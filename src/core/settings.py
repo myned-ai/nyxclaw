@@ -1,0 +1,125 @@
+"""
+Application Configuration
+
+Centralized configuration using Pydantic Settings for type-safe
+environment variable management with validation.
+
+This module contains ONLY vendor-agnostic settings.
+Vendor-specific settings (OpenAI, Gemini) are managed by their respective agents.
+"""
+
+from functools import lru_cache
+from pathlib import Path
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Get the directory containing this file, then go up to avatar_chat_server/
+_CONFIG_DIR = Path(__file__).parent.parent.parent
+
+
+class Settings(BaseSettings):
+    """
+    Application settings loaded from environment variables.
+
+    All settings can be overridden via environment variables or .env file.
+    This class contains only VENDOR-AGNOSTIC settings.
+    """
+
+    model_config = SettingsConfigDict(
+        env_file=_CONFIG_DIR / ".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        extra="ignore",
+    )
+
+    # Assistant Configuration (shared across all agents)
+    assistant_instructions: str = "You are a helpful and friendly AI assistant. Be concise in your responses."
+
+    # Wav2Arkit Model Configuration (ONNX CPU-only)
+    onnx_model_path: str = "./pretrained_models/wav2arkit/wav2arkit_cpu.onnx"
+
+    # Server Configuration
+    server_host: str = "0.0.0.0"
+    server_port: int = 8080
+    use_ssl: bool = False
+    debug: bool = False
+    debug_audio_capture: bool = False  # Save incoming audio to files for debugging
+
+    # Knowledge Base Configuration
+    # Can be a local file path (e.g. "data/knowledge.md") or a URL
+    knowledge_base_source: str | None = None
+
+    # Authentication Configuration
+    auth_enabled: bool = False
+    auth_secret_key: str = ""
+    auth_token_ttl: int = 3600
+    auth_allowed_origins: str = "http://localhost:5173,http://localhost:5174,http://localhost:5175"
+    auth_enable_rate_limiting: bool = True
+
+    # Agent Configuration
+    agent_type: str = (
+        "sample_openai"  # "sample_openai", "sample_gemini", "sample_openclaw", "sample_zeroclaw", "remote"
+    )
+    agent_url: str | None = None  # URL for remote agent (e.g., "ws://agent-service:8080/ws")
+
+    # Audio Configuration (vendor-agnostic)
+    # Note: Widget sends 24kHz audio. This is used for Wav2Arkit processing.
+    input_sample_rate: int = 24000  # Input audio sample rate (widget format)
+    output_sample_rate: int = 24000  # Output audio sample rate (for playback and lip-sync)
+    wav2arkit_sample_rate: int = 16000  # Wav2Arkit model expects 16kHz
+    blendshape_fps: int = 30  # Output blendshape frame rate
+    audio_chunk_duration: float = 0.5  # 0.5 second chunks for Wav2Arkit processing
+
+    # Transcript timing estimation
+    # Used to calculate text offsets for transcript deltas
+    # Typical values: slow=12, normal=16, fast=20 chars/sec
+    transcript_chars_per_second: float = 16.0
+
+    @property
+    def resolved_onnx_model_path(self) -> str:
+        """Return an absolute path to the wav2arkit ONNX model.
+
+        Resolves ``onnx_model_path`` relative to the project root when it is a
+        relative path, so the server starts correctly regardless of CWD
+        (local dev from ``src/``, Docker from ``/app``, etc.).
+        """
+        raw = Path(self.onnx_model_path)
+        if raw.is_absolute():
+            return str(raw)
+        # _CONFIG_DIR is the project root (parents[2] from src/core/settings.py)
+        candidate = (_CONFIG_DIR / raw).resolve()
+        if candidate.exists():
+            return str(candidate)
+        # Fallback to CWD-relative (preserves legacy behaviour)
+        return str(raw)
+
+    @property
+    def frame_interval_ms(self) -> float:
+        return 1000 / self.blendshape_fps
+
+    @property
+    def samples_per_frame(self) -> int:
+        return self.input_sample_rate // self.blendshape_fps
+
+    @property
+    def bytes_per_frame(self) -> int:
+        return self.samples_per_frame * 2  # PCM16 = 2 bytes
+
+
+@lru_cache
+def get_settings() -> Settings:
+    """
+    Get cached application settings.
+
+    Uses lru_cache to ensure settings are only loaded once
+    and reused throughout the application lifecycle.
+    """
+    return Settings()
+
+
+def get_allowed_origins() -> list[str]:
+    """Parse allowed origins from comma-separated string."""
+    settings = get_settings()
+    if not settings.auth_allowed_origins:
+        return []
+    return [origin.strip() for origin in settings.auth_allowed_origins.split(",") if origin.strip()]
