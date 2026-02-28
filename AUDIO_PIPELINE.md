@@ -1,32 +1,32 @@
-# Audio Pipeline Setup: STT & TTS for OpenClaw Agent
+# Audio Pipeline Setup: STT & TTS
 
 This document explains how to set up the server-side Speech-to-Text (STT) and
-Text-to-Speech (TTS) components used by the OpenClaw avatar agent.
+Text-to-Speech (TTS) components used by NyxClaw.
 
 ## Architecture
 
 ```
                           ┌─────────────────────────────────────────────┐
-                          │            avatar-chat-server               │
+                          │                  NyxClaw                    │
                           │                                             │
   Client ──WebSocket──►   │  audio ──► STT Service ──► text             │
+                          │           (faster-whisper)   │              │
+                          │                    Claw Agent (LLM)         │
                           │                              │              │
-                          │                    OpenClaw Gateway          │
-                          │                    (127.0.0.1:18789)        │
-                          │                              │              │
-                          │            text ◄── SSE stream              │
+                          │            text ◄── SSE/WS stream           │
                           │              │                              │
                           │  audio ◄── TTS Service                      │
+                          │           (Piper VITS ONNX)                 │
   Client ◄──WebSocket──   │                                             │
                           └─────────────────────────────────────────────┘
 
-  STT: Kyutai STT 1B (Rust candle via moshi-server)  → ws://127.0.0.1:8090
-  TTS: Kyutai Pocket TTS (Python pocket-tts)          → in-process
-  LLM: OpenClaw Gateway                               → http://127.0.0.1:18789
+  STT: faster-whisper (CTranslate2, int8) + Silero VAD (ONNX) → in-process
+  TTS: Piper VITS ONNX                                         → in-process
+  LLM: Claw Agent (OpenClaw HTTP or ZeroClaw WebSocket)
 ```
 
-All three components (moshi-server STT, avatar-chat-server, openclawd) are
-designed to coexist on the **same machine**, communicating over loopback.
+NyxClaw and the Claw agent backend are designed to coexist on the **same
+machine**, communicating over loopback.
 
 ---
 
@@ -320,64 +320,62 @@ Add these to your `.env` file:
 # Agent type
 AGENT_TYPE=sample_openclaw
 
-# OpenClaw gateway (same machine)
-OPENCLAW_BASE_URL=http://127.0.0.1:18789
-OPENCLAW_API_TOKEN=your_openclaw_gateway_token
-OPENCLAW_MODEL=openclaw:main
+# Agent backend (same machine)
+BASE_URL=http://127.0.0.1:19001
+AUTH_TOKEN=your_agent_token
+AGENT_MODEL=openclaw:main
 
-# STT server (moshi-server on same machine)
-STT_SERVER_URL=ws://127.0.0.1:8090/api/asr-streaming
-STT_AUTH_TOKEN=avatar_stt_token
+# STT (faster-whisper, in-process)
+STT_ENABLED=true
+STT_MODEL=small.en
 
-# TTS voice
-TTS_VOICE_PATH=voices/default.wav
-# TTS_VOICE_SAFETENSORS=voices/default.safetensors  # Optional: precomputed
+# TTS (Piper VITS ONNX, in-process)
+TTS_ENABLED=true
+TTS_VOICE_NAME=en_US-hfc_female-medium
+# TTS_VOICE_PATH=voices/default.wav  # Optional: WAV for voice reference
 ```
 
 ---
 
 ## 5. Running the Full Stack
 
-Start all three services (each in its own terminal):
+Start both services (each in its own terminal):
 
-**Terminal 1 — STT Server (Rust):**
-
-```bash
-moshi-server worker --config configs/stt.toml --port 8090
-```
-
-**Terminal 2 — OpenClaw Gateway:**
+**Terminal 1 — Claw Agent Backend:**
 
 ```bash
-openclawd  # (already running, or start per OpenClaw docs)
+# OpenClaw example (start per OpenClaw docs)
+openclawd
+
+# Or ZeroClaw
+zeroclawd
 ```
 
-**Terminal 3 — Avatar Chat Server:**
+**Terminal 2 — NyxClaw Server:**
 
 ```bash
-uv run uvicorn src.main:app --host 0.0.0.0 --port 8080
+uv run python src/main.py
 ```
 
-All three communicate over loopback:
+Both communicate over loopback:
 
 | Service | Address | Protocol |
 |---|---|---|
-| STT (moshi-server) | `ws://127.0.0.1:8090` | WebSocket |
-| OpenClaw Gateway | `http://127.0.0.1:18789` | HTTP SSE |
-| Avatar Chat Server | `ws://0.0.0.0:8080` | WebSocket |
+| Claw Agent | `http://127.0.0.1:19001` (OpenClaw) or `ws://127.0.0.1:5555` (ZeroClaw) | HTTP SSE / WebSocket |
+| NyxClaw | `ws://0.0.0.0:8080` | WebSocket |
 
 ---
 
 ## 6. Request Flow
 
-1. **Client** connects via WebSocket to avatar-chat-server
+1. **Client** connects via WebSocket to NyxClaw
 2. **Client** streams microphone audio (24 kHz PCM, 16-bit LE)
-3. **avatar-chat-server** forwards audio to **moshi-server** STT via WebSocket
-4. **moshi-server** returns streaming transcription (word by word, with VAD)
-5. When VAD detects end-of-turn, avatar-chat-server sends accumulated text to
-   **OpenClaw** via `POST /v1/chat/completions` (SSE streaming)
-6. As SSE text tokens arrive, they are buffered into sentences
-7. Complete sentences are fed to **pocket-tts** `generate_audio_stream()`
+3. **NyxClaw** runs audio through **Silero VAD** (ONNX) for speech detection
+4. When speech is detected, audio is transcribed by **faster-whisper** (CTranslate2)
+5. When VAD detects end-of-turn, NyxClaw sends accumulated text to the
+   **Claw Agent** (OpenClaw HTTP SSE or ZeroClaw WebSocket)
+6. As text tokens arrive, they are buffered into sentences
+7. Complete sentences are fed to **Piper TTS** (VITS ONNX)
 8. Generated PCM audio chunks are sent back to the **client** via WebSocket
 9. Client plays audio and drives avatar lip-sync (Wav2Arkit pipeline)
 

@@ -1,14 +1,10 @@
 """
-Avatar Chat Server
+nyxclaw — Voice-to-Avatar Server
 
 FastAPI application for real-time voice-to-avatar interaction.
-Combines AI agents for voice conversation with Wav2Arkit
-model for synchronized facial animation.
+Combines Claw-based AI agents with Wav2Arkit model for synchronized facial animation.
 
-Supports multiple agent backends:
-- sample_openai: OpenAI Realtime API
-- sample_gemini: Google Gemini Live API
-- remote: External agent service
+Supports: sample_openclaw, sample_zeroclaw
 
 Usage:
     uvicorn main:app --host 0.0.0.0 --port 8080 --reload
@@ -134,7 +130,7 @@ async def lifespan(app: FastAPI):
 
     # Startup
     logger.info("=" * 60)
-    logger.info("Avatar Chat Server Starting")
+    logger.info("NyxClaw Starting")
     logger.info("=" * 60)
     protocol = "wss" if settings.use_ssl else "ws"
     logger.info(f"WebSocket endpoint: {protocol}://{settings.server_host}:{settings.server_port}/ws")
@@ -161,13 +157,13 @@ async def lifespan(app: FastAPI):
 
 # Create FastAPI application
 app = FastAPI(
-    title="Avatar Chat Server",
+    title="NyxClaw",
     description="""
-    Real-time voice-to-avatar interaction server.
-    
+    Voice-to-avatar UI server for Claw-based agents.
+
     ## Features
-    
-    - **Voice AI**: OpenAI Realtime API for natural voice conversations
+
+    - **Claw Agents**: OpenClaw and ZeroClaw backends with local STT/TTS
     - **Facial Animation**: Wav2Arkit model for synchronized blendshapes
     - **WebSocket Streaming**: Real-time audio and animation data
     
@@ -252,7 +248,7 @@ async def root():
     """Root endpoint with server information."""
     settings = get_settings()
     response = {
-        "name": "Avatar Chat Server",
+        "name": "NyxClaw",
         "version": app.version,
         "status": "running",
     }

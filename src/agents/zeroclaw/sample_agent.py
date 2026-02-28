@@ -122,7 +122,7 @@ class SampleZeroClawAgent(BaseAgent):
         self._trim_history()
 
     def _trim_history(self) -> None:
-        max_messages = max(4, int(self._zc.zeroclaw_history_max_messages))
+        max_messages = max(4, int(self._zc.history_max_messages))
         if len(self._messages) <= max_messages:
             return
 
@@ -250,7 +250,7 @@ class SampleZeroClawAgent(BaseAgent):
 
     @property
     def transcript_speed(self) -> float:
-        return self._zc.zeroclaw_transcript_speed
+        return self._zc.transcript_speed
 
     @property
     def input_sample_rate(self) -> int:
@@ -498,7 +498,7 @@ class SampleZeroClawAgent(BaseAgent):
     def _build_ws_chat_url(self) -> str:
         """Build ZeroClaw chat websocket URL including optional token."""
         zc = self._zc
-        base = zc.zeroclaw_base_url.rstrip("/")
+        base = zc.base_url.rstrip("/")
         parsed = urlparse(base)
 
         scheme = parsed.scheme.lower()
@@ -509,8 +509,8 @@ class SampleZeroClawAgent(BaseAgent):
         path = f"{parsed.path.rstrip('/')}/ws/chat" if parsed.path else "/ws/chat"
         query = parsed.query
 
-        if zc.zeroclaw_ws_token:
-            token_query = urlencode({"token": zc.zeroclaw_ws_token})
+        if zc.auth_token:
+            token_query = urlencode({"token": zc.auth_token})
             query = f"{query}&{token_query}" if query else token_query
 
         return urlunparse((ws_scheme, parsed.netloc, path, "", query, ""))
@@ -525,7 +525,7 @@ class SampleZeroClawAgent(BaseAgent):
         knowledge = await KnowledgeService.load_knowledge_base(self._settings.knowledge_base_source)
         self._system_prompt = KnowledgeService.format_instructions(self._settings.assistant_instructions, knowledge)
 
-        thinking_mode = (zc.zeroclaw_thinking_mode or "default").strip().lower()
+        thinking_mode = (zc.thinking_mode or "default").strip().lower()
         if thinking_mode in {"off", "minimal"}:
             guidance = (
                 "\n\nResponse style: prioritize low-latency concise answers. "
@@ -539,13 +539,13 @@ class SampleZeroClawAgent(BaseAgent):
             ws_url = self._build_ws_chat_url()
             self._zc_ws = await websockets.connect(
                 ws_url,
-                open_timeout=zc.zeroclaw_connect_timeout,
+                open_timeout=zc.connect_timeout,
                 close_timeout=5,
                 ping_interval=20,
                 ping_timeout=20,
             )
             self._zc_ws_clean = True
-            logger.info(f"ZeroClaw WebSocket connected at {zc.zeroclaw_base_url}")
+            logger.info(f"ZeroClaw WebSocket connected at {zc.base_url}")
         except Exception as exc:
             logger.warning(f"ZeroClaw connect failed (will retry per message): {exc}")
             self._zc_ws = None
@@ -596,7 +596,7 @@ class SampleZeroClawAgent(BaseAgent):
 
         self._connected = True
         logger.info(
-            f"ZeroClaw agent ready (stt={self._stt_available}, tts={self._tts_available}, model={zc.zeroclaw_model})"
+            f"ZeroClaw agent ready (stt={self._stt_available}, tts={self._tts_available}, model={zc.agent_model})"
         )
 
     async def _ensure_zc_ws(self) -> websockets.WebSocketClientProtocol:
@@ -615,7 +615,7 @@ class SampleZeroClawAgent(BaseAgent):
         ws_url = self._build_ws_chat_url()
         self._zc_ws = await websockets.connect(
             ws_url,
-            open_timeout=self._zc.zeroclaw_connect_timeout,
+            open_timeout=self._zc.connect_timeout,
             close_timeout=5,
             ping_interval=20,
             ping_timeout=20,
@@ -726,7 +726,7 @@ class SampleZeroClawAgent(BaseAgent):
                 try:
                     done_futs, _ = await asyncio.wait(
                         {recv_fut, cancel_fut},
-                        timeout=zc.zeroclaw_read_timeout,
+                        timeout=zc.read_timeout,
                         return_when=asyncio.FIRST_COMPLETED,
                     )
                 finally:

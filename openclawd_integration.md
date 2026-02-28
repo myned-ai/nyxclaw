@@ -1,18 +1,18 @@
-# OpenClaw Avatar Integration Architecture
+# OpenClaw Integration Architecture
 
 ## Goal
-Enable a low-latency, voice-enabled avatar (running on the Nyx framework) using OpenClaw as the intelligence backend, while handling Speech-to-Text (STT) and Text-to-Speech (TTS) on the server side using optimized local/WASM models.The server might coexists on the same machine as OpenClawd.
+Enable a low-latency, voice-enabled avatar using OpenClaw as the intelligence backend, while handling Speech-to-Text (STT) and Text-to-Speech (TTS) on the server side using optimized local ONNX models. NyxClaw typically coexists on the same machine as OpenClaw.
 
 ## Architecture Overview
 
 The system follows a **Voice-to-Text -> LLM Stream -> Text-to-Voice** pipeline to minimize latency.
 
 ### 1. User Input (Speech-to-Text)
-**Component:** Client Widget / Avatar Server
-**Model:** `kyutai/stt-1b-en_fr-candle` (Hugging Face)
+**Component:** NyxClaw Server
+**Model:** faster-whisper (CTranslate2, int8) + Silero VAD (ONNX)
 **Task:**
-- Capture user microphone audio.
-- Transcribe audio to text in real-time or near real-time using the Candle/WASM implementation.
+- Capture user microphone audio via WebSocket.
+- Detect speech with Silero VAD, transcribe with faster-whisper.
 - **Output:** Text string.
 
 ### 2. Intelligence (LLM Backend)
@@ -25,7 +25,7 @@ The system follows a **Voice-to-Text -> LLM Stream -> Text-to-Voice** pipeline t
 **Request Example:**
 ```json
 POST /v1/chat/completions
-Authorization: Bearer <OPENCLAW_TOKEN>
+Authorization: Bearer <AUTH_TOKEN>
 Content-Type: application/json
 
 {
@@ -38,19 +38,19 @@ Content-Type: application/json
 **Output:** Server-Sent Events (SSE) stream of text tokens.
 
 ### 3. Response Generation (Text-to-Speech & Lip Sync)
-**Component:** Client Widget / Avatar Server
-**Model:** `kyutai/pocket-tts-candle` (GitHub Rust subdirectory / WASM)
+**Component:** NyxClaw Server
+**Model:** Piper VITS ONNX
 **Task:**
 - Buffer incoming text tokens from OpenClaw into sentences/phrases.
-- Send buffered text to the local `pocket-tts-candle` model.
-- Generate raw audio buffers and viseme data (for lip sync).
-- **Output:** Audio playback and avatar animation.
+- Send buffered text to Piper TTS for audio synthesis.
+- Run Wav2Arkit ONNX model for blendshape generation.
+- **Output:** Synchronized audio + blendshapes streamed to client.
 
 ## Prerequisites — OpenClaw Gateway Configuration
 
 > **Important:** The OpenClaw web chat UI works independently of the HTTP API.
 > The `/v1/chat/completions` endpoint must be **explicitly enabled** in
-> `openclaw.json` before the avatar server can communicate with the gateway.
+> `openclaw.json` before NyxClaw can communicate with the gateway.
 
 In your `openclaw.json` (inside the Docker container or on the host), add/verify:
 
@@ -60,23 +60,23 @@ In your `openclaw.json` (inside the Docker container or on the host), add/verify
     "http": {
       "endpoints": {
         "chatCompletions": {
-          "enabled": true          // ← required for the avatar server
+          "enabled": true          // required for NyxClaw
         }
       }
     },
     "auth": {
-      "token": "<your-token>"      // ← this value goes into OPENCLAW_API_TOKEN in .env
+      "token": "<your-token>"      // this value goes into AUTH_TOKEN in .env
     }
   }
 }
 ```
 
-**After editing**, restart the openclawd container so the config takes effect.
+**After editing**, restart the OpenClaw container so the config takes effect.
 
 You can verify the endpoint is active with:
 
 ```bash
-curl -s -X POST http://localhost:18789/v1/chat/completions \
+curl -s -X POST http://localhost:19001/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer <your-token>" \
   -d '{"model":"openclaw:main","messages":[{"role":"user","content":"hi"}],"stream":false}'
@@ -85,18 +85,17 @@ curl -s -X POST http://localhost:18789/v1/chat/completions \
 A `200` with a JSON response means it's working. A `405 Method Not Allowed` means
 `chatCompletions` is still disabled.
 
-## Implementation Steps for Code Agent
+## Implementation Steps
 
 1.  **OpenClaw Setup:**
     - Verify `openclaw.json` has `gateway.http.endpoints.chatCompletions.enabled = true`.
     - Ensure an authentication token is configured (`gateway.auth.token`).
 
-2.  **Client/Server Integration:**
-    - Integrate the `stt-1b-en_fr-candle` model to transcribe microphone input.
-    - Implement an HTTP client to POST the transcription to OpenClaw's `/v1/chat/completions` endpoint.
-    - Implement an SSE reader to parse the streaming response (`data: {...}`).
+2.  **NyxClaw Configuration:**
+    - Set `AGENT_TYPE=sample_openclaw` in `.env`.
+    - Set `BASE_URL=http://127.0.0.1:19001` and `AUTH_TOKEN=<your-token>`.
+    - Enable STT/TTS: `STT_ENABLED=true`, `TTS_ENABLED=true`.
 
 3.  **Audio Pipeline:**
-    - Create a text buffer that accumulates streaming tokens until a punctuation mark (sentence boundary) is reached.
-    - Feed the complete sentence to `pocket-tts-candle` to generate audio.
-    - Queue the generated audio chunks for seamless playback to the user.
+    - NyxClaw handles the full pipeline automatically:
+      audio in -> VAD -> STT -> OpenClaw SSE -> sentence buffer -> TTS -> Wav2Arkit -> sync_frame out.

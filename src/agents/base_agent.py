@@ -2,7 +2,7 @@
 Abstract Agent Interface
 
 Defines the interface for conversational AI agents.
-Supports both local (in-process) and remote (inter-container) implementations.
+Supports Claw-based agent implementations.
 """
 
 from abc import ABC, abstractmethod

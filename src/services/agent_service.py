@@ -2,17 +2,13 @@
 Agent Service
 
 Provides agent instances based on configuration.
-Supports sample agents.
 """
 
 from agents import (
     BaseAgent,
-    SampleGeminiAgent,
-    SampleOpenAIAgent,
     SampleOpenClawAgent,
     SampleZeroClawAgent,
 )
-from agents.remote_agent import RemoteAgent
 from core.settings import get_settings
 
 
@@ -27,18 +23,12 @@ def create_agent_instance() -> BaseAgent:
     settings = get_settings()
     agent_type = settings.agent_type
 
-    if agent_type == "sample_openai":
-        return SampleOpenAIAgent()
-    elif agent_type == "sample_gemini":
-        return SampleGeminiAgent()
-    elif agent_type == "sample_openclaw":
+    if agent_type == "sample_openclaw":
         return SampleOpenClawAgent()
     elif agent_type == "sample_zeroclaw":
         return SampleZeroClawAgent()
-    elif agent_type == "remote":
-        return RemoteAgent()
     else:
         raise ValueError(
             f"Unknown agent_type: {agent_type}. "
-            "Supported: sample_openai, sample_gemini, sample_openclaw, sample_zeroclaw, remote"
+            "Supported: sample_openclaw, sample_zeroclaw"
         )

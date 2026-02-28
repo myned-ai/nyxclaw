@@ -1,56 +1,51 @@
-# Avatar Chat Server
+# NyxClaw
 
-**Sample backend server for the [Avatar Chat Widget](https://github.com/myned-ai/avatar-chat-widget)**
+**Voice-to-avatar server for Claw-based AI agents**
 
-> **See the Avatar Chat Widget in action -> [Try Nyx](https://myned.ai)**
+> **See it in action -> [Try Nyx](https://myned.ai)**
 
-Real-time voice-to-avatar interaction server combining AI agents (OpenAI Realtime API, Google Gemini Live API or your custom agent) with the Wav2Arkit model for synchronized avatar facial animation. This is an example server that powers the [Avatar Chat Widget](https://github.com/myned-ai/avatar-chat-widget) by processing audio streams and generating ARKit blendshapes for realistic facial animations.
+Real-time voice-to-avatar interaction server combining Claw agents (OpenClaw, ZeroClaw) with local STT/TTS and the Wav2Arkit model for synchronized avatar facial animation. Processes audio streams and generates ARKit blendshapes for realistic facial animations.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.10](https://img.shields.io/badge/python-3.10-blue.svg)](https://www.python.org/downloads/)
 
 ## Features
 
-- **Real-time Voice-to-Voice AI**: OpenAI Realtime API or Google Gemini Live API integration for natural conversation
+- **Local STT/TTS Pipeline**: faster-whisper (CTranslate2) + Silero VAD + Piper VITS ONNX — no cloud dependency
 - **Facial Animation Sync**: Wav2Arkit model for ARKit-compatible blendshapes
-- **Modular Agent System**: Pluggable agents (sample OpenAI/Gemini or custom implementations)
+- **Modular Agent System**: Pluggable Claw agents (OpenClaw HTTP SSE, ZeroClaw WebSocket)
 - **WebSocket Communication**: Low-latency bidirectional streaming
 - **CPU Acceleration**: ONNX-optimized inference for real-time performance without GPU
 - **Production Ready**: Docker support, health checks, logging, authentication
 
-## Use Cases
-
-- **AI Customer Support Agents**: Replace chatbots with branded, empathetic 3D avatars
-- **Interactive Kiosks**: Voice-enabled avatars for retail or information desks
-- **Virtual Concierges**: Hospitality assistants that can see (via multimodal input) and speak
-- **Education & Training**: Roleplay scenarios with responsive virtual characters
-
 ## Architecture
 
-This server acts as the central brain between the client (Widget) and the AI (LLM):
-
-1.  **Audio In**: Receives microphone audio from the user (Client)
-2.  **Agent Processing**: Forwards audio to OpenAI/Gemini/Custom Agent
-3.  **Response Generation**: Receives audio response from Agent
-4.  **Facial Animation**: Runs Wav2Arkit model (ONNX) to generate lip-sync frames
-5.  **Sync Out**: Streams synchronized Audio + Blendshape packets to Client at 30 FPS
+```
+Client ──WebSocket──► NyxClaw Server
+                        │
+                        ├── audio ──► STT (faster-whisper + Silero VAD) ──► text
+                        │                                                    │
+                        │                                          Claw Agent (LLM)
+                        │                                                    │
+                        ├── audio ◄── TTS (Piper VITS ONNX) ◄── text response
+                        │
+                        ├── Wav2Arkit (ONNX) ──► blendshapes
+                        │
+Client ◄──WebSocket──── sync_frame (audio + blendshapes @ 30 FPS)
+```
 
 ## Table of Contents
 
 - [Prerequisites](#prerequisites)
 - [Quick Start](#quick-start)
-  - [Local Development](#local-development)
-  - [Docker](#docker)
 - [Configuration](#configuration)
 - [API Documentation](#api-documentation)
 - [Docker Usage](#docker-usage)
 - [Authentication](#authentication)
-- [Performance Best Practices](#performance-best-practices)
 - [Agent Modularity](#agent-modularity)
 - [Development](#development)
 - [License](#license)
 - [Acknowledgments](#acknowledgments)
-
 
 ## Prerequisites
 
@@ -58,18 +53,14 @@ This server acts as the central brain between the client (Widget) and the AI (LL
 
 - Python 3.10.x (exact version required)
 - [uv](https://github.com/astral-sh/uv) package manager
-- **One of the following API keys** (depending on your chosen agent):
-  - OpenAI API key with Realtime API access (for `sample_openai` agent)
-  - Google Gemini API key (for `sample_gemini` agent)
+- A running Claw agent backend (OpenClaw or ZeroClaw)
 - ONNX Runtime (CPU-optimized, included in dependencies)
 
 ### Docker
 
 - Docker 20.10+
 - Docker Compose 2.0+
-- **One of the following API keys** (depending on your chosen agent):
-  - OpenAI API key with Realtime API access (for `sample_openai` agent)
-  - Google Gemini API key (for `sample_gemini` agent)
+- A running Claw agent backend (OpenClaw or ZeroClaw)
 
 ## Quick Start
 
@@ -84,40 +75,37 @@ powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | ie
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # 2. Clone the repository
-git clone https://github.com/myned-ai/avatar-chat-server.git
-cd avatar-chat-server
+git clone https://github.com/myned-ai/nyxclaw.git
+cd nyxclaw
 
-# 3. Install dependencies
-uv sync
+# 3. Install dependencies (with local voice stack)
+uv sync --extra local_voice
 
 # 4. Download the Wav2Arkit model
 pip install -U "huggingface_hub[cli]"
 mkdir -p pretrained_models/wav2arkit
 huggingface-cli download myned-ai/wav2arkit_cpu --local-dir pretrained_models/wav2arkit
 
-# 5. Optional: local voice stack (faster-whisper STT + Piper TTS + Silero VAD)
-uv sync --extra local_voice
-
-# Download faster-whisper base.en model (CTranslate2 int8)
+# 5. Download faster-whisper model (CTranslate2 int8)
 uv run --with 'faster-whisper>=1.1.0' python -c \
-  "from faster_whisper.utils import download_model; download_model('base.en', output_dir='pretrained_models/faster_whisper_base_en')"
+  "from faster_whisper.utils import download_model; download_model('small.en', output_dir='pretrained_models/faster_whisper_small_en')"
 
-# Download Piper TTS voice
+# 6. Download Piper TTS voice
 mkdir -p pretrained_models/piper
 uv run --with huggingface_hub python -c "
 import shutil; from huggingface_hub import hf_hub_download
 for s in ('', '.json'):
     shutil.copy2(
-        hf_hub_download('rhasspy/piper-voices', f'en_US-ljspeech-high.onnx{s}',
-            subfolder='en/en_US/ljspeech/high'),
-        f'pretrained_models/piper/en_US-ljspeech-high.onnx{s}')
+        hf_hub_download('rhasspy/piper-voices', f'en_US-hfc_female-medium.onnx{s}',
+            subfolder='en/en_US/hfc_female/medium'),
+        f'pretrained_models/piper/en_US-hfc_female-medium.onnx{s}')
 "
 
-# 6. Configure environment
+# 7. Configure environment
 cp .env.example .env
-# Edit .env with your OPENAI_API_KEY and other settings
+# Edit .env with your agent backend settings (BASE_URL, AUTH_TOKEN, etc.)
 
-# 7. Run server
+# 8. Run server
 uv run python src/main.py
 ```
 
@@ -129,8 +117,8 @@ Server will start at `http://localhost:8080`
 
 ```bash
 # 1. Clone and configure
-git clone https://github.com/myned-ai/avatar-chat-server.git
-cd avatar-chat-server
+git clone https://github.com/myned-ai/nyxclaw.git
+cd nyxclaw
 cp .env.example .env
 # Edit .env with your settings
 
@@ -140,8 +128,7 @@ mkdir -p pretrained_models/wav2arkit
 huggingface-cli download myned-ai/wav2arkit_cpu --local-dir pretrained_models/wav2arkit
 
 # Optional: enable local voice build (faster-whisper / Piper TTS / Silero VAD)
-# Add these in .env before build (defaults are false)
-# INSTALL_LOCAL_VOICE=true
+# Add in .env before build: INSTALL_LOCAL_VOICE=true
 
 # 3. Build and run (production)
 docker-compose up -d
@@ -160,78 +147,56 @@ docker-compose --profile dev up
 
 All settings can be configured via environment variables or `.env` file.
 
-### Required Settings
-
-At least one API key is required, depending on your chosen `AGENT_TYPE`:
-
-| Variable | Description |
-|----------|-------------|
-| `OPENAI_API_KEY` | Your OpenAI API key (required if using `sample_openai` agent) |
-| `GEMINI_API_KEY` | Your Google Gemini API key (required if using `sample_gemini` agent) |
-
-### Optional Settings
+### Agent Backend Settings
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| **Agent Configuration** |
-| `AGENT_TYPE` | `sample_openai` | Agent type: `sample_openai`, `sample_gemini`, `sample_openclaw`, `sample_zeroclaw`, `remote` |
-| `AGENT_URL` | *(none)* | WebSocket URL for remote agent (e.g., `ws://agent-service:8080/ws`) |
-| **ZeroClaw Configuration** |
-| `ZEROCLAW_BASE_URL` | `http://127.0.0.1:5555` | ZeroClaw gateway base URL (WebSocket chat uses `/ws/chat`) |
-| `ZEROCLAW_WS_TOKEN` | *(none)* | Optional ZeroClaw bearer token passed as `?token=` for WebSocket auth |
-| `ZEROCLAW_MODEL` | `zeroclaw:main` | Logical model label for logs/metadata |
-| `ZEROCLAW_THINKING_MODE` | `minimal` | Thinking hint: `off`, `minimal`, `default` |
-| **OpenAI Configuration** |
-| `OPENAI_MODEL` | `gpt-realtime` | Realtime API model |
-| `OPENAI_VOICE` | `alloy` | Voice: `alloy`, `ash`, `ballad`, `coral`, `echo`, `sage`, `shimmer`, `verse`, `marin`, `cedar` |
-| `OPENAI_VOICE_SPEED` | `1.2` | Voice speed (0.25–1.5, where 1.0 is normal) |
-| `OPENAI_TRANSCRIPT_SPEED` | `15.0` | Transcript character emission speed (chars/sec) for client sync |
-| `OPENAI_TRANSCRIPTION_MODEL` | `gpt-4o-transcribe` | Transcription model for user speech |
-| `OPENAI_TRANSCRIPTION_LANGUAGE` | `en` | Language for transcription (ISO-639-1 code) |
-| `OPENAI_VAD_TYPE` | `semantic_vad` | Voice Activity Detection type: `server_vad`, `semantic_vad` |
-| `OPENAI_VAD_THRESHOLD` | `0.9` | VAD threshold (0.0–1.0, higher = less sensitive) |
-| `OPENAI_VAD_SILENCE_DURATION_MS` | `500` | Silence duration before turn ends (ms) |
-| `OPENAI_VAD_PREFIX_PADDING_MS` | `300` | Audio to include before detected speech (ms) |
-| `OPENAI_NOISE_REDUCTION` | `near_field` | Noise reduction: `near_field`, `far_field`, or empty to disable |
-| **Gemini Configuration** |
-| `GEMINI_MODEL` | `gemini-2.5-flash-native-audio-preview-12-2025` | Live API model |
-| `GEMINI_VOICE` | `Leda` | Voice: `Puck`, `Charon`, `Kore`, `Fenrir`, `Aoede`, `Leda`, `Orus`, `Zephyr` |
-| `GEMINI_API_VERSION` | `v1alpha` | Gemini API version |
-| `GEMINI_THINKING_BUDGET` | `-1` | Thinking budget: `0`=disabled, `-1`=dynamic, `1`–`32768`=fixed tokens |
-| `GEMINI_GOOGLE_SEARCH_GROUNDING` | `false` | Enable Google Search grounding for real-time information |
-| `GEMINI_PROACTIVE_AUDIO` | `false` | Allow model to decide not to respond if content is not relevant |
-| `GEMINI_CONTEXT_WINDOW_COMPRESSION` | `true` | Enable context window compression for longer sessions |
-| `GEMINI_INPUT_SAMPLE_RATE` | `16000` | Audio sample rate sent to Gemini |
-| `GEMINI_OUTPUT_SAMPLE_RATE` | `24000` | Audio sample rate received from Gemini |
-| `GEMINI_TRANSCRIPT_SPEED` | `15.0` | Transcript character emission speed (chars/sec) |
-| `GEMINI_VAD_START_SENSITIVITY` | `START_SENSITIVITY_LOW` | VAD start sensitivity |
-| `GEMINI_VAD_END_SENSITIVITY` | `END_SENSITIVITY_LOW` | VAD end sensitivity |
-| `GEMINI_TURN_COVERAGE` | `TURN_INCLUDES_ALL_INPUT` | Turn coverage mode |
-| **Assistant Configuration** |
+| `AGENT_TYPE` | `sample_openclaw` | Agent type: `sample_openclaw`, `sample_zeroclaw` |
+| `BASE_URL` | `http://127.0.0.1:19001` | Agent backend URL |
+| `AUTH_TOKEN` | *(none)* | Bearer token for agent authentication |
+| `AGENT_MODEL` | `openclaw:main` | Model identifier for agent backend |
+| `USER_ID` | *(none)* | Optional stable user ID for session continuity |
+| `THINKING_MODE` | `minimal` | Thinking hint: `off`, `minimal`, `default` |
+| `SESSION_KEY` | *(none)* | OpenClaw gateway routing override |
+| `AGENT_ID` | *(none)* | OpenClaw agent ID override |
+| `MAX_RETRIES` | `2` | Max retries for failed requests (OpenClaw) |
+
+### STT Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `STT_ENABLED` | `true` | Enable speech-to-text |
+| `STT_MODEL` | `small.en` | faster-whisper model (`tiny.en`, `base.en`, `small.en`, `medium.en`) |
+| `STT_VAD_START_THRESHOLD` | `0.60` | Silero VAD speech start threshold |
+| `STT_VAD_END_THRESHOLD` | `0.35` | Silero VAD speech end threshold |
+| `STT_VAD_MIN_SILENCE_MS` | `280` | Minimum silence before end-of-speech (ms) |
+| `STT_INITIAL_PROMPT` | *(none)* | Whisper initial prompt for vocabulary priming |
+
+### TTS Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TTS_ENABLED` | `true` | Enable text-to-speech |
+| `TTS_ONNX_MODEL_DIR` | `./pretrained_models/piper` | Piper ONNX model directory |
+| `TTS_VOICE_NAME` | `en_US-hfc_female-medium` | Piper voice name |
+| `TTS_VOICE_PATH` | *(none)* | Path to WAV file for voice cloning |
+| `TTS_NOISE_SCALE` | `0.75` | Audio variation (0=flat, 1=expressive) |
+| `TTS_NOISE_W_SCALE` | `0.8` | Phoneme duration variation |
+| `TTS_LENGTH_SCALE` | `0.95` | Speech speed (<1=faster, >1=slower) |
+
+### Other Settings
+
+| Variable | Default | Description |
+|----------|---------|-------------|
 | `ASSISTANT_INSTRUCTIONS` | *see .env.example* | System prompt for the AI assistant |
-| **Model Configuration** |
-| `ONNX_MODEL_PATH` | `./pretrained_models/wav2arkit/wav2arkit_cpu.onnx` | Path to ONNX model weights (CPU-only) |
-| **Server Configuration** |
+| `ONNX_MODEL_PATH` | `./pretrained_models/wav2arkit/wav2arkit_cpu.onnx` | Wav2Arkit ONNX model path |
 | `SERVER_HOST` | `0.0.0.0` | Server bind address |
 | `SERVER_PORT` | `8080` | Server port |
-| `USE_SSL` | `false` | Enable SSL (WebSocket endpoint becomes `wss://`) |
-| `DEBUG` | `false` | Enable debug logging (verbose output) |
-| `DEBUG_AUDIO_CAPTURE` | `false` | Save incoming audio to files for debugging |
-| **Audio Configuration** |
-| `INPUT_SAMPLE_RATE` | `24000` | Input audio sample rate (widget format) |
-| `OUTPUT_SAMPLE_RATE` | `24000` | Output audio sample rate (for playback and lip-sync) |
-| `WAV2ARKIT_SAMPLE_RATE` | `16000` | Wav2Arkit model expected sample rate |
-| `BLENDSHAPE_FPS` | `30` | Output blendshape frame rate |
-| `AUDIO_CHUNK_DURATION` | `0.5` | Audio chunk duration in seconds for Wav2Arkit processing |
-| `TRANSCRIPT_CHARS_PER_SECOND` | `16.0` | Transcript timing estimation (chars/sec) |
-| **Authentication** |
+| `DEBUG` | `false` | Enable debug logging |
 | `AUTH_ENABLED` | `false` | Enable HMAC token authentication |
-| `AUTH_SECRET_KEY` | *(auto-generated)* | Secret key for HMAC signing (generate with `openssl rand -hex 32`) |
-| `AUTH_TOKEN_TTL` | `3600` | Token time-to-live in seconds |
-| `AUTH_ALLOWED_ORIGINS` | `localhost:5173,...` | CORS allowed origins (comma-separated) |
-| `AUTH_ENABLE_RATE_LIMITING` | `true` | Enable rate limiting |
+| `AUTH_SECRET_KEY` | *(auto-generated)* | HMAC signing key (`openssl rand -hex 32`) |
 
-See [.env.example](.env.example) for complete configuration template.
+See [.env.example](.env.example) for the complete configuration template.
 
 ## API Documentation
 
@@ -252,120 +217,31 @@ With authentication:
 ws://localhost:8080/ws?token=YOUR_AUTH_TOKEN
 ```
 
-#### Client → Server Messages
+#### Client -> Server Messages
 
 | Type | Payload | Description |
 |------|---------|-------------|
 | `text` | `{"type": "text", "data": "Hello"}` | Send text message to AI |
 | `audio_stream_start` | `{"type": "audio_stream_start", "userId": "user123"}` | Start audio streaming session |
-| `audio` | `{"type": "audio", "data": "<base64>"}` | Audio chunk (e.g. PCM16, 24kHz mono, base64-encoded) |
+| `audio` | `{"type": "audio", "data": "<base64>"}` | Audio chunk (PCM16, 24kHz mono, base64-encoded) |
 | `interrupt` | `{"type": "interrupt"}` | Explicitly interrupt AI response |
 | `ping` | `{"type": "ping"}` | Heartbeat to keep connection alive |
 
-#### Server → Client Messages
+#### Server -> Client Messages
 
 | Type | Description |
 |------|-------------|
-| `config` | Sent on connection. Contains negotiated audio settings (see below) |
+| `config` | Sent on connection. Contains negotiated audio settings |
 | `audio_start` | AI started responding. Includes `sessionId`, `turnId`, `sampleRate`, `format` |
-| `sync_frame` | Synchronized audio + blendshape frame at 30 FPS (see below) |
+| `sync_frame` | Synchronized audio + blendshape frame at 30 FPS |
 | `audio_chunk` | Fallback audio-only chunk when Wav2Arkit model is unavailable |
 | `audio_end` | AI finished responding. Includes `sessionId`, `turnId` |
-| `transcript_delta` | Streaming text fragment with timing offsets (see below) |
+| `transcript_delta` | Streaming text fragment with timing offsets |
 | `transcript_done` | Complete transcript for a turn (`role`: `"user"` or `"assistant"`) |
 | `avatar_state` | Avatar state change (`"Listening"` or `"Responding"`) |
 | `interrupt` | User interrupted AI response. Includes `turnId`, `offsetMs` |
 | `error` | Error message |
 | `pong` | Heartbeat response with `timestamp` |
-
-#### Server Message Payloads
-
-**`config`** — Sent immediately on WebSocket connection:
-```json
-{
-  "type": "config",
-  "audio": {
-    "inputSampleRate": 24000
-  }
-}
-```
-
-**`audio_start`** — AI started a new response turn:
-```json
-{
-  "type": "audio_start",
-  "sessionId": "...",
-  "turnId": "turn_1234567890_abcdef01",
-  "sampleRate": 24000,
-  "format": "audio/pcm16",
-  "timestamp": 1234567890123
-}
-```
-
-**`sync_frame`** — Synchronized audio + blendshape data (30 FPS):
-```json
-{
-  "type": "sync_frame",
-  "weights": { "jawOpen": 0.3, "mouthSmile_L": 0.5, ... },
-  "audio": "<base64-pcm16>",
-  "sessionId": "...",
-  "turnId": "...",
-  "timestamp": 1234567890123,
-  "frameIndex": 0
-}
-```
-
-**`audio_chunk`** — Fallback when Wav2Arkit model is not available (no blendshapes):
-```json
-{
-  "type": "audio_chunk",
-  "data": "<base64-pcm16>",
-  "sessionId": "...",
-  "timestamp": 1234567890123
-}
-```
-
-**`transcript_delta`** — Streaming text with timing offsets for client sync:
-```json
-{
-  "type": "transcript_delta",
-  "text": "Hello",
-  "role": "assistant",
-  "turnId": "...",
-  "sessionId": "...",
-  "timestamp": 1234567890123,
-  "startOffset": 0,
-  "endOffset": 312
-}
-```
-
-**`interrupt`** — Sent when user interrupts an AI response:
-```json
-{
-  "type": "interrupt",
-  "timestamp": 1234567890123,
-  "turnId": "...",
-  "offsetMs": 1500
-}
-```
-
-#### Blendshape Weights Format
-
-The `weights` object in `sync_frame` messages contains 52 ARKit-compatible blendshape coefficients (0.0-1.0):
-
-```json
-{
-  "browInnerUp": 0.0,
-  "browDown_L": 0.0,
-  "browDown_R": 0.0,
-  "jawOpen": 0.3,
-  "mouthSmile_L": 0.5,
-  "mouthSmile_R": 0.5,
-  ...
-}
-```
-
-See [ARKit Blendshape Documentation](https://developer.apple.com/documentation/arkit/arfaceanchor/blendshapelocation) for complete list.
 
 ## Docker Usage
 
@@ -382,19 +258,19 @@ The Dockerfile uses a multi-stage build optimized for CPU-only production:
 
 ```bash
 # Build image
-docker build -t avatar-chat-server .
+docker build -t nyxclaw .
 
 # Run (CPU-only)
 docker run -d \
-  --name avatar-chat-server \
+  --name nyxclaw \
   -p 8080:8080 \
   --env-file .env \
   -v $(pwd)/pretrained_models:/app/pretrained_models:ro \
   --restart unless-stopped \
-  avatar-chat-server
+  nyxclaw
 
 # View logs
-docker logs -f avatar-chat-server
+docker logs -f nyxclaw
 
 # Health check
 curl http://localhost:8080/health
@@ -403,15 +279,7 @@ curl http://localhost:8080/health
 ### Docker Compose Profiles
 
 - **Default (Production)**: `docker-compose up -d`
-  - Optimized production build
-  - Runs as non-root user
-  - Health checks enabled
-  - Auto-restart on failure
-
 - **Development**: `docker-compose --profile dev up`
-  - Hot reload enabled
-  - Source code mounted as volume
-  - Debug logging enabled
 
 ## Authentication
 
@@ -426,8 +294,6 @@ AUTH_SECRET_KEY=your-secret-key-here-generate-with-openssl-rand-hex-32
 AUTH_ALLOWED_ORIGINS=https://yourwebsite.com,https://www.yourwebsite.com
 ```
 
-If `AUTH_SECRET_KEY` is not set, the server will auto-generate one at startup (not suitable for production — the key will change on each restart).
-
 ### Generate Secret Key
 
 ```bash
@@ -436,171 +302,77 @@ openssl rand -hex 32
 
 ### Getting a Token
 
-The token endpoint validates the `Origin` header and returns a signed token for that origin:
-
 ```bash
 curl -X POST http://localhost:8080/api/auth/token \
   -H "Origin: https://yourwebsite.com"
 ```
 
-Response:
-```json
-{
-  "token": "base64-encoded-hmac-token",
-  "ttl": 3600,
-  "origin": "https://yourwebsite.com"
-}
-```
-
 ### Using the Token
 
-Include in WebSocket URL:
 ```
 ws://localhost:8080/ws?token=YOUR_AUTH_TOKEN
 ```
 
-### Security Layers
-
-The authentication middleware implements a 4-layer security model:
-
-1. **Origin Validation** — Whitelist check against `AUTH_ALLOWED_ORIGINS`
-2. **HMAC Token Verification** — Signature and expiry validation
-3. **Rate Limiting** — Token bucket algorithm (if enabled)
-4. **Monitoring** — Audit logging
-
-### Rate Limiting
-
-When enabled, uses a **token bucket algorithm** with two levels:
-
-- **Per-domain**: 100 token capacity, refills at 10 tokens/sec
-- **Per-session**: 30 token capacity, refills at 5 tokens/sec
-
-Exceeding limits results in WebSocket-level rejection (not HTTP 429).
-
-## Performance Best Practices
-
-### Hardware Recommendations
-
-- **CPU**: 4+ cores recommended for real-time ONNX inference (8+ cores optimal)
-- **RAM**: 8GB+ (16GB recommended)
-- **Network**: Low-latency connection to AI API (< 100ms recommended)
-
-### CPU Optimization Notes
-
-The server uses ONNX Runtime for CPU-optimized inference. For best performance:
-- ONNX Runtime automatically uses the best available SIMD instructions (SSE, AVX2, AVX-512)
-- Ensure sufficient RAM (16GB+ recommended)
-- Monitor RTF (Real-Time Factor) in debug logs; aim for <1.0
-- If audio drops occur, consider reducing `audio_chunk_duration` in config
-
-### Optimizations
-
-The server implements several performance optimizations for real-time operation:
-
-1. **Model Warmup**: Eliminates first-inference delay
-2. **orjson**: 3-5x faster JSON serialization
-3. **Base64 Pre-encoding**: Moves encoding off critical 30 FPS broadcast path
-4. **Bounded Queues**: Prevents memory exhaustion under load
-5. **Fire-and-forget Tasks**: Non-blocking broadcast to WebSocket clients
-
-### Monitoring
-
-Check server logs for performance indicators:
-```bash
-# Debug mode shows timing information
-DEBUG=true uv run python src/main.py
-```
-
-Key metrics:
-- WebSocket connection count
-- Audio processing latency
-- Model inference time
-- Queue depths
-
 ## Agent Modularity
 
-The server uses a modular agent system allowing different conversational AI backends:
+The server uses a modular agent system for different Claw backends:
 
-### Sample Agents
+### Available Agents
 
-- **sample_openai**: Uses OpenAI Realtime API (default)
-- **sample_gemini**: Uses Google Gemini Live API
-- **sample_openclaw**: Uses OpenClaw HTTP gateway with local STT/TTS
-- **sample_zeroclaw**: Uses ZeroClaw WebSocket gateway (`/ws/chat`) with local STT/TTS
+- **sample_openclaw**: OpenClaw HTTP gateway with SSE streaming (`/v1/chat/completions`)
+- **sample_zeroclaw**: ZeroClaw WebSocket gateway (`/ws/chat`)
 
-### Quick `.env` switch: ZeroClaw
+Both agents use the same local STT/TTS pipeline (faster-whisper + Piper VITS ONNX).
+
+### Quick `.env` switch
 
 ```dotenv
+# OpenClaw
+AGENT_TYPE=sample_openclaw
+BASE_URL=http://127.0.0.1:19001
+AUTH_TOKEN=your-openclaw-token
+AGENT_MODEL=openclaw:main
+
+# ZeroClaw
 AGENT_TYPE=sample_zeroclaw
-
-# ZeroClaw gateway
-ZEROCLAW_BASE_URL=http://127.0.0.1:5555
-ZEROCLAW_WS_TOKEN=
-ZEROCLAW_MODEL=zeroclaw:main
-ZEROCLAW_THINKING_MODE=minimal
-
-# Local STT/TTS (same pipeline as sample_openclaw)
-ZEROCLAW_STT_ENABLED=true
-ZEROCLAW_STT_MODEL=base.en
-ZEROCLAW_TTS_ENABLED=true
-ZEROCLAW_TTS_VOICE_NAME=en_US-ljspeech-high
+BASE_URL=http://127.0.0.1:5555
+AUTH_TOKEN=your-zeroclaw-token
+AGENT_MODEL=zeroclaw:main
 ```
 
 ### Custom Agents
 
-Implement the `BaseAgent` interface for custom AI services:
+Implement the `BaseAgent` interface:
 
 ```python
 from agents import BaseAgent, ConversationState
 
 class MyCustomAgent(BaseAgent):
     @property
-    def is_connected(self) -> bool:
-        # Return connection status
-        ...
+    def is_connected(self) -> bool: ...
 
     @property
-    def state(self) -> ConversationState:
-        # Return current conversation state
-        ...
+    def state(self) -> ConversationState: ...
 
     @property
-    def transcript_speed(self) -> float:
-        # Transcript chars/sec for client sync (e.g., 15.0)
-        ...
+    def transcript_speed(self) -> float: ...
 
-    def set_event_handlers(self, **kwargs) -> None:
-        # Store callbacks: on_audio_delta, on_transcript_delta,
-        # on_response_start, on_response_end, on_user_transcript,
-        # on_interrupted, on_error
-        ...
+    def set_event_handlers(self, **kwargs) -> None: ...
 
-    async def connect(self) -> None:
-        # Connect to your AI service
-        ...
+    async def connect(self) -> None: ...
 
-    def send_text_message(self, text: str) -> None:
-        # Send text to AI
-        ...
+    def send_text_message(self, text: str) -> None: ...
 
-    def append_audio(self, audio_bytes: bytes) -> None:
-        # Send audio to AI (PCM16 bytes)
-        ...
+    def append_audio(self, audio_bytes: bytes) -> None: ...
 
-    async def disconnect(self) -> None:
-        # Disconnect from your AI service
-        ...
+    async def disconnect(self) -> None: ...
 ```
-
-Set `AGENT_TYPE=remote` and `AGENT_URL=ws://your-agent-service/ws` for remote agents.
 
 ### Switching Agents
 
 1. Set `AGENT_TYPE` in `.env`
-2. Provide required API keys
+2. Update `BASE_URL` and `AUTH_TOKEN` for your backend
 3. Restart the server
-
-The core chat-server (WebSocket handling, blendshape generation) remains unchanged.
 
 ## Development
 
@@ -610,44 +382,19 @@ The core chat-server (WebSocket handling, blendshape generation) remains unchang
 uv sync --group dev
 ```
 
-### Code Quality Tools
-
-This project uses [Ruff](https://docs.astral.sh/ruff/) for linting and formatting, and [ty](https://github.com/astral-sh/ty) for static type checking.
-
-#### Linting
+### Code Quality
 
 ```bash
-# Check for linting issues
+# Lint
 uv run ruff check src/
 
-# Auto-fix linting issues
-uv run ruff check src/ --fix
-
-# Fix with unsafe fixes (use with caution)
-uv run ruff check src/ --fix --unsafe-fixes
-```
-
-#### Formatting
-
-```bash
-# Check formatting
-uv run ruff format src/ --check
-
-# Format code
+# Format
 uv run ruff format src/
-```
 
-#### Type Checking
-
-```bash
-# Run static type analysis
+# Type check
 uv run ty check src/
-```
 
-#### Run All Checks
-
-```bash
-# Lint, format, and type check
+# All checks
 uv run ruff check src/ --fix && uv run ruff format src/ && uv run ty check src/
 ```
 
@@ -666,5 +413,5 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - [Apple ARKit](https://developer.apple.com/augmented-reality/arkit/) for the blendshape specification standard
 - [LAM Audio2Expression](https://github.com/aigc3d/LAM_Audio2Expression) for facial animation model
 - [Wav2Vec 2.0](https://ai.meta.com/blog/wav2vec-20-learning-the-structure-of-speech-from-raw-audio/) for speech representation learning
-- [OpenAI](https://openai.com/) for Realtime API
-- [Google](https://ai.google.dev/) for Gemini Live API
+- [Piper TTS](https://github.com/rhasspy/piper) for VITS ONNX text-to-speech
+- [faster-whisper](https://github.com/SYSTRAN/faster-whisper) for CTranslate2 speech-to-text

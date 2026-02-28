@@ -1,7 +1,7 @@
 [project]
-name = "avatar-chat-server"
+name = "nyxclaw"
 version = "1.0.0"
-description = "Real-time voice-to-avatar interaction server combining OpenAI Realtime API with Wav2Arkit model"
+description = "Voice-to-avatar UI server for Claw-based agents with Wav2Arkit facial animation"
 readme = "README.md"
 requires-python = "==3.10.*"
 license = { text = "MIT" }
@@ -12,7 +12,7 @@ dependencies = [
     "uvicorn[standard]>=0.27.0",
     "pydantic-settings>=2.1.0",
 
-    # WebSocket support (for OpenAI Realtime client)
+    # WebSocket support
     "websockets>=12.0",
 
     # Performance - Fast JSON serialization
@@ -33,10 +33,8 @@ dependencies = [
     "onnxruntime>=1.23.2; platform_system != 'Windows'",
 
     # AI Agent dependencies
-    "google-genai>=1.0.0",  # Google GenAI SDK for Gemini Live API
     "httpx>=0.27.0",  # Async HTTP client for OpenClaw agent (SSE streaming)
-    
-    
+
 ]
 
 [project.optional-dependencies]

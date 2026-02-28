@@ -1,5 +1,5 @@
 # ==============================================================================
-# Avatar Chat Server - Docker Compose Configuration
+# NyxClaw - Docker Compose Configuration
 # ==============================================================================
 #
 # Usage:
@@ -12,7 +12,7 @@
 
 services:
   # ============================================================================
-  # Avatar Chat Server (Production)
+  # NyxClaw (Production)
   # ============================================================================
   server:
     build:
@@ -20,20 +20,10 @@ services:
       target: production
       args:
         INSTALL_LOCAL_VOICE: ${INSTALL_LOCAL_VOICE:-false}
-    container_name: avatar-chat-server
+    container_name: nyxclaw
     ports:
       - "${SERVER_PORT:-8080}:8080"
     environment:
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o-realtime-preview}
-      - OPENAI_VOICE=${OPENAI_VOICE:-alloy}
-      - OPENAI_VAD_TYPE=${OPENAI_VAD_TYPE:-server_vad}
-      - OPENAI_VAD_THRESHOLD=${OPENAI_VAD_THRESHOLD:-0.5}
-      - OPENAI_VAD_SILENCE_DURATION_MS=${OPENAI_VAD_SILENCE_DURATION_MS:-300}
-      - OPENAI_VAD_PREFIX_PADDING_MS=${OPENAI_VAD_PREFIX_PADDING_MS:-300}
-      - OPENAI_TRANSCRIPTION_MODEL=${OPENAI_TRANSCRIPTION_MODEL:-gpt-4o-mini-transcribe}
-      - OPENAI_TRANSCRIPTION_LANGUAGE=${OPENAI_TRANSCRIPTION_LANGUAGE:-en}
-      - OPENAI_NOISE_REDUCTION=${OPENAI_NOISE_REDUCTION:-near_field}
       - ASSISTANT_INSTRUCTIONS=${ASSISTANT_INSTRUCTIONS:-You are a helpful and friendly AI assistant.}
       - ONNX_MODEL_PATH=/app/pretrained_models/wav2arkit/wav2arkit_cpu.onnx
       - SERVER_HOST=0.0.0.0
@@ -42,49 +32,30 @@ services:
       - DEBUG=${DEBUG:-false}
       - DEBUG_AUDIO_CAPTURE=${DEBUG_AUDIO_CAPTURE:-false}
       # Agent Configuration
-      - AGENT_TYPE=${AGENT_TYPE:-sample_gemini}
-      # OpenClaw Configuration
-      - OPENCLAW_API_TOKEN=${OPENCLAW_API_TOKEN}
-      - OPENCLAW_BASE_URL=${OPENCLAW_BASE_URL:-http://host.docker.internal:19001}
-      - OPENCLAW_MODEL=${OPENCLAW_MODEL:-openclaw:main}
-      - OPENCLAW_USER_ID=${OPENCLAW_USER_ID}
-      - OPENCLAW_SESSION_KEY=${OPENCLAW_SESSION_KEY}
-      - OPENCLAW_AGENT_ID=${OPENCLAW_AGENT_ID}
-      - OPENCLAW_THINKING_MODE=${OPENCLAW_THINKING_MODE:-minimal}
-      - OPENCLAW_STT_MODEL=${OPENCLAW_STT_MODEL:-small.en}
-      - OPENCLAW_STT_VAD_START_THRESHOLD=${OPENCLAW_STT_VAD_START_THRESHOLD:-0.60}
-      - OPENCLAW_STT_VAD_END_THRESHOLD=${OPENCLAW_STT_VAD_END_THRESHOLD:-0.35}
-      - OPENCLAW_STT_VAD_MIN_SILENCE_MS=${OPENCLAW_STT_VAD_MIN_SILENCE_MS:-500}
+      - AGENT_TYPE=${AGENT_TYPE:-sample_openclaw}
+      # Agent Backend Configuration
+      - BASE_URL=${BASE_URL:-http://host.docker.internal:19001}
+      - AUTH_TOKEN=${AUTH_TOKEN}
+      - AGENT_MODEL=${AGENT_MODEL:-openclaw:main}
+      - USER_ID=${USER_ID}
+      - THINKING_MODE=${THINKING_MODE:-minimal}
+      - SESSION_KEY=${SESSION_KEY}
+      - AGENT_ID=${AGENT_ID}
+      - MAX_RETRIES=${MAX_RETRIES:-2}
+      # STT/TTS Configuration
+      - STT_ENABLED=${STT_ENABLED:-true}
+      - STT_MODEL=${STT_MODEL:-small.en}
+      - STT_VAD_START_THRESHOLD=${STT_VAD_START_THRESHOLD:-0.60}
+      - STT_VAD_END_THRESHOLD=${STT_VAD_END_THRESHOLD:-0.35}
+      - STT_VAD_MIN_SILENCE_MS=${STT_VAD_MIN_SILENCE_MS:-500}
       - STT_INITIAL_PROMPT=${STT_INITIAL_PROMPT:-}
-      - OPENCLAW_TTS_ONNX_MODEL_DIR=${OPENCLAW_TTS_ONNX_MODEL_DIR:-/app/pretrained_models/piper}
-      - OPENCLAW_TTS_VOICE_NAME=${OPENCLAW_TTS_VOICE_NAME:-en_US-hfc_female-medium}
-      - OPENCLAW_TTS_VOICE_PATH=${OPENCLAW_TTS_VOICE_PATH}
-      - OPENCLAW_TTS_NOISE_SCALE=${OPENCLAW_TTS_NOISE_SCALE:-0.75}
-      - OPENCLAW_TTS_NOISE_W_SCALE=${OPENCLAW_TTS_NOISE_W_SCALE:-0.8}
-      - OPENCLAW_TTS_LENGTH_SCALE=${OPENCLAW_TTS_LENGTH_SCALE:-0.95}
-      # ZeroClaw Configuration
-      - ZEROCLAW_BASE_URL=${ZEROCLAW_BASE_URL}
-      - ZEROCLAW_WS_TOKEN=${ZEROCLAW_WS_TOKEN}
-      - ZEROCLAW_MODEL=${ZEROCLAW_MODEL:-zeroclaw:main}
-      - ZEROCLAW_THINKING_MODE=${ZEROCLAW_THINKING_MODE:-minimal}
-      - ZEROCLAW_STT_MODEL=${ZEROCLAW_STT_MODEL:-small.en}
-      - ZEROCLAW_STT_VAD_START_THRESHOLD=${ZEROCLAW_STT_VAD_START_THRESHOLD:-0.60}
-      - ZEROCLAW_STT_VAD_END_THRESHOLD=${ZEROCLAW_STT_VAD_END_THRESHOLD:-0.35}
-      - ZEROCLAW_STT_VAD_MIN_SILENCE_MS=${ZEROCLAW_STT_VAD_MIN_SILENCE_MS:-500}
-      - ZEROCLAW_TTS_ONNX_MODEL_DIR=${ZEROCLAW_TTS_ONNX_MODEL_DIR:-/app/pretrained_models/piper}
-      - ZEROCLAW_TTS_VOICE_NAME=${ZEROCLAW_TTS_VOICE_NAME:-en_US-hfc_female-medium}
-      - ZEROCLAW_TTS_VOICE_PATH=${ZEROCLAW_TTS_VOICE_PATH}
-      - ZEROCLAW_TTS_NOISE_SCALE=${ZEROCLAW_TTS_NOISE_SCALE:-0.75}
-      - ZEROCLAW_TTS_NOISE_W_SCALE=${ZEROCLAW_TTS_NOISE_W_SCALE:-0.8}
-      - ZEROCLAW_TTS_LENGTH_SCALE=${ZEROCLAW_TTS_LENGTH_SCALE:-0.95}
-      # Gemini Configuration
-      - GEMINI_API_KEY=${GEMINI_API_KEY}
-      - GEMINI_MODEL=${GEMINI_MODEL}
-      - GEMINI_VOICE=${GEMINI_VOICE}
-      - GEMINI_THINKING_BUDGET=${GEMINI_THINKING_BUDGET}
-      - GEMINI_GOOGLE_SEARCH_GROUNDING=${GEMINI_GOOGLE_SEARCH_GROUNDING}
-      - GEMINI_PROACTIVE_AUDIO=${GEMINI_PROACTIVE_AUDIO}
-      - GEMINI_CONTEXT_WINDOW_COMPRESSION=${GEMINI_CONTEXT_WINDOW_COMPRESSION}
+      - TTS_ENABLED=${TTS_ENABLED:-true}
+      - TTS_ONNX_MODEL_DIR=${TTS_ONNX_MODEL_DIR:-/app/pretrained_models/piper}
+      - TTS_VOICE_NAME=${TTS_VOICE_NAME:-en_US-hfc_female-medium}
+      - TTS_VOICE_PATH=${TTS_VOICE_PATH}
+      - TTS_NOISE_SCALE=${TTS_NOISE_SCALE:-0.75}
+      - TTS_NOISE_W_SCALE=${TTS_NOISE_W_SCALE:-0.8}
+      - TTS_LENGTH_SCALE=${TTS_LENGTH_SCALE:-0.95}
       - KNOWLEDGE_BASE_SOURCE=${KNOWLEDGE_BASE_SOURCE:-none}
     volumes:
       - ./data:/app/data
@@ -102,7 +73,7 @@ services:
       start_period: 10s
 
   # ============================================================================
-  # Avatar Chat Server (Development with hot reload)
+  # NyxClaw (Development with hot reload)
   # ============================================================================
   server-dev:
     build:
@@ -110,15 +81,12 @@ services:
       target: development
       args:
         INSTALL_LOCAL_VOICE: ${INSTALL_LOCAL_VOICE:-false}
-    container_name: avatar-chat-server-dev
+    container_name: nyxclaw-dev
     profiles:
       - dev
     ports:
       - "${SERVER_PORT:-8080}:8080"
     environment:
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o-realtime-preview}
-      - OPENAI_VOICE=${OPENAI_VOICE:-alloy}
       - ASSISTANT_INSTRUCTIONS=${ASSISTANT_INSTRUCTIONS:-You are a helpful and friendly AI assistant.}
       - ONNX_MODEL_PATH=/app/pretrained_models/wav2arkit/wav2arkit_cpu.onnx
       - SERVER_HOST=0.0.0.0
@@ -126,49 +94,30 @@ services:
       - AUTH_ENABLED=false
       - DEBUG=true
       # Agent Configuration
-      - AGENT_TYPE=${AGENT_TYPE:-sample_gemini}
-      # OpenClaw Configuration
-      - OPENCLAW_API_TOKEN=${OPENCLAW_API_TOKEN}
-      - OPENCLAW_BASE_URL=${OPENCLAW_BASE_URL:-http://host.docker.internal:19001}
-      - OPENCLAW_MODEL=${OPENCLAW_MODEL:-openclaw:main}
-      - OPENCLAW_USER_ID=${OPENCLAW_USER_ID}
-      - OPENCLAW_SESSION_KEY=${OPENCLAW_SESSION_KEY}
-      - OPENCLAW_AGENT_ID=${OPENCLAW_AGENT_ID}
-      - OPENCLAW_THINKING_MODE=${OPENCLAW_THINKING_MODE:-minimal}
-      - OPENCLAW_STT_MODEL=${OPENCLAW_STT_MODEL:-small.en}
-      - OPENCLAW_STT_VAD_START_THRESHOLD=${OPENCLAW_STT_VAD_START_THRESHOLD:-0.60}
-      - OPENCLAW_STT_VAD_END_THRESHOLD=${OPENCLAW_STT_VAD_END_THRESHOLD:-0.35}
-      - OPENCLAW_STT_VAD_MIN_SILENCE_MS=${OPENCLAW_STT_VAD_MIN_SILENCE_MS:-500}
+      - AGENT_TYPE=${AGENT_TYPE:-sample_openclaw}
+      # Agent Backend Configuration
+      - BASE_URL=${BASE_URL:-http://host.docker.internal:19001}
+      - AUTH_TOKEN=${AUTH_TOKEN}
+      - AGENT_MODEL=${AGENT_MODEL:-openclaw:main}
+      - USER_ID=${USER_ID}
+      - THINKING_MODE=${THINKING_MODE:-minimal}
+      - SESSION_KEY=${SESSION_KEY}
+      - AGENT_ID=${AGENT_ID}
+      - MAX_RETRIES=${MAX_RETRIES:-2}
+      # STT/TTS Configuration
+      - STT_ENABLED=${STT_ENABLED:-true}
+      - STT_MODEL=${STT_MODEL:-small.en}
+      - STT_VAD_START_THRESHOLD=${STT_VAD_START_THRESHOLD:-0.60}
+      - STT_VAD_END_THRESHOLD=${STT_VAD_END_THRESHOLD:-0.35}
+      - STT_VAD_MIN_SILENCE_MS=${STT_VAD_MIN_SILENCE_MS:-500}
       - STT_INITIAL_PROMPT=${STT_INITIAL_PROMPT:-}
-      - OPENCLAW_TTS_ONNX_MODEL_DIR=${OPENCLAW_TTS_ONNX_MODEL_DIR:-/app/pretrained_models/piper}
-      - OPENCLAW_TTS_VOICE_NAME=${OPENCLAW_TTS_VOICE_NAME:-en_US-hfc_female-medium}
-      - OPENCLAW_TTS_VOICE_PATH=${OPENCLAW_TTS_VOICE_PATH}
-      - OPENCLAW_TTS_NOISE_SCALE=${OPENCLAW_TTS_NOISE_SCALE:-0.75}
-      - OPENCLAW_TTS_NOISE_W_SCALE=${OPENCLAW_TTS_NOISE_W_SCALE:-0.8}
-      - OPENCLAW_TTS_LENGTH_SCALE=${OPENCLAW_TTS_LENGTH_SCALE:-0.95}
-      # ZeroClaw Configuration
-      - ZEROCLAW_BASE_URL=${ZEROCLAW_BASE_URL}
-      - ZEROCLAW_WS_TOKEN=${ZEROCLAW_WS_TOKEN}
-      - ZEROCLAW_MODEL=${ZEROCLAW_MODEL:-zeroclaw:main}
-      - ZEROCLAW_THINKING_MODE=${ZEROCLAW_THINKING_MODE:-minimal}
-      - ZEROCLAW_STT_MODEL=${ZEROCLAW_STT_MODEL:-small.en}
-      - ZEROCLAW_STT_VAD_START_THRESHOLD=${ZEROCLAW_STT_VAD_START_THRESHOLD:-0.60}
-      - ZEROCLAW_STT_VAD_END_THRESHOLD=${ZEROCLAW_STT_VAD_END_THRESHOLD:-0.35}
-      - ZEROCLAW_STT_VAD_MIN_SILENCE_MS=${ZEROCLAW_STT_VAD_MIN_SILENCE_MS:-500}
-      - ZEROCLAW_TTS_ONNX_MODEL_DIR=${ZEROCLAW_TTS_ONNX_MODEL_DIR:-/app/pretrained_models/piper}
-      - ZEROCLAW_TTS_VOICE_NAME=${ZEROCLAW_TTS_VOICE_NAME:-en_US-hfc_female-medium}
-      - ZEROCLAW_TTS_VOICE_PATH=${ZEROCLAW_TTS_VOICE_PATH}
-      - ZEROCLAW_TTS_NOISE_SCALE=${ZEROCLAW_TTS_NOISE_SCALE:-0.75}
-      - ZEROCLAW_TTS_NOISE_W_SCALE=${ZEROCLAW_TTS_NOISE_W_SCALE:-0.8}
-      - ZEROCLAW_TTS_LENGTH_SCALE=${ZEROCLAW_TTS_LENGTH_SCALE:-0.95}
-      # Gemini Configuration
-      - GEMINI_API_KEY=${GEMINI_API_KEY}
-      - GEMINI_MODEL=${GEMINI_MODEL}
-      - GEMINI_VOICE=${GEMINI_VOICE}
-      - GEMINI_THINKING_BUDGET=${GEMINI_THINKING_BUDGET}
-      - GEMINI_GOOGLE_SEARCH_GROUNDING=${GEMINI_GOOGLE_SEARCH_GROUNDING}
-      - GEMINI_PROACTIVE_AUDIO=${GEMINI_PROACTIVE_AUDIO}
-      - GEMINI_CONTEXT_WINDOW_COMPRESSION=${GEMINI_CONTEXT_WINDOW_COMPRESSION}
+      - TTS_ENABLED=${TTS_ENABLED:-true}
+      - TTS_ONNX_MODEL_DIR=${TTS_ONNX_MODEL_DIR:-/app/pretrained_models/piper}
+      - TTS_VOICE_NAME=${TTS_VOICE_NAME:-en_US-hfc_female-medium}
+      - TTS_VOICE_PATH=${TTS_VOICE_PATH}
+      - TTS_NOISE_SCALE=${TTS_NOISE_SCALE:-0.75}
+      - TTS_NOISE_W_SCALE=${TTS_NOISE_W_SCALE:-0.8}
+      - TTS_LENGTH_SCALE=${TTS_LENGTH_SCALE:-0.95}
       - KNOWLEDGE_BASE_SOURCE=${KNOWLEDGE_BASE_SOURCE:-none}
     volumes:
       - .:/app

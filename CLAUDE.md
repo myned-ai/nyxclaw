@@ -1,6 +1,20 @@
-# avatar-chat-server
+# nyxclaw
 
-Real-time voice-to-avatar server. Multi-agent (OpenAI, Gemini, OpenClaw, ZeroClaw) with local STT/TTS pipeline via ONNX. Audio format: PCM16 @ 24kHz.
+Voice-to-avatar UI server for Claw-based agents. Currently supports OpenClaw and ZeroClaw, designed to expand to additional Claw agents. Local STT/TTS pipeline via ONNX. Audio format: PCM16 @ 24kHz.
+
+## What This Is
+
+A real-time WebSocket server that bridges a frontend client and Claw-based AI backends. It doesn't just relay audio — it runs a **Wav2Arkit ONNX model** on every audio chunk the AI produces, generating 52 Apple ARKit facial blendshapes at 30 FPS, then streams synchronized `(audio + blendshape)` packets so a 3D avatar can lip-sync in real time on CPU.
+
+### End-to-end flow
+
+1. **Client connects** via WebSocket to `/ws` (with optional HMAC-SHA256 token auth)
+2. **User speaks** — PCM16 @ 24kHz audio streams in, Silero VAD (ONNX) detects speech boundaries, faster-whisper transcribes
+3. **Claw agent processes** — transcript goes to OpenClaw (HTTP SSE) or ZeroClaw (WebSocket), LLM response streams back
+4. **Local TTS** — Piper VITS (ONNX) synthesizes speech from LLM text, sentence-by-sentence for low latency
+5. **Wav2Arkit inference** — TTS audio is fed through `wav2arkit_cpu.onnx` to produce 52 ARKit blendshape weights per frame
+6. **Paced output** — `sync_frame` messages stream to the client at real-time rate with audio + blendshapes + synced transcript
+7. **Barge-in** — VAD monitors during playback; 4 consecutive speech frames (~128 ms) trigger immediate cancellation of LLM + TTS + playback
 
 ## Build & Run
 
@@ -42,14 +56,12 @@ uv run ruff format src/               # format
 ## Key Files
 
 - `src/core/settings.py` — Pydantic BaseSettings, env var resolution, `resolved_onnx_model_path`
-- `src/agents/base_agent.py` — Abstract agent interface (all agents inherit this)
+- `src/agents/base_agent.py` — Abstract agent interface (all Claw agents inherit this)
+- `src/agents/openclaw/` — OpenClaw agent implementation
+- `src/agents/zeroclaw/` — ZeroClaw agent implementation
 - `src/chat/chat_session.py` — WebSocket session, audio playback, wav2arkit inference, barge-in
 - `src/services/stt_service.py` — Silero VAD (ONNX) + faster-whisper transcription
 - `src/services/tts_service.py` — Piper VITS ONNX text-to-speech
-
-## Audio Pipeline
-
-Before modifying STT, TTS, VAD, barge-in, or agent audio code, **read `STT_TTS_PIPELINE_HANDOFF.md`** first. It contains architecture diagrams, open problems (P1-P4), and exact line references.
 
 ## Git
 

@@ -3,9 +3,6 @@ Application Configuration
 
 Centralized configuration using Pydantic Settings for type-safe
 environment variable management with validation.
-
-This module contains ONLY vendor-agnostic settings.
-Vendor-specific settings (OpenAI, Gemini) are managed by their respective agents.
 """
 
 from functools import lru_cache
@@ -57,10 +54,7 @@ class Settings(BaseSettings):
     auth_enable_rate_limiting: bool = True
 
     # Agent Configuration
-    agent_type: str = (
-        "sample_openai"  # "sample_openai", "sample_gemini", "sample_openclaw", "sample_zeroclaw", "remote"
-    )
-    agent_url: str | None = None  # URL for remote agent (e.g., "ws://agent-service:8080/ws")
+    agent_type: str = "sample_openclaw"  # "sample_openclaw", "sample_zeroclaw"
 
     # Audio Configuration (vendor-agnostic)
     # Note: Widget sends 24kHz audio. This is used for Wav2Arkit processing.

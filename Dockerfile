@@ -1,14 +1,14 @@
 # ==============================================================================
-# Avatar Chat Server - CPU-Only Dockerfile
+# NyxClaw - CPU-Only Dockerfile
 # ==============================================================================
 # Multi-stage build optimized for ONNX CPU inference.
 #
 # Build:
-#   docker build -t avatar-chat-server .
-#   docker build --build-arg INSTALL_LOCAL_VOICE=true -t avatar-chat-server:local-voice .
+#   docker build -t nyxclaw .
+#   docker build --build-arg INSTALL_LOCAL_VOICE=true -t nyxclaw:local-voice .
 #
 # Run:
-#   docker run -p 8080:8080 --env-file .env avatar-chat-server
+#   docker run -p 8080:8080 --env-file .env nyxclaw
 # ==============================================================================
 
 # ------------------------------------------------------------------------------

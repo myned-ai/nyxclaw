@@ -1,11 +1,11 @@
-# Avatar Chat Client Implementation Specification
+# NyxClaw Client Implementation Specification
 
-**Version:** 1.4
-**Date:** February 12, 2026
+**Version:** 1.5
+**Date:** February 28, 2026
 **Target:** Client-Side Developers & AI Agents
 
 ## 1. Overview
-This document specifies the communication protocol and implementation requirements for a client connecting to the Avatar Chat Server. The server provides real-time conversational AI with specific orchestration for 3D Avatars (audio, blendshapes, transcripts) and handles server-side Voice Activity Detection (VAD) for interruptions. The server supports multiple backend agents (OpenAI, Gemini, or remote agents).
+This document specifies the communication protocol and implementation requirements for a client connecting to the NyxClaw server. The server provides real-time conversational AI with specific orchestration for 3D Avatars (audio, blendshapes, transcripts) and handles server-side Voice Activity Detection (VAD) for interruptions. The server supports Claw-based backend agents (OpenClaw, ZeroClaw) with local STT/TTS.
 
 ### 1.1 Transport
 - **Protocol:** WebSocket (WS/WSS)

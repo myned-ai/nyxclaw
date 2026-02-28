@@ -127,7 +127,7 @@ class SampleOpenClawAgent(BaseAgent):
         self._trim_history()
 
     def _trim_history(self) -> None:
-        max_messages = max(4, int(self._oc.openclaw_history_max_messages))
+        max_messages = max(4, int(self._oc.history_max_messages))
         if len(self._messages) <= max_messages:
             return
 
@@ -255,7 +255,7 @@ class SampleOpenClawAgent(BaseAgent):
 
     @property
     def transcript_speed(self) -> float:
-        return self._oc.openclaw_transcript_speed
+        return self._oc.transcript_speed
 
     @property
     def input_sample_rate(self) -> int:
@@ -301,37 +301,37 @@ class SampleOpenClawAgent(BaseAgent):
         logger.info("Connecting OpenClaw agent")
 
         # 1. Validate token
-        if not oc.openclaw_api_token:
+        if not oc.auth_token:
             raise ValueError(
-                "OPENCLAW_API_TOKEN is required — set it in .env or match gateway.auth.token in openclaw.json"
+                "AUTH_TOKEN is required — set it in .env or match gateway.auth.token in openclaw.json"
             )
 
         # 2. HTTP client
         headers: dict[str, str] = {
-            "Authorization": f"Bearer {oc.openclaw_api_token}",
+            "Authorization": f"Bearer {oc.auth_token}",
             "Content-Type": "application/json",
         }
-        if oc.openclaw_agent_id:
-            headers["x-openclaw-agent-id"] = oc.openclaw_agent_id
-        if oc.openclaw_session_key:
-            headers["x-openclaw-session-key"] = oc.openclaw_session_key
+        if oc.agent_id:
+            headers["x-openclaw-agent-id"] = oc.agent_id
+        if oc.session_key:
+            headers["x-openclaw-session-key"] = oc.session_key
 
         self._http_client = httpx.AsyncClient(
-            base_url=oc.openclaw_base_url,
+            base_url=oc.base_url,
             headers=headers,
             timeout=httpx.Timeout(
-                connect=oc.openclaw_connect_timeout,
-                read=oc.openclaw_read_timeout,
+                connect=oc.connect_timeout,
+                read=oc.read_timeout,
                 write=10.0,
                 pool=5.0,
             ),
-            transport=httpx.AsyncHTTPTransport(retries=max(0, oc.openclaw_max_retries)),
+            transport=httpx.AsyncHTTPTransport(retries=max(0, oc.max_retries)),
         )
 
         # 3. Knowledge / system prompt
         knowledge = await KnowledgeService.load_knowledge_base(self._settings.knowledge_base_source)
         self._system_prompt = KnowledgeService.format_instructions(self._settings.assistant_instructions, knowledge)
-        thinking_mode = (oc.openclaw_thinking_mode or "default").strip().lower()
+        thinking_mode = (oc.thinking_mode or "default").strip().lower()
         if thinking_mode in {"off", "minimal"}:
             guidance = (
                 "\n\nResponse style: prioritize low-latency concise answers. "
@@ -344,7 +344,7 @@ class SampleOpenClawAgent(BaseAgent):
         # 4. Connectivity probe (non-fatal)
         try:
             probe = await self._http_client.get("/", timeout=3.0)
-            logger.info(f"OpenClaw reachable at {oc.openclaw_base_url} (status={probe.status_code})")
+            logger.info(f"OpenClaw reachable at {oc.base_url} (status={probe.status_code})")
         except Exception as exc:
             logger.warning(f"OpenClaw probe: {exc}")
 
@@ -397,7 +397,7 @@ class SampleOpenClawAgent(BaseAgent):
 
         self._connected = True
         logger.info(
-            f"OpenClaw agent ready (stt={self._stt_available}, tts={self._tts_available}, model={oc.openclaw_model})"
+            f"OpenClaw agent ready (stt={self._stt_available}, tts={self._tts_available}, model={oc.agent_model})"
         )
 
     async def disconnect(self) -> None:
@@ -652,12 +652,12 @@ class SampleOpenClawAgent(BaseAgent):
         item_id = f"openclaw_{int(time.time() * 1000)}"
 
         payload: dict[str, Any] = {
-            "model": oc.openclaw_model,
+            "model": oc.agent_model,
             "messages": list(self._messages),
             "stream": True,
         }
-        if oc.openclaw_user_id:
-            payload["user"] = oc.openclaw_user_id
+        if oc.user_id:
+            payload["user"] = oc.user_id
 
         # ── Signal response start ───────────────────────────────────
         self._state.session_id = session_id
@@ -779,7 +779,7 @@ class SampleOpenClawAgent(BaseAgent):
         except asyncio.CancelledError:
             logger.debug("SSE stream cancelled")
         except httpx.ConnectError as exc:
-            error_msg = f"Cannot reach OpenClaw at {oc.openclaw_base_url}: {exc}. Is openclawd running?"
+            error_msg = f"Cannot reach OpenClaw at {oc.base_url}: {exc}. Is OpenClaw running?"
             logger.error(error_msg)
             if self._on_error:
                 await self._on_error({"error": error_msg})

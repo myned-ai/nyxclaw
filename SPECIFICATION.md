@@ -1,7 +1,7 @@
-# Avatar Chat Server - Technical Specification
+# NyxClaw - Technical Specification
 
 ## 1. Overview
-The **Avatar Chat Server** is a real-time, bidirectional interaction backend designed to power 3D avatar interfaces. It acts as a bridge between a client (web/mobile) and conversational AI agents (OpenAI Realtime API, Google Gemini Live), adding a critical layer of **audio-to-facial-animation** synthesis.
+**NyxClaw** is a real-time, bidirectional interaction backend designed to power 3D avatar interfaces. It acts as a bridge between a client (web/mobile) and Claw-based AI agents (OpenClaw, ZeroClaw), adding a critical layer of **audio-to-facial-animation** synthesis with local STT/TTS.
 
 Key capability: transforming raw audio streams into synchronized ARKit blendshapes in real-time on CPU.
 
@@ -12,13 +12,17 @@ Key capability: transforming raw audio streams into synchronized ARKit blendshap
 - **Framework**: FastAPI (ASGI)
 - **Protocol**: WebSockets (Real-time communication), HTTP (Health/Auth)
 - **Inference Engine**: ONNX Runtime (CPU-optimized)
+- **STT**: faster-whisper (CTranslate2) + Silero VAD (ONNX)
+- **TTS**: Piper VITS ONNX
 - **Package Manager**: uv
 
 ### 2.2 Core Modules
 - **`main.py`**: Application entry point, middleware configuration (CORS, Auth), and lifecycle management.
 - **`routers/chat_router.py`**: Handles WebSocket connections (`/ws`), manages session state, and orchestrates data flow between the client, the AI agent, and the inference service.
-- **`agents/`**: Abstract layer (`BaseAgent`) for swappable AI backends (`sample_openai`, `sample_gemini`, `remote`).
+- **`agents/`**: Abstract layer (`BaseAgent`) for swappable Claw backends (`sample_openclaw`, `sample_zeroclaw`).
 - **`wav2arkit/`**: Inference module (`Wav2ArkitInference`) that runs the `wav2arkit_cpu.onnx` model to generate 52 facial blendshapes from audio segments.
+- **`services/stt_service.py`**: Silero VAD (ONNX) + faster-whisper transcription.
+- **`services/tts_service.py`**: Piper VITS ONNX text-to-speech.
 
 ## 3. Interfaces & Protocols
 
@@ -27,7 +31,7 @@ Key capability: transforming raw audio streams into synchronized ARKit blendshap
 | :--- | :--- | :--- |
 | `GET` | `/` | Root info (name, version, status). |
 | `GET` | `/health` | Health check. Returns 503 if services are unhealthy. |
-| `POST` | `/api/auth/token` | Generates a JWT for WebSocket connection. Requires valid `Origin`. |
+| `POST` | `/api/auth/token` | Generates a token for WebSocket connection. Requires valid `Origin`. |
 | `GET` | `/docs` | OpenAPI / Swagger UI. |
 
 ### 3.2 WebSocket Protocol (`/ws`)
@@ -41,16 +45,15 @@ Key capability: transforming raw audio streams into synchronized ARKit blendshap
 - **`interrupt`**: Signals that the user interrupted the bot; client must cut audio.
 
 #### Upstream (Client -> Server)
-- **`audio_stream_start`**: usage initiator.
-- **`audio`**: Raw audio chunks (preferred as binary, or base64 wrapped JSON).
+- **`audio_stream_start`**: Usage initiator.
+- **`audio`**: Raw audio chunks (base64 wrapped JSON).
 - **`text`**: Text-only input.
 - **`interrupt`**: Client-triggered interruption.
 
 ## 4. Feature Specification
 
 ### 4.1 Real-Time Intelligence
-- **Pluggable Agents**: Switch between OpenAI GPT-4o Realtime and Google Gemini Live via configuration.
-    - *See [GEMINI_INTEGRATION_GUIDE.md](GEMINI_INTEGRATION_GUIDE.md) for Gemini-specific implementation details.*
+- **Pluggable Agents**: Switch between OpenClaw (HTTP SSE) and ZeroClaw (WebSocket) via `AGENT_TYPE` configuration.
 - **Low Latency**: Streaming architecture ensures minimal delay between user speech and avatar response.
 
 ### 4.2 Facial Animation Synthesis
@@ -59,7 +62,7 @@ Key capability: transforming raw audio streams into synchronized ARKit blendshap
 - **Synchronization**: Server guarantees 1:1 mapping between audio chunks and visual frames.
 
 ### 4.3 Security & Production
-- **Authentication**: Optional JWT-based auth flow (`AUTH_ENABLED=true`).
+- **Authentication**: Optional HMAC-based auth flow (`AUTH_ENABLED=true`).
 - **Rate Limiting**: Protects against abuse (requests per minute).
 - **CORS**: Configurable allowed origins.
 - **Dockerized**: Multi-stage Docker build for small, secure production images.
@@ -69,9 +72,10 @@ Key capability: transforming raw audio streams into synchronized ARKit blendshap
 Configured via `.env` or Environment Variables.
 
 **Key Variables:**
-- `OPENAI_API_KEY` / `GEMINI_API_KEY`: Model credentials.
-- `AGENT_TYPE`: Selector (`sample_openai`, `sample_gemini`, `remote`).
-- `ONNX_MODEL_PATH`: Path to the local model file.
+- `AGENT_TYPE`: Selector (`sample_openclaw`, `sample_zeroclaw`).
+- `BASE_URL` / `AUTH_TOKEN`: Agent backend connection.
+- `ONNX_MODEL_PATH`: Path to the Wav2Arkit model file.
+- `STT_ENABLED` / `TTS_ENABLED`: Toggle local voice pipeline.
 - `AUTH_ENABLED`: Toggle security features.
 - `DEBUG`: Toggle verbose logging.
 
