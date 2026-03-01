@@ -32,7 +32,7 @@ services:
       - DEBUG=${DEBUG:-false}
       - DEBUG_AUDIO_CAPTURE=${DEBUG_AUDIO_CAPTURE:-false}
       # Agent Configuration
-      - AGENT_TYPE=${AGENT_TYPE:-sample_openclaw}
+      - AGENT_TYPE=${AGENT_TYPE:-openclaw}
       # Agent Backend Configuration
       - BASE_URL=${BASE_URL:-http://host.docker.internal:19001}
       - AUTH_TOKEN=${AUTH_TOKEN}
@@ -56,9 +56,7 @@ services:
       - TTS_NOISE_SCALE=${TTS_NOISE_SCALE:-0.75}
       - TTS_NOISE_W_SCALE=${TTS_NOISE_W_SCALE:-0.8}
       - TTS_LENGTH_SCALE=${TTS_LENGTH_SCALE:-0.95}
-      - KNOWLEDGE_BASE_SOURCE=${KNOWLEDGE_BASE_SOURCE:-none}
     volumes:
-      - ./data:/app/data
       - ./pretrained_models/wav2arkit/wav2arkit_cpu.onnx:/app/pretrained_models/wav2arkit/wav2arkit_cpu.onnx:ro
       - ./pretrained_models/wav2arkit/wav2arkit_cpu.onnx.data:/app/pretrained_models/wav2arkit/wav2arkit_cpu.onnx.data:ro
       - ./pretrained_models/piper:/app/pretrained_models/piper:ro
@@ -94,7 +92,7 @@ services:
       - AUTH_ENABLED=false
       - DEBUG=true
       # Agent Configuration
-      - AGENT_TYPE=${AGENT_TYPE:-sample_openclaw}
+      - AGENT_TYPE=${AGENT_TYPE:-openclaw}
       # Agent Backend Configuration
       - BASE_URL=${BASE_URL:-http://host.docker.internal:19001}
       - AUTH_TOKEN=${AUTH_TOKEN}
@@ -118,7 +116,6 @@ services:
       - TTS_NOISE_SCALE=${TTS_NOISE_SCALE:-0.75}
       - TTS_NOISE_W_SCALE=${TTS_NOISE_W_SCALE:-0.8}
       - TTS_LENGTH_SCALE=${TTS_LENGTH_SCALE:-0.95}
-      - KNOWLEDGE_BASE_SOURCE=${KNOWLEDGE_BASE_SOURCE:-none}
     volumes:
       - .:/app
       - ./pretrained_models/wav2arkit/wav2arkit_cpu.onnx:/app/pretrained_models/wav2arkit/wav2arkit_cpu.onnx:ro

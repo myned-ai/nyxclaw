@@ -19,7 +19,7 @@ Key capability: transforming raw audio streams into synchronized ARKit blendshap
 ### 2.2 Core Modules
 - **`main.py`**: Application entry point, middleware configuration (CORS, Auth), and lifecycle management.
 - **`routers/chat_router.py`**: Handles WebSocket connections (`/ws`), manages session state, and orchestrates data flow between the client, the AI agent, and the inference service.
-- **`agents/`**: Abstract layer (`BaseAgent`) for swappable Claw backends (`sample_openclaw`, `sample_zeroclaw`).
+- **`backend/`**: Abstract layer (`BaseAgent`) for swappable Claw backends (`openclaw`, `zeroclaw`).
 - **`wav2arkit/`**: Inference module (`Wav2ArkitInference`) that runs the `wav2arkit_cpu.onnx` model to generate 52 facial blendshapes from audio segments.
 - **`services/stt_service.py`**: Silero VAD (ONNX) + faster-whisper transcription.
 - **`services/tts_service.py`**: Piper VITS ONNX text-to-speech.
@@ -72,7 +72,7 @@ Key capability: transforming raw audio streams into synchronized ARKit blendshap
 Configured via `.env` or Environment Variables.
 
 **Key Variables:**
-- `AGENT_TYPE`: Selector (`sample_openclaw`, `sample_zeroclaw`).
+- `AGENT_TYPE`: Selector (`openclaw`, `zeroclaw`).
 - `BASE_URL` / `AUTH_TOKEN`: Agent backend connection.
 - `ONNX_MODEL_PATH`: Path to the Wav2Arkit model file.
 - `STT_ENABLED` / `TTS_ENABLED`: Toggle local voice pipeline.

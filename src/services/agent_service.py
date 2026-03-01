@@ -4,10 +4,10 @@ Agent Service
 Provides agent instances based on configuration.
 """
 
-from agents import (
+from backend import (
     BaseAgent,
-    SampleOpenClawAgent,
-    SampleZeroClawAgent,
+    OpenClawBackend,
+    ZeroClawBackend,
 )
 from core.settings import get_settings
 
@@ -23,12 +23,12 @@ def create_agent_instance() -> BaseAgent:
     settings = get_settings()
     agent_type = settings.agent_type
 
-    if agent_type == "sample_openclaw":
-        return SampleOpenClawAgent()
-    elif agent_type == "sample_zeroclaw":
-        return SampleZeroClawAgent()
+    if agent_type == "openclaw":
+        return OpenClawBackend()
+    elif agent_type == "zeroclaw":
+        return ZeroClawBackend()
     else:
         raise ValueError(
             f"Unknown agent_type: {agent_type}. "
-            "Supported: sample_openclaw, sample_zeroclaw"
+            "Supported: openclaw, zeroclaw"
         )

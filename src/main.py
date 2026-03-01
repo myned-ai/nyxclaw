@@ -4,7 +4,7 @@ nyxclaw — Voice-to-Avatar Server
 FastAPI application for real-time voice-to-avatar interaction.
 Combines Claw-based AI agents with Wav2Arkit model for synchronized facial animation.
 
-Supports: sample_openclaw, sample_zeroclaw
+Supports: openclaw, zeroclaw
 
 Usage:
     uvicorn main:app --host 0.0.0.0 --port 8080 --reload
@@ -33,8 +33,8 @@ logger = get_logger(__name__)
 
 
 async def _preload_local_voice_stack(agent_type: str) -> None:
-    if agent_type == "sample_openclaw":
-        from agents.openclaw.openclaw_settings import get_openclaw_settings
+    if agent_type == "openclaw":
+        from backend.openclaw.settings import get_openclaw_settings
 
         oc = get_openclaw_settings()
 
@@ -75,8 +75,8 @@ async def _preload_local_voice_stack(agent_type: str) -> None:
             except Exception as exc:
                 logger.warning(f"Startup preload: TTS warm failed (OpenClaw): {exc}")
 
-    if agent_type == "sample_zeroclaw":
-        from agents.zeroclaw.zeroclaw_settings import get_zeroclaw_settings
+    if agent_type == "zeroclaw":
+        from backend.zeroclaw.settings import get_zeroclaw_settings
 
         zc = get_zeroclaw_settings()
 

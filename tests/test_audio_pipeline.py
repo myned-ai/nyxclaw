@@ -283,7 +283,7 @@ async def test_stt_disconnect(stt):
 
 async def test_cancel_sync_callback_fires():
     """cancel_response() must call _on_cancel_sync synchronously."""
-    from agents.zeroclaw.sample_agent import SampleZeroClawAgent
+    from backend.zeroclaw.backend import ZeroClawBackend as SampleZeroClawAgent
 
     agent = SampleZeroClawAgent()
     cancel_called = False
@@ -341,7 +341,7 @@ async def test_cancel_playback_reset_on_start():
 
 async def test_is_responding_during_response_end():
     """is_responding stays True while _on_response_end runs."""
-    from agents.zeroclaw.sample_agent import SampleZeroClawAgent
+    from backend.zeroclaw.backend import ZeroClawBackend as SampleZeroClawAgent
 
     agent = SampleZeroClawAgent()
     captured_state = {}
@@ -376,7 +376,7 @@ async def test_is_responding_during_response_end():
 
 async def test_bargein_during_playback_interrupts():
     """Barge-in during _on_response_end triggers _on_interrupted."""
-    from agents.zeroclaw.sample_agent import SampleZeroClawAgent
+    from backend.zeroclaw.backend import ZeroClawBackend as SampleZeroClawAgent
 
     agent = SampleZeroClawAgent()
     interrupted = asyncio.Event()
@@ -450,7 +450,7 @@ async def test_stabilization_loop_exits_on_cancel():
 
 async def test_bargein_frame_counter():
     """Barge-in requires 4 consecutive speech frames, resets on silence."""
-    from agents.zeroclaw.sample_agent import SampleZeroClawAgent
+    from backend.zeroclaw.backend import ZeroClawBackend as SampleZeroClawAgent
 
     agent = SampleZeroClawAgent()
     agent._state.is_responding = True

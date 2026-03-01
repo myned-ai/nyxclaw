@@ -28,10 +28,8 @@ import orjson
 
 from core.logger import get_logger
 from core.settings import get_settings
-from services.knowledge_service import KnowledgeService
-
 from ..base_agent import BaseAgent, ConversationState
-from .openclaw_settings import get_openclaw_settings
+from .settings import get_openclaw_settings
 
 logger = get_logger(__name__)
 
@@ -55,7 +53,7 @@ _UNSUPPORTED_TTS_CHARS = re.compile(
 )
 
 
-class SampleOpenClawAgent(BaseAgent):
+class OpenClawBackend(BaseAgent):
     """
     OpenClaw agent with optional server-side STT and TTS.
 
@@ -328,9 +326,8 @@ class SampleOpenClawAgent(BaseAgent):
             transport=httpx.AsyncHTTPTransport(retries=max(0, oc.max_retries)),
         )
 
-        # 3. Knowledge / system prompt
-        knowledge = await KnowledgeService.load_knowledge_base(self._settings.knowledge_base_source)
-        self._system_prompt = KnowledgeService.format_instructions(self._settings.assistant_instructions, knowledge)
+        # 3. System prompt
+        self._system_prompt = self._settings.assistant_instructions
         thinking_mode = (oc.thinking_mode or "default").strip().lower()
         if thinking_mode in {"off", "minimal"}:
             guidance = (

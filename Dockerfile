@@ -100,7 +100,6 @@ FROM dependencies AS production
 
 # Copy application code (already running as appuser)
 COPY --chown=appuser:appuser ./src ./src
-COPY --chown=appuser:appuser ./data ./data
 
 # Environment variables
 ENV SERVER_HOST=0.0.0.0 \

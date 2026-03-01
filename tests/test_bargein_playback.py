@@ -20,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 async def test_cancel_sync_callback_fires():
     """cancel_response() must call _on_cancel_sync synchronously."""
-    from agents.zeroclaw.sample_agent import SampleZeroClawAgent as ZeroClawAgent
+    from backend.zeroclaw.backend import ZeroClawBackend as ZeroClawAgent
 
     agent = ZeroClawAgent()
     cancel_called = False
@@ -130,7 +130,7 @@ async def test_cancel_playback_reset_on_response_start():
 
 async def test_is_responding_stays_true_during_response_end():
     """is_responding must stay True while _on_response_end waits for audio drain."""
-    from agents.zeroclaw.sample_agent import SampleZeroClawAgent as ZeroClawAgent
+    from backend.zeroclaw.backend import ZeroClawBackend as ZeroClawAgent
 
     agent = ZeroClawAgent()
 
@@ -171,7 +171,7 @@ async def test_is_responding_stays_true_during_response_end():
 
 async def test_bargein_during_playback_calls_interrupted():
     """When barge-in fires during _on_response_end, _on_interrupted must be called."""
-    from agents.zeroclaw.sample_agent import SampleZeroClawAgent as ZeroClawAgent
+    from backend.zeroclaw.backend import ZeroClawBackend as ZeroClawAgent
 
     agent = ZeroClawAgent()
 

@@ -42,10 +42,6 @@ class Settings(BaseSettings):
     debug: bool = False
     debug_audio_capture: bool = False  # Save incoming audio to files for debugging
 
-    # Knowledge Base Configuration
-    # Can be a local file path (e.g. "data/knowledge.md") or a URL
-    knowledge_base_source: str | None = None
-
     # Authentication Configuration
     auth_enabled: bool = False
     auth_secret_key: str = ""
@@ -54,7 +50,7 @@ class Settings(BaseSettings):
     auth_enable_rate_limiting: bool = True
 
     # Agent Configuration
-    agent_type: str = "sample_openclaw"  # "sample_openclaw", "sample_zeroclaw"
+    agent_type: str = "openclaw"  # "openclaw", "zeroclaw"
 
     # Audio Configuration (vendor-agnostic)
     # Note: Widget sends 24kHz audio. This is used for Wav2Arkit processing.

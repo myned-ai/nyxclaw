@@ -92,7 +92,7 @@ A `200` with a JSON response means it's working. A `405 Method Not Allowed` mean
     - Ensure an authentication token is configured (`gateway.auth.token`).
 
 2.  **NyxClaw Configuration:**
-    - Set `AGENT_TYPE=sample_openclaw` in `.env`.
+    - Set `AGENT_TYPE=openclaw` in `.env`.
     - Set `BASE_URL=http://127.0.0.1:19001` and `AUTH_TOKEN=<your-token>`.
     - Enable STT/TTS: `STT_ENABLED=true`, `TTS_ENABLED=true`.
 

@@ -151,7 +151,7 @@ All settings can be configured via environment variables or `.env` file.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `AGENT_TYPE` | `sample_openclaw` | Agent type: `sample_openclaw`, `sample_zeroclaw` |
+| `AGENT_TYPE` | `openclaw` | Agent type: `openclaw`, `zeroclaw` |
 | `BASE_URL` | `http://127.0.0.1:19001` | Agent backend URL |
 | `AUTH_TOKEN` | *(none)* | Bearer token for agent authentication |
 | `AGENT_MODEL` | `openclaw:main` | Model identifier for agent backend |
@@ -281,6 +281,28 @@ curl http://localhost:8080/health
 - **Default (Production)**: `docker-compose up -d`
 - **Development**: `docker-compose --profile dev up`
 
+### Resource Requirements
+
+NyxClaw runs multiple ONNX models concurrently on CPU. With the full local voice stack enabled (`INSTALL_LOCAL_VOICE=true`), expect the following memory footprint:
+
+| Component | Memory |
+|-----------|--------|
+| faster-whisper small.en (CTranslate2 int8) | ~500 MB |
+| Piper TTS VITS ONNX | ~100 MB |
+| Wav2Arkit ONNX (blendshape inference) | ~200 MB |
+| Silero VAD ONNX | ~10 MB |
+| ONNX Runtime session overhead | ~200 MB |
+| Python runtime + FastAPI + dependencies | ~300 MB |
+
+|  | Minimum | Recommended |
+|--|---------|-------------|
+| **RAM** | 2 GB | 3-4 GB |
+| **CPU** | 2 cores | 4 cores |
+
+During an active conversation, CPU usage spikes as Wav2Arkit inference runs continuously on every audio chunk, Piper TTS synthesis is CPU-bound (sentence-by-sentence), and faster-whisper transcription bursts when the user finishes speaking. All three can overlap during barge-in scenarios.
+
+For a single concurrent session, **2 vCPU + 3 GB RAM** is a comfortable target. Each additional concurrent WebSocket session adds roughly 200-400 MB (separate STT/VAD state) plus CPU contention on the ONNX inference.
+
 ## Authentication
 
 The server uses **HMAC-SHA256 signed tokens** for authentication. Tokens are origin-bound and time-limited.
@@ -313,39 +335,39 @@ curl -X POST http://localhost:8080/api/auth/token \
 ws://localhost:8080/ws?token=YOUR_AUTH_TOKEN
 ```
 
-## Agent Modularity
+## Backend Modularity
 
-The server uses a modular agent system for different Claw backends:
+The server uses a modular backend system for different Claw backends:
 
-### Available Agents
+### Available Backends
 
-- **sample_openclaw**: OpenClaw HTTP gateway with SSE streaming (`/v1/chat/completions`)
-- **sample_zeroclaw**: ZeroClaw WebSocket gateway (`/ws/chat`)
+- **openclaw**: OpenClaw HTTP gateway with SSE streaming (`/v1/chat/completions`)
+- **zeroclaw**: ZeroClaw WebSocket gateway (`/ws/chat`)
 
-Both agents use the same local STT/TTS pipeline (faster-whisper + Piper VITS ONNX).
+Both backends use the same local STT/TTS pipeline (faster-whisper + Piper VITS ONNX).
 
 ### Quick `.env` switch
 
 ```dotenv
 # OpenClaw
-AGENT_TYPE=sample_openclaw
+AGENT_TYPE=openclaw
 BASE_URL=http://127.0.0.1:19001
 AUTH_TOKEN=your-openclaw-token
 AGENT_MODEL=openclaw:main
 
 # ZeroClaw
-AGENT_TYPE=sample_zeroclaw
+AGENT_TYPE=zeroclaw
 BASE_URL=http://127.0.0.1:5555
 AUTH_TOKEN=your-zeroclaw-token
 AGENT_MODEL=zeroclaw:main
 ```
 
-### Custom Agents
+### Custom Backends
 
 Implement the `BaseAgent` interface:
 
 ```python
-from agents import BaseAgent, ConversationState
+from backend import BaseAgent, ConversationState
 
 class MyCustomAgent(BaseAgent):
     @property
@@ -368,7 +390,7 @@ class MyCustomAgent(BaseAgent):
     async def disconnect(self) -> None: ...
 ```
 
-### Switching Agents
+### Switching Backends
 
 1. Set `AGENT_TYPE` in `.env`
 2. Update `BASE_URL` and `AUTH_TOKEN` for your backend

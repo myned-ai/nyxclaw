@@ -19,10 +19,8 @@ import websockets
 
 from core.logger import get_logger
 from core.settings import get_settings
-from services.knowledge_service import KnowledgeService
-
 from ..base_agent import BaseAgent, ConversationState
-from .zeroclaw_settings import get_zeroclaw_settings
+from .settings import get_zeroclaw_settings
 
 logger = get_logger(__name__)
 
@@ -54,7 +52,7 @@ _UNSUPPORTED_TTS_CHARS = re.compile(
 )
 
 
-class SampleZeroClawAgent(BaseAgent):
+class ZeroClawBackend(BaseAgent):
     """
     ZeroClaw agent with local STT/TTS.
 
@@ -522,8 +520,7 @@ class SampleZeroClawAgent(BaseAgent):
         zc = self._zc
         logger.info("Connecting ZeroClaw agent")
 
-        knowledge = await KnowledgeService.load_knowledge_base(self._settings.knowledge_base_source)
-        self._system_prompt = KnowledgeService.format_instructions(self._settings.assistant_instructions, knowledge)
+        self._system_prompt = self._settings.assistant_instructions
 
         thinking_mode = (zc.thinking_mode or "default").strip().lower()
         if thinking_mode in {"off", "minimal"}:

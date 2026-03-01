@@ -318,7 +318,7 @@ Add these to your `.env` file:
 
 ```bash
 # Agent type
-AGENT_TYPE=sample_openclaw
+AGENT_TYPE=openclaw
 
 # Agent backend (same machine)
 BASE_URL=http://127.0.0.1:19001
