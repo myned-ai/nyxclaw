@@ -94,6 +94,7 @@ class ZeroClawBackend(BaseAgent):
         self._user_transcript_buffer: str = ""
         self._pause_flushing = False
         self._bargein_speech_frames: int = 0
+        self._bargein_grace_until: float = 0.0
 
         # Persistent WebSocket to ZeroClaw — kept open across messages so
         # the server-side WsSession (browser, conversation history, tools)
@@ -326,8 +327,13 @@ class ZeroClawBackend(BaseAgent):
                     # can interrupt mid-response (like OpenAI/Gemini).
                     # Require 4 consecutive speech frames (~128ms) to avoid
                     # single-frame noise triggers.
+                    # Grace period: skip barge-in for 500ms after response
+                    # starts to avoid the user's own speech tail triggering
+                    # a false cancellation.
                     await self._stt.send_audio(audio_bytes)
-                    if self._stt.has_speech:
+                    if time.perf_counter() < self._bargein_grace_until:
+                        self._bargein_speech_frames = 0
+                    elif self._stt.has_speech:
                         self._bargein_speech_frames += 1
                         if self._bargein_speech_frames >= 4:
                             logger.info(
@@ -381,9 +387,12 @@ class ZeroClawBackend(BaseAgent):
 
             # Wait for the in-flight stream task to drain the WS gracefully.
             # The task exits on its own once _cancel_event is set + drain finishes.
+            # Timeout kept short (0.5s) to avoid blocking the next turn —
+            # barge-in already cancelled the response, so we only need enough
+            # time for the cancel+drain handshake with ZeroClaw.
             if self._active_stream_task and not self._active_stream_task.done():
                 try:
-                    await asyncio.wait_for(self._active_stream_task, timeout=2.0)
+                    await asyncio.wait_for(self._active_stream_task, timeout=0.5)
                 except asyncio.TimeoutError:
                     logger.warning("Stream drain timed out, force-cancelling")
                     self._active_stream_task.cancel()
@@ -417,7 +426,7 @@ class ZeroClawBackend(BaseAgent):
 
     async def _tts_worker(
         self,
-        queue: asyncio.Queue[tuple[str, str] | None],
+        queue: asyncio.Queue[tuple[str, str, bool] | None],
         turn_metrics: dict[str, Any],
         item_id: str,
     ) -> None:
@@ -436,7 +445,7 @@ class ZeroClawBackend(BaseAgent):
                 if self._response_cancelled:
                     break
 
-                original, sanitized = item
+                original, sanitized, is_filler = item
 
                 # Breath pause between sentences (not before the first)
                 if sentence_count > 0 and self._on_audio_delta and not self._response_cancelled:
@@ -444,7 +453,9 @@ class ZeroClawBackend(BaseAgent):
 
                 # Emit transcript delta in sync with audio (after silence pad,
                 # before this sentence's audio starts).
-                if self._on_transcript_delta and not self._response_cancelled:
+                # Skip filler — it's spoken but not part of the real transcript,
+                # and its offsets would corrupt the virtual cursor for real content.
+                if not is_filler and self._on_transcript_delta and not self._response_cancelled:
                     await self._on_transcript_delta(original, "assistant", item_id, None)
 
                 logger.debug(f"TTS synthesizing: {sanitized!r}")
@@ -675,6 +686,8 @@ class ZeroClawBackend(BaseAgent):
         self._state.is_responding = True
         self._state.transcript_buffer = ""
         self._state.audio_done = False
+        self._bargein_speech_frames = 0
+        self._bargein_grace_until = time.perf_counter() + 0.5
 
         if self._on_response_start:
             await self._on_response_start(session_id)
@@ -682,7 +695,7 @@ class ZeroClawBackend(BaseAgent):
         full_response = ""
         sentence_buffer = ""
         spoke_filler = False
-        tts_queue: asyncio.Queue[tuple[str, str] | None] = asyncio.Queue()
+        tts_queue: asyncio.Queue[tuple[str, str, bool] | None] = asyncio.Queue()
         tts_task: asyncio.Task[None] | None = None
 
         turn_metrics: dict[str, Any] = {
@@ -769,7 +782,7 @@ class ZeroClawBackend(BaseAgent):
                             if sanitized:
                                 if turn_metrics["tts_first_sentence_at"] is None:
                                     turn_metrics["tts_first_sentence_at"] = time.perf_counter()
-                                await tts_queue.put((filler, sanitized))
+                                await tts_queue.put((filler, sanitized, True))
                         elif self._on_transcript_delta:
                             await self._on_transcript_delta(filler, "assistant", item_id, None)
                     continue
@@ -808,7 +821,7 @@ class ZeroClawBackend(BaseAgent):
                                 continue
                             if turn_metrics["tts_first_sentence_at"] is None:
                                 turn_metrics["tts_first_sentence_at"] = time.perf_counter()
-                            await tts_queue.put((sent, sanitized))
+                            await tts_queue.put((sent, sanitized, False))
 
                 if message_type == "done":
                     break
@@ -839,7 +852,7 @@ class ZeroClawBackend(BaseAgent):
                         if sanitized:
                             if turn_metrics["tts_first_sentence_at"] is None:
                                 turn_metrics["tts_first_sentence_at"] = time.perf_counter()
-                            await tts_queue.put((remaining, sanitized))
+                            await tts_queue.put((remaining, sanitized, False))
                     await tts_queue.put(None)
                     if tts_task:
                         await tts_task

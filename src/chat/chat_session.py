@@ -314,7 +314,7 @@ class ChatSession:
                 {
                     "type": "audio_chunk",
                     "data": base64.b64encode(audio_bytes).decode("utf-8"),
-                    "sessionId": self.session_id,
+                    "sessionId": self.current_turn_session_id or self.session_id,
                     "timestamp": int(time.time() * 1000),
                 }
             )
@@ -388,8 +388,8 @@ class ChatSession:
             except (asyncio.TimeoutError, asyncio.CancelledError):
                 pass
 
-        # Check interruption before final waits/sends
-        if self.is_interrupted:
+        # Check interruption/barge-in before final waits/sends
+        if self.is_interrupted or self._cancel_playback:
             return
 
         if self.frame_emit_task and not self.frame_emit_task.done():
@@ -400,19 +400,23 @@ class ChatSession:
             except (asyncio.TimeoutError, asyncio.CancelledError):
                 pass
 
-        if self.is_interrupted:
+        if self.is_interrupted or self._cancel_playback:
             return
 
         await self.send_json(
             {
                 "type": "audio_end",
-                "sessionId": self.session_id,
+                "sessionId": self.current_turn_session_id or self.session_id,
                 "turnId": self.current_turn_id,
                 "timestamp": int(time.time() * 1000),
             }
         )
 
         if transcript:
+            logger.debug(
+                f"Session {self.session_id}: Sending transcript_done ({len(transcript)} chars): "
+                f"{transcript[:100]!r}{'...' if len(transcript) > 100 else ''}"
+            )
             msg = {
                 "type": "transcript_done",
                 "text": transcript,
@@ -423,6 +427,8 @@ class ChatSession:
             if item_id:
                 msg["itemId"] = item_id
             await self.send_json(msg)
+        else:
+            logger.warning(f"Session {self.session_id}: transcript_done SKIPPED — empty transcript")
 
         await self.send_json({"type": "avatar_state", "state": "Listening"})
 
@@ -439,7 +445,12 @@ class ChatSession:
         previous_item_id: str | None = None,
     ) -> None:
         if self.is_interrupted or self._cancel_playback:
+            logger.debug(
+                f"Session {self.session_id}: transcript_delta DROPPED "
+                f"(interrupted={self.is_interrupted}, cancel={self._cancel_playback}) text={text!r}"
+            )
             return
+        logger.debug(f"Session {self.session_id}: transcript_delta received: {text!r} role={role}")
         # LLM APIs vary in chunk granularity — some send word-level tokens,
         # others send entire sentences.  Split multi-word chunks into
         # word-level deltas so the frontend SubtitleController gets
@@ -447,8 +458,12 @@ class ChatSession:
         if role == "assistant":
             # Anchor virtual cursor to actual audio position once per
             # sentence so that within-sentence words use the heuristic.
+            # Only advance forward — never backward.  The filler text
+            # (spoken before tool results arrive) can push the cursor
+            # ahead of the actual audio; resetting it backward would
+            # create overlapping startOffset values that break clients.
             actual_audio_ms = self.total_audio_received * 1000
-            if actual_audio_ms > 0:
+            if actual_audio_ms > self.virtual_cursor_text_ms:
                 self.virtual_cursor_text_ms = actual_audio_ms
 
             words = text.split()
@@ -481,12 +496,17 @@ class ChatSession:
             end_offset = 0
 
         turn_id = self.current_turn_id if role == "assistant" else f"user_{int(time.time() * 1000)}"
+        session_id = (
+            self.current_turn_session_id
+            if role == "assistant" and self.current_turn_session_id
+            else self.session_id
+        )
         msg = {
             "type": "transcript_delta",
             "text": text,
             "role": role,
             "turnId": turn_id,
-            "sessionId": self.session_id,
+            "sessionId": session_id,
             "timestamp": int(time.time() * 1000),
             "startOffset": int(start_offset),
             "endOffset": int(end_offset),

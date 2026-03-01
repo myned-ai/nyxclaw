@@ -104,6 +104,7 @@ class OpenClawBackend(BaseAgent):
         self._user_transcript_buffer: str = ""
         self._pause_flushing = False
         self._bargein_speech_frames: int = 0
+        self._bargein_grace_until: float = 0.0
 
         # ── Per-turn latency metrics ────────────────────────────────
         self._metric_input_source: str = "unknown"
@@ -542,9 +543,14 @@ class OpenClawBackend(BaseAgent):
                 # can interrupt mid-response (like OpenAI/Gemini).
                 # Require 4 consecutive speech frames (~128ms) to avoid
                 # single-frame noise triggers.
+                # Grace period: skip barge-in for 500ms after response
+                # starts to avoid the user's own speech tail triggering
+                # a false cancellation.
                 if self._state.is_responding:
                     await self._stt.send_audio(audio_bytes)
-                    if self._stt.has_speech:
+                    if time.perf_counter() < self._bargein_grace_until:
+                        self._bargein_speech_frames = 0
+                    elif self._stt.has_speech:
                         self._bargein_speech_frames += 1
                         if self._bargein_speech_frames >= 4:
                             logger.info(
@@ -661,6 +667,8 @@ class OpenClawBackend(BaseAgent):
         self._state.is_responding = True
         self._state.transcript_buffer = ""
         self._state.audio_done = False
+        self._bargein_speech_frames = 0
+        self._bargein_grace_until = time.perf_counter() + 0.5
         logger.info(f"Starting response stream for session {session_id}")
 
         if self._on_response_start:
