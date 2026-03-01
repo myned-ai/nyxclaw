@@ -4,19 +4,14 @@
 
 > **See it in action -> [Try Nyx](https://myned.ai)**
 
-Real-time voice-to-avatar interaction server combining Claw agents (OpenClaw, ZeroClaw) with local STT/TTS and the Wav2Arkit model for synchronized avatar facial animation. Processes audio streams and generates ARKit blendshapes for realistic facial animations.
-
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.10](https://img.shields.io/badge/python-3.10-blue.svg)](https://www.python.org/downloads/)
 
-## Features
+## What It Does
 
-- **Local STT/TTS Pipeline**: faster-whisper (CTranslate2) + Silero VAD + Piper VITS ONNX — no cloud dependency
-- **Facial Animation Sync**: Wav2Arkit model for ARKit-compatible blendshapes
-- **Modular Agent System**: Pluggable Claw agents (OpenClaw HTTP SSE, ZeroClaw WebSocket)
-- **WebSocket Communication**: Low-latency bidirectional streaming
-- **CPU Acceleration**: ONNX-optimized inference for real-time performance without GPU
-- **Production Ready**: Docker support, health checks, logging, authentication
+NyxClaw is a real-time WebSocket server that bridges a frontend client and Claw-based AI backends (OpenClaw, ZeroClaw). It doesn't just relay audio — it runs a **Wav2Arkit ONNX model** on every audio chunk the AI produces, generating 52 Apple ARKit facial blendshapes at 30 FPS, then streams synchronized `(audio + blendshape)` packets so a 3D avatar can lip-sync in real time on CPU.
+
+The full pipeline: user speaks -> VAD detects speech -> STT transcribes -> Claw agent responds (streaming) -> TTS synthesizes voice -> Wav2Arkit generates facial animation -> client receives synchronized audio + blendshapes.
 
 ## Architecture
 
@@ -34,33 +29,26 @@ Client ──WebSocket──► NyxClaw Server
 Client ◄──WebSocket──── sync_frame (audio + blendshapes @ 30 FPS)
 ```
 
-## Table of Contents
+### Technology Stack
 
-- [Prerequisites](#prerequisites)
-- [Quick Start](#quick-start)
-- [Configuration](#configuration)
-- [API Documentation](#api-documentation)
-- [Docker Usage](#docker-usage)
-- [Authentication](#authentication)
-- [Agent Modularity](#agent-modularity)
-- [Development](#development)
-- [License](#license)
-- [Acknowledgments](#acknowledgments)
+- **Runtime**: Python 3.10+ / FastAPI (ASGI)
+- **Protocol**: WebSocket (real-time), HTTP (health/auth)
+- **Inference**: ONNX Runtime (CPU-optimized)
+- **STT**: faster-whisper (CTranslate2 int8) + Silero VAD (ONNX)
+- **TTS**: Piper VITS ONNX
+- **Audio**: PCM 16-bit, 24 kHz, mono
+- **Package Manager**: uv
 
-## Prerequisites
+### Core Modules
 
-### Local Development
-
-- Python 3.10.x (exact version required)
-- [uv](https://github.com/astral-sh/uv) package manager
-- A running Claw agent backend (OpenClaw or ZeroClaw)
-- ONNX Runtime (CPU-optimized, included in dependencies)
-
-### Docker
-
-- Docker 20.10+
-- Docker Compose 2.0+
-- A running Claw agent backend (OpenClaw or ZeroClaw)
+| Module | Description |
+|--------|-------------|
+| `src/main.py` | Entry point, middleware (CORS, auth), lifecycle |
+| `src/chat/chat_session.py` | WebSocket session, audio playback, barge-in |
+| `src/backend/` | Pluggable Claw backends (`BaseAgent` interface) |
+| `src/wav2arkit/` | ONNX model producing 52 ARKit blendshapes from audio |
+| `src/services/stt_service.py` | Silero VAD (ONNX) + faster-whisper transcription |
+| `src/services/tts_service.py` | Piper VITS ONNX text-to-speech |
 
 ## Quick Start
 
@@ -145,23 +133,23 @@ docker-compose --profile dev up
 
 ## Configuration
 
-All settings can be configured via environment variables or `.env` file.
+All settings are configured via environment variables or `.env` file. See [.env.example](.env.example) for the full template.
 
-### Agent Backend Settings
+### Agent Backend
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `AGENT_TYPE` | `openclaw` | Agent type: `openclaw`, `zeroclaw` |
+| `AGENT_TYPE` | `openclaw` | Backend type: `openclaw`, `zeroclaw` |
 | `BASE_URL` | `http://127.0.0.1:19001` | Agent backend URL |
 | `AUTH_TOKEN` | *(none)* | Bearer token for agent authentication |
 | `AGENT_MODEL` | `openclaw:main` | Model identifier for agent backend |
-| `USER_ID` | *(none)* | Optional stable user ID for session continuity |
+| `USER_ID` | *(none)* | Stable user ID for session continuity |
 | `THINKING_MODE` | `minimal` | Thinking hint: `off`, `minimal`, `default` |
 | `SESSION_KEY` | *(none)* | OpenClaw gateway routing override |
 | `AGENT_ID` | *(none)* | OpenClaw agent ID override |
 | `MAX_RETRIES` | `2` | Max retries for failed requests (OpenClaw) |
 
-### STT Configuration
+### STT (Speech-to-Text)
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -172,7 +160,7 @@ All settings can be configured via environment variables or `.env` file.
 | `STT_VAD_MIN_SILENCE_MS` | `280` | Minimum silence before end-of-speech (ms) |
 | `STT_INITIAL_PROMPT` | *(none)* | Whisper initial prompt for vocabulary priming |
 
-### TTS Configuration
+### TTS (Text-to-Speech)
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -184,7 +172,7 @@ All settings can be configured via environment variables or `.env` file.
 | `TTS_NOISE_W_SCALE` | `0.8` | Phoneme duration variation |
 | `TTS_LENGTH_SCALE` | `0.95` | Speech speed (<1=faster, >1=slower) |
 
-### Other Settings
+### Server & Auth
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -196,166 +184,56 @@ All settings can be configured via environment variables or `.env` file.
 | `AUTH_ENABLED` | `false` | Enable HMAC token authentication |
 | `AUTH_SECRET_KEY` | *(auto-generated)* | HMAC signing key (`openssl rand -hex 32`) |
 
-See [.env.example](.env.example) for the complete configuration template.
+## Backend Setup
 
-## API Documentation
+NyxClaw supports pluggable Claw backends. Set `AGENT_TYPE` in `.env` to switch between them.
 
-### REST Endpoints
+### OpenClaw
 
-- `GET /inf` - Server info and status
-- `GET /health` - Health check endpoint
-- `GET /docs` - OpenAPI documentation (Swagger UI)
-- `GET /redoc` - ReDoc documentation
-- `POST /api/auth/token` - Generate HMAC auth token (if authentication enabled)
+The OpenClaw `/v1/chat/completions` endpoint must be **explicitly enabled** in `openclaw.json` before NyxClaw can communicate with the gateway.
 
-### WebSocket Endpoint
+In your `openclaw.json`:
 
-Connect to `ws://localhost:8080/ws` (or `wss://` for production with TLS)
-
-With authentication:
+```jsonc
+{
+  "gateway": {
+    "http": {
+      "endpoints": {
+        "chatCompletions": {
+          "enabled": true          // required for NyxClaw
+        }
+      }
+    },
+    "auth": {
+      "token": "<your-token>"      // this value goes into AUTH_TOKEN in .env
+    }
+  }
+}
 ```
-ws://localhost:8080/ws?token=YOUR_AUTH_TOKEN
-```
 
-#### Client -> Server Messages
-
-| Type | Payload | Description |
-|------|---------|-------------|
-| `text` | `{"type": "text", "data": "Hello"}` | Send text message to AI |
-| `audio_stream_start` | `{"type": "audio_stream_start", "userId": "user123"}` | Start audio streaming session |
-| `audio` | `{"type": "audio", "data": "<base64>"}` | Audio chunk (PCM16, 24kHz mono, base64-encoded) |
-| `interrupt` | `{"type": "interrupt"}` | Explicitly interrupt AI response |
-| `ping` | `{"type": "ping"}` | Heartbeat to keep connection alive |
-
-#### Server -> Client Messages
-
-| Type | Description |
-|------|-------------|
-| `config` | Sent on connection. Contains negotiated audio settings |
-| `audio_start` | AI started responding. Includes `sessionId`, `turnId`, `sampleRate`, `format` |
-| `sync_frame` | Synchronized audio + blendshape frame at 30 FPS |
-| `audio_chunk` | Fallback audio-only chunk when Wav2Arkit model is unavailable |
-| `audio_end` | AI finished responding. Includes `sessionId`, `turnId` |
-| `transcript_delta` | Streaming text fragment with timing offsets |
-| `transcript_done` | Complete transcript for a turn (`role`: `"user"` or `"assistant"`) |
-| `avatar_state` | Avatar state change (`"Listening"` or `"Responding"`) |
-| `interrupt` | User interrupted AI response. Includes `turnId`, `offsetMs` |
-| `error` | Error message |
-| `pong` | Heartbeat response with `timestamp` |
-
-## Docker Usage
-
-### Multi-Stage Build
-
-The Dockerfile uses a multi-stage build optimized for CPU-only production:
-
-1. **Base Stage**: Python 3.10-slim (Debian-based) with system dependencies
-2. **Dependencies Stage**: Fast dependency installation with uv
-3. **Production Stage**: Minimal image with non-root user, health checks
-4. **Development Stage**: Hot reload support for development
-
-### Production Deployment
+Restart the OpenClaw container after editing, then verify:
 
 ```bash
-# Build image
-docker build -t nyxclaw .
-
-# Run (CPU-only)
-docker run -d \
-  --name nyxclaw \
-  -p 8080:8080 \
-  --env-file .env \
-  -v $(pwd)/pretrained_models:/app/pretrained_models:ro \
-  --restart unless-stopped \
-  nyxclaw
-
-# View logs
-docker logs -f nyxclaw
-
-# Health check
-curl http://localhost:8080/health
+curl -s -X POST http://localhost:19001/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <your-token>" \
+  -d '{"model":"openclaw:main","messages":[{"role":"user","content":"hi"}],"stream":false}'
 ```
 
-### Docker Compose Profiles
+A `200` JSON response means it's working. A `405` means `chatCompletions` is still disabled.
 
-- **Default (Production)**: `docker-compose up -d`
-- **Development**: `docker-compose --profile dev up`
-
-### Resource Requirements
-
-NyxClaw runs multiple ONNX models concurrently on CPU. With the full local voice stack enabled (`INSTALL_LOCAL_VOICE=true`), expect the following memory footprint:
-
-| Component | Memory |
-|-----------|--------|
-| faster-whisper small.en (CTranslate2 int8) | ~500 MB |
-| Piper TTS VITS ONNX | ~100 MB |
-| Wav2Arkit ONNX (blendshape inference) | ~200 MB |
-| Silero VAD ONNX | ~10 MB |
-| ONNX Runtime session overhead | ~200 MB |
-| Python runtime + FastAPI + dependencies | ~300 MB |
-
-|  | Minimum | Recommended |
-|--|---------|-------------|
-| **RAM** | 2 GB | 3-4 GB |
-| **CPU** | 2 cores | 4 cores |
-
-During an active conversation, CPU usage spikes as Wav2Arkit inference runs continuously on every audio chunk, Piper TTS synthesis is CPU-bound (sentence-by-sentence), and faster-whisper transcription bursts when the user finishes speaking. All three can overlap during barge-in scenarios.
-
-For a single concurrent session, **2 vCPU + 3 GB RAM** is a comfortable target. Each additional concurrent WebSocket session adds roughly 200-400 MB (separate STT/VAD state) plus CPU contention on the ONNX inference.
-
-## Authentication
-
-The server uses **HMAC-SHA256 signed tokens** for authentication. Tokens are origin-bound and time-limited.
-
-### Enabling Authentication
-
-Set in `.env`:
-```bash
-AUTH_ENABLED=true
-AUTH_SECRET_KEY=your-secret-key-here-generate-with-openssl-rand-hex-32
-AUTH_ALLOWED_ORIGINS=https://yourwebsite.com,https://www.yourwebsite.com
-```
-
-### Generate Secret Key
-
-```bash
-openssl rand -hex 32
-```
-
-### Getting a Token
-
-```bash
-curl -X POST http://localhost:8080/api/auth/token \
-  -H "Origin: https://yourwebsite.com"
-```
-
-### Using the Token
-
-```
-ws://localhost:8080/ws?token=YOUR_AUTH_TOKEN
-```
-
-## Backend Modularity
-
-The server uses a modular backend system for different Claw backends:
-
-### Available Backends
-
-- **openclaw**: OpenClaw HTTP gateway with SSE streaming (`/v1/chat/completions`)
-- **zeroclaw**: ZeroClaw WebSocket gateway (`/ws/chat`)
-
-Both backends use the same local STT/TTS pipeline (faster-whisper + Piper VITS ONNX).
-
-### Quick `.env` switch
+`.env` for OpenClaw:
 
 ```dotenv
-# OpenClaw
 AGENT_TYPE=openclaw
 BASE_URL=http://127.0.0.1:19001
 AUTH_TOKEN=your-openclaw-token
 AGENT_MODEL=openclaw:main
+```
 
-# ZeroClaw
+### ZeroClaw
+
+```dotenv
 AGENT_TYPE=zeroclaw
 BASE_URL=http://127.0.0.1:5555
 AUTH_TOKEN=your-zeroclaw-token
@@ -364,12 +242,12 @@ AGENT_MODEL=zeroclaw:main
 
 ### Custom Backends
 
-Implement the `BaseAgent` interface:
+Implement the `BaseAgent` interface in `src/backend/`:
 
 ```python
 from backend import BaseAgent, ConversationState
 
-class MyCustomAgent(BaseAgent):
+class MyCustomBackend(BaseAgent):
     @property
     def is_connected(self) -> bool: ...
 
@@ -390,40 +268,148 @@ class MyCustomAgent(BaseAgent):
     async def disconnect(self) -> None: ...
 ```
 
-### Switching Backends
+Then register it in `src/services/agent_service.py` and add the new `AGENT_TYPE` value.
 
-1. Set `AGENT_TYPE` in `.env`
-2. Update `BASE_URL` and `AUTH_TOKEN` for your backend
-3. Restart the server
+## API
+
+### HTTP Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/` | Server info (name, version, status) |
+| `GET` | `/health` | Health check (503 if unhealthy) |
+| `POST` | `/api/auth/token` | Generate HMAC auth token |
+| `GET` | `/docs` | OpenAPI / Swagger UI |
+
+### WebSocket (`/ws`)
+
+Connect to `ws://localhost:8080/ws` (or `wss://` with TLS). With auth: `ws://localhost:8080/ws?token=TOKEN`
+
+**Client -> Server:**
+
+| Type | Description |
+|------|-------------|
+| `audio_stream_start` | Start audio session (`userId` optional) |
+| `audio` | Audio chunk — base64-encoded PCM16 24kHz mono |
+| `text` | Text message to AI |
+| `interrupt` | Stop AI response |
+| `ping` | Keepalive |
+
+**Server -> Client:**
+
+| Type | Description |
+|------|-------------|
+| `config` | Audio settings (sent on connect) |
+| `audio_start` | AI response turn started |
+| `sync_frame` | Audio + 52 ARKit blendshapes (30 FPS) |
+| `audio_chunk` | Audio-only fallback (no blendshape model) |
+| `audio_end` | AI response turn finished |
+| `transcript_delta` | Streaming text fragment |
+| `transcript_done` | Complete turn transcript |
+| `interrupt` | User interrupted AI — includes `offsetMs` cutoff |
+| `avatar_state` | `"Listening"` or `"Responding"` |
+| `pong` | Heartbeat response |
+
+For full field-level protocol details, see the Client Implementation Specification.
+
+## Docker
+
+### Multi-Stage Build
+
+1. **Base**: Python 3.10-slim with system dependencies
+2. **Dependencies**: Fast install with uv
+3. **Production**: Minimal image, non-root user, health checks
+4. **Development**: Hot reload support
+
+### Production
+
+```bash
+docker build -t nyxclaw .
+
+docker run -d \
+  --name nyxclaw \
+  -p 8080:8080 \
+  --env-file .env \
+  -v $(pwd)/pretrained_models:/app/pretrained_models:ro \
+  --restart unless-stopped \
+  nyxclaw
+```
+
+### Compose Profiles
+
+- **Production**: `docker-compose up -d`
+- **Development**: `docker-compose --profile dev up`
+
+### Resource Requirements
+
+NyxClaw runs multiple ONNX models concurrently on CPU. With the full voice stack (`INSTALL_LOCAL_VOICE=true`):
+
+| Component | Memory |
+|-----------|--------|
+| faster-whisper small.en (CTranslate2 int8) | ~500 MB |
+| Piper TTS VITS ONNX | ~100 MB |
+| Wav2Arkit ONNX (blendshape inference) | ~200 MB |
+| Silero VAD ONNX | ~10 MB |
+| ONNX Runtime session overhead | ~200 MB |
+| Python runtime + FastAPI + dependencies | ~300 MB |
+
+|  | Minimum | Recommended |
+|--|---------|-------------|
+| **RAM** | 2 GB | 3-4 GB |
+| **CPU** | 2 cores | 4 cores |
+
+During active conversation, CPU spikes as Wav2Arkit, Piper TTS, and faster-whisper can all run concurrently (especially during barge-in). For a single session, **2 vCPU + 3 GB RAM** is a comfortable target.
+
+## Authentication
+
+HMAC-SHA256 signed tokens, origin-bound and time-limited.
+
+```bash
+# Enable in .env
+AUTH_ENABLED=true
+AUTH_SECRET_KEY=$(openssl rand -hex 32)
+AUTH_ALLOWED_ORIGINS=https://yoursite.com,https://www.yoursite.com
+
+# Get a token
+curl -X POST http://localhost:8080/api/auth/token \
+  -H "Origin: https://yoursite.com"
+
+# Connect
+ws://localhost:8080/ws?token=YOUR_TOKEN
+```
 
 ## Development
 
-### Install Dev Dependencies
-
 ```bash
-uv sync --group dev
+uv sync --group dev                   # install dev dependencies
+uv run ruff check src/                # lint
+uv run ruff format src/               # format
+uv run ty check src/                  # type check
+uv run pytest                         # tests
 ```
 
-### Code Quality
+## Troubleshooting
+
+### Model download fails
+
+Set `HUGGING_FACE_HUB_TOKEN` if the model requires authentication:
 
 ```bash
-# Lint
-uv run ruff check src/
-
-# Format
-uv run ruff format src/
-
-# Type check
-uv run ty check src/
-
-# All checks
-uv run ruff check src/ --fix && uv run ruff format src/ && uv run ty check src/
+export HUGGING_FACE_HUB_TOKEN=hf_your_token_here
 ```
 
-### Running Tests
+### STT is slow on CPU
+
+- Use a smaller model: `STT_MODEL=tiny.en` or `STT_MODEL=base.en`
+- Ensure no other CPU-heavy processes are competing
+- The `small.en` model is sufficient for single-user real-time on modern x86 (AVX2+)
+
+### Piper TTS install fails
+
+Requires Python >= 3.10 and appropriate ONNX Runtime:
 
 ```bash
-uv run pytest
+uv sync --extra local_voice
 ```
 
 ## License
