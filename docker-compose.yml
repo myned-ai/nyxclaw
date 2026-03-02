@@ -33,6 +33,16 @@ services:
       - DEBUG_AUDIO_CAPTURE=${DEBUG_AUDIO_CAPTURE:-false}
       # Agent Configuration
       - AGENT_TYPE=${AGENT_TYPE:-openclaw}
+      - VOICE_MODE=${VOICE_MODE:-openai}
+      # OpenAI Voice Mode
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENAI_REALTIME_MODEL=${OPENAI_REALTIME_MODEL:-gpt-realtime}
+      - OPENAI_VAD_TYPE=${OPENAI_VAD_TYPE:-semantic_vad}
+      - OPENAI_TRANSCRIPTION_MODEL=${OPENAI_TRANSCRIPTION_MODEL:-gpt-4o-transcribe}
+      - OPENAI_TRANSCRIPTION_LANGUAGE=${OPENAI_TRANSCRIPTION_LANGUAGE:-en}
+      - OPENAI_TTS_MODEL=${OPENAI_TTS_MODEL:-tts-1}
+      - OPENAI_VOICE=${OPENAI_VOICE:-alloy}
+      - OPENAI_TTS_SPEED=${OPENAI_TTS_SPEED:-1.0}
       # Agent Backend Configuration
       - BASE_URL=${BASE_URL:-http://host.docker.internal:19001}
       - AUTH_TOKEN=${AUTH_TOKEN}
@@ -93,6 +103,16 @@ services:
       - DEBUG=true
       # Agent Configuration
       - AGENT_TYPE=${AGENT_TYPE:-openclaw}
+      - VOICE_MODE=${VOICE_MODE:-openai}
+      # OpenAI Voice Mode
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENAI_REALTIME_MODEL=${OPENAI_REALTIME_MODEL:-gpt-realtime}
+      - OPENAI_VAD_TYPE=${OPENAI_VAD_TYPE:-semantic_vad}
+      - OPENAI_TRANSCRIPTION_MODEL=${OPENAI_TRANSCRIPTION_MODEL:-gpt-4o-transcribe}
+      - OPENAI_TRANSCRIPTION_LANGUAGE=${OPENAI_TRANSCRIPTION_LANGUAGE:-en}
+      - OPENAI_TTS_MODEL=${OPENAI_TTS_MODEL:-tts-1}
+      - OPENAI_VOICE=${OPENAI_VOICE:-alloy}
+      - OPENAI_TTS_SPEED=${OPENAI_TTS_SPEED:-1.0}
       # Agent Backend Configuration
       - BASE_URL=${BASE_URL:-http://host.docker.internal:19001}
       - AUTH_TOKEN=${AUTH_TOKEN}

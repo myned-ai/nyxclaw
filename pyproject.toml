@@ -35,16 +35,14 @@ dependencies = [
     # AI Agent dependencies
     "httpx>=0.27.0",  # Async HTTP client for OpenClaw agent (SSE streaming)
 
+    # OpenAI SDK (lightweight — used by openai_realtime voice layer)
+    "openai>=1.50.0",
 ]
 
 [project.optional-dependencies]
-# Optional local voice stack (STT + VAD + TTS).
-# Install with: uv sync --extra local_voice
+# Local voice pipeline (Piper TTS + faster-whisper STT + Silero VAD).
+# Heavy deps (~1GB+). Install with: uv sync --extra local_voice
 local_voice = [
-    # Local voice pipeline dependencies
-    # silero-vad omitted: depends on torch (~2GB). We load silero_vad.onnx
-    # directly via onnxruntime using _SileroVADIterator in stt_service.py.
-    # faster-whisper uses CTranslate2 (not ONNX) for STT inference.
     "piper-tts>=1.2.0",
     "faster-whisper>=1.1.0",
 ]
@@ -110,7 +108,7 @@ ignore = [
 "__init__.py" = ["F401"]  # Allow unused imports in __init__.py
 
 [tool.ruff.lint.isort]
-known-first-party = ["core", "services", "backend", "routers", "auth", "wav2arkit"]
+known-first-party = ["core", "services", "backend", "routers", "auth", "wav2arkit", "voice"]
 
 [tool.ruff.format]
 quote-style = "double"

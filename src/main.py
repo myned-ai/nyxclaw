@@ -135,6 +135,7 @@ async def lifespan(app: FastAPI):
     protocol = "wss" if settings.use_ssl else "ws"
     logger.info(f"WebSocket endpoint: {protocol}://{settings.server_host}:{settings.server_port}/ws")
     logger.info(f"Agent type: {settings.agent_type}")
+    logger.info(f"Voice mode: {settings.voice_mode}")
     logger.info(f"Wav2Arkit model: {settings.onnx_model_path}")
     logger.info(f"Debug: {settings.debug}")
     logger.info(f"Auth: {'Enabled' if settings.auth_enabled else 'Disabled'}")
@@ -147,7 +148,8 @@ async def lifespan(app: FastAPI):
     get_wav2arkit_service()
 
     # Warm local ONNX STT/TTS resources once at startup to reduce first-turn latency
-    await _preload_local_voice_stack(settings.agent_type)
+    if settings.voice_mode == "local":
+        await _preload_local_voice_stack(settings.agent_type)
 
     yield
 
@@ -163,7 +165,7 @@ app = FastAPI(
 
     ## Features
 
-    - **Claw Agents**: OpenClaw and ZeroClaw backends with local STT/TTS
+    - **Claw Agents**: OpenClaw, ZeroClaw (local STT/TTS), and OpenAI Realtime (server-side)
     - **Facial Animation**: Wav2Arkit model for synchronized blendshapes
     - **WebSocket Streaming**: Real-time audio and animation data
     
@@ -257,6 +259,7 @@ async def root():
         protocol = "wss" if settings.use_ssl else "ws"
         response["websocket"] = f"{protocol}://{settings.server_host}:{settings.server_port}/ws"
         response["agent_type"] = settings.agent_type
+        response["voice_mode"] = settings.voice_mode
 
     return response
 

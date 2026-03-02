@@ -51,6 +51,7 @@ class Settings(BaseSettings):
 
     # Agent Configuration
     agent_type: str = "openclaw"  # "openclaw", "zeroclaw"
+    voice_mode: str = "local"  # "local" (Piper TTS + faster-whisper) or "openai" (OpenAI Realtime + TTS API)
 
     # Audio Configuration (vendor-agnostic)
     # Note: Widget sends 24kHz audio. This is used for Wav2Arkit processing.

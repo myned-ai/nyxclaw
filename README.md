@@ -2,40 +2,77 @@
 
 **Voice-to-avatar server for Claw-based AI agents**
 
-> **See it in action -> [Try Nyx](https://myned.ai)**
+> **Based on -> [Nyx Web Widget](https://myned.ai)**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.10](https://img.shields.io/badge/python-3.10-blue.svg)](https://www.python.org/downloads/)
 
 ## What It Does
 
-NyxClaw is a real-time WebSocket server that bridges a frontend client and Claw-based AI backends (OpenClaw, ZeroClaw). It doesn't just relay audio — it runs a **Wav2Arkit ONNX model** on every audio chunk the AI produces, generating 52 Apple ARKit facial blendshapes at 30 FPS, then streams synchronized `(audio + blendshape)` packets so a 3D avatar can lip-sync in real time on CPU.
+NyxClaw is a real-time WebSocket server that bridges a 3D real-time avatar frontend client and Claw-based AI backends (OpenClaw, ZeroClaw, etc). It runs the **Wav2Arkit ONNX** model on every audio chunk the backend produces, generating 52 ARKit facial blendshapes at 30 FPS, then streams synchronized `(audio + blendshape)` packets so the 3D avatar can lip-sync in real time on CPU.
 
-The full pipeline: user speaks -> VAD detects speech -> STT transcribes -> Claw agent responds (streaming) -> TTS synthesizes voice -> Wav2Arkit generates facial animation -> client receives synchronized audio + blendshapes.
+Two voice pipelines are supported:
+
+| | **Local Voice** (`VOICE_MODE=local`) | **OpenAI Voice** (`VOICE_MODE=openai`) |
+|---|---|---|
+| **STT** | faster-whisper + Silero VAD (CPU) | OpenAI Realtime API (server-side) |
+| **TTS** | Piper VITS ONNX (CPU) | OpenAI TTS API |
+| **Install** | `uv sync --extra local_voice` | `uv sync` (included by default) |
+| **Requires** | ~1 GB of model downloads | `OPENAI_API_KEY` in `.env` |
+
+Both pipelines run Wav2Arkit on every audio chunk for facial animation.
 
 ## Architecture
 
+### Local Voice (`VOICE_MODE=local`)
+
+```mermaid
+flowchart LR
+    Client["Client"]
+
+    subgraph NyxClaw["NyxClaw Server"]
+        direction TB
+        STT["STT\nfaster-whisper\n+ Silero VAD"]
+        LLM1["Claw Agent\n(LLM)"]
+        TTS["TTS\nPiper VITS\nONNX"]
+        W2A1["Wav2Arkit\n(ONNX)"]
+    end
+
+    Client -- "audio (PCM16 24kHz)" --> STT
+    STT -- "transcript" --> LLM1
+    LLM1 -- "text response" --> TTS
+    TTS -- "audio" --> W2A1
+    W2A1 -- "sync_frame\naudio + blendshapes\n@ 30 FPS" --> Client
 ```
-Client ──WebSocket──► NyxClaw Server
-                        │
-                        ├── audio ──► STT (faster-whisper + Silero VAD) ──► text
-                        │                                                    │
-                        │                                          Claw Agent (LLM)
-                        │                                                    │
-                        ├── audio ◄── TTS (Piper VITS ONNX) ◄── text response
-                        │
-                        ├── Wav2Arkit (ONNX) ──► blendshapes
-                        │
-Client ◄──WebSocket──── sync_frame (audio + blendshapes @ 30 FPS)
+
+### OpenAI Voice (`VOICE_MODE=openai`)
+
+```mermaid
+flowchart LR
+    Client["Client"]
+
+    subgraph NyxClaw["NyxClaw Server"]
+        direction TB
+        RT["OpenAI Realtime API\n(VAD + STT)"]
+        LLM2["Claw Agent\n(LLM)"]
+        OTTS["OpenAI TTS API"]
+        W2A2["Wav2Arkit\n(ONNX)"]
+    end
+
+    Client -- "audio (PCM16 24kHz)" --> RT
+    RT -- "transcript" --> LLM2
+    LLM2 -- "text response" --> OTTS
+    OTTS -- "audio" --> W2A2
+    W2A2 -- "sync_frame\naudio + blendshapes\n@ 30 FPS" --> Client
 ```
 
 ### Technology Stack
 
-- **Runtime**: Python 3.10+ / FastAPI (ASGI)
+- **Runtime**: Python 3.10 / FastAPI (ASGI)
 - **Protocol**: WebSocket (real-time), HTTP (health/auth)
 - **Inference**: ONNX Runtime (CPU-optimized)
-- **STT**: faster-whisper (CTranslate2 int8) + Silero VAD (ONNX)
-- **TTS**: Piper VITS ONNX
+- **STT**: faster-whisper + Silero VAD (local) or OpenAI Realtime API
+- **TTS**: Piper VITS ONNX (local) or OpenAI TTS API
 - **Audio**: PCM 16-bit, 24 kHz, mono
 - **Package Manager**: uv
 
@@ -46,6 +83,7 @@ Client ◄──WebSocket──── sync_frame (audio + blendshapes @ 30 FPS)
 | `src/main.py` | Entry point, middleware (CORS, auth), lifecycle |
 | `src/chat/chat_session.py` | WebSocket session, audio playback, barge-in |
 | `src/backend/` | Pluggable Claw backends (`BaseAgent` interface) |
+| `src/voice/openai_realtime/` | OpenAI voice pipeline (Realtime API VAD+STT, TTS API) |
 | `src/wav2arkit/` | ONNX model producing 52 ARKit blendshapes from audio |
 | `src/services/stt_service.py` | Silero VAD (ONNX) + faster-whisper transcription |
 | `src/services/tts_service.py` | Piper VITS ONNX text-to-speech |
@@ -58,27 +96,49 @@ Client ◄──WebSocket──── sync_frame (audio + blendshapes @ 30 FPS)
 # 1. Install uv (if not already installed)
 # Windows:
 powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
-
 # macOS/Linux:
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# 2. Clone the repository
+# 2. Clone and configure
 git clone https://github.com/myned-ai/nyxclaw.git
 cd nyxclaw
+cp .env.example .env
 
-# 3. Install dependencies (with local voice stack)
-uv sync --extra local_voice
+# 3. Install dependencies
+uv sync
 
-# 4. Download the Wav2Arkit model
+# 4. Download the Wav2Arkit model (required for all voice modes)
 pip install -U "huggingface_hub[cli]"
 mkdir -p pretrained_models/wav2arkit
 huggingface-cli download myned-ai/wav2arkit_cpu --local-dir pretrained_models/wav2arkit
+```
 
-# 5. Download faster-whisper model (CTranslate2 int8)
-uv run --with 'faster-whisper>=1.1.0' python -c \
+Now choose **one** of the two voice pipelines:
+
+#### Option A: OpenAI Voice (easiest)
+
+No model downloads needed — just add your API key:
+
+```bash
+# In .env, set:
+VOICE_MODE=openai
+OPENAI_API_KEY=sk-...
+# + your Claw backend settings (AGENT_TYPE, BASE_URL, AUTH_TOKEN, AGENT_MODEL)
+```
+
+#### Option B: Local Voice (fully offline)
+
+Install the local voice extra and download the models:
+
+```bash
+# Install local voice dependencies (~1 GB)
+uv sync --extra local_voice
+
+# Download faster-whisper model (CTranslate2 int8)
+uv run python -c \
   "from faster_whisper.utils import download_model; download_model('small.en', output_dir='pretrained_models/faster_whisper_small_en')"
 
-# 6. Download Piper TTS voice
+# Download Piper TTS voice
 mkdir -p pretrained_models/piper
 uv run --with huggingface_hub python -c "
 import shutil; from huggingface_hub import hf_hub_download
@@ -89,11 +149,14 @@ for s in ('', '.json'):
         f'pretrained_models/piper/en_US-hfc_female-medium.onnx{s}')
 "
 
-# 7. Configure environment
-cp .env.example .env
-# Edit .env with your agent backend settings (BASE_URL, AUTH_TOKEN, etc.)
+# In .env, set:
+VOICE_MODE=local
+# + your Claw backend settings (AGENT_TYPE, BASE_URL, AUTH_TOKEN, AGENT_MODEL)
+```
 
-# 8. Run server
+#### Run
+
+```bash
 uv run python src/main.py
 ```
 
@@ -118,7 +181,7 @@ huggingface-cli download myned-ai/wav2arkit_cpu --local-dir pretrained_models/wa
 # Optional: enable local voice build (faster-whisper / Piper TTS / Silero VAD)
 # Add in .env before build: INSTALL_LOCAL_VOICE=true
 
-# 3. Build and run (production)
+# 3. Build and run (production — exposed on port 8081)
 docker-compose up -d
 
 # 4. View logs
@@ -127,7 +190,7 @@ docker-compose logs -f
 # 5. Stop server
 docker-compose down
 
-# Development mode (with hot reload)
+# Development mode (with hot reload, port from SERVER_PORT env var)
 docker-compose --profile dev up
 ```
 
@@ -139,7 +202,8 @@ All settings are configured via environment variables or `.env` file. See [.env.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `AGENT_TYPE` | `openclaw` | Backend type: `openclaw`, `zeroclaw` |
+| `AGENT_TYPE` | `openclaw` | LLM backend: `openclaw`, `zeroclaw` |
+| `VOICE_MODE` | `local` | Voice pipeline: `local` (Piper TTS + faster-whisper) or `openai` (OpenAI Realtime + TTS API) |
 | `BASE_URL` | `http://127.0.0.1:19001` | Agent backend URL |
 | `AUTH_TOKEN` | *(none)* | Bearer token for agent authentication |
 | `AGENT_MODEL` | `openclaw:main` | Model identifier for agent backend |
@@ -149,7 +213,20 @@ All settings are configured via environment variables or `.env` file. See [.env.
 | `AGENT_ID` | *(none)* | OpenClaw agent ID override |
 | `MAX_RETRIES` | `2` | Max retries for failed requests (OpenClaw) |
 
-### STT (Speech-to-Text)
+### OpenAI Voice (`VOICE_MODE=openai`)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OPENAI_API_KEY` | *(none)* | OpenAI API key (required) |
+| `OPENAI_REALTIME_MODEL` | `gpt-realtime` | Realtime API model for VAD + STT |
+| `OPENAI_VAD_TYPE` | `semantic_vad` | VAD type: `semantic_vad` or `server_vad` |
+| `OPENAI_TRANSCRIPTION_MODEL` | `gpt-4o-transcribe` | Transcription model |
+| `OPENAI_TRANSCRIPTION_LANGUAGE` | `en` | Transcription language |
+| `OPENAI_TTS_MODEL` | `tts-1` | TTS model (`tts-1`, `tts-1-hd`) |
+| `OPENAI_VOICE` | `alloy` | TTS voice (`alloy`, `echo`, `fable`, `onyx`, `nova`, `shimmer`) |
+| `OPENAI_TTS_SPEED` | `1.0` | TTS speed (0.25 to 4.0) |
+
+### Local Voice STT (`VOICE_MODE=local`)
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -160,7 +237,7 @@ All settings are configured via environment variables or `.env` file. See [.env.
 | `STT_VAD_MIN_SILENCE_MS` | `280` | Minimum silence before end-of-speech (ms) |
 | `STT_INITIAL_PROMPT` | *(none)* | Whisper initial prompt for vocabulary priming |
 
-### TTS (Text-to-Speech)
+### Local Voice TTS (`VOICE_MODE=local`)
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -276,7 +353,7 @@ Then register it in `src/services/agent_service.py` and add the new `AGENT_TYPE`
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/` | Server info (name, version, status) |
+| `GET` | `/inf` | Server info (name, version, status) |
 | `GET` | `/health` | Health check (503 if unhealthy) |
 | `POST` | `/api/auth/token` | Generate HMAC auth token |
 | `GET` | `/docs` | OpenAPI / Swagger UI |
@@ -310,7 +387,7 @@ Connect to `ws://localhost:8080/ws` (or `wss://` with TLS). With auth: `ws://loc
 | `avatar_state` | `"Listening"` or `"Responding"` |
 | `pong` | Heartbeat response |
 
-For full field-level protocol details, see the Client Implementation Specification.
+See the WebSocket protocol table above for message types and fields.
 
 ## Docker
 
@@ -337,8 +414,8 @@ docker run -d \
 
 ### Compose Profiles
 
-- **Production**: `docker-compose up -d`
-- **Development**: `docker-compose --profile dev up`
+- **Production**: `docker-compose up -d` (port 8081)
+- **Development**: `docker-compose --profile dev up` (port from `SERVER_PORT`, default 8080)
 
 ### Resource Requirements
 
@@ -406,7 +483,7 @@ export HUGGING_FACE_HUB_TOKEN=hf_your_token_here
 
 ### Piper TTS install fails
 
-Requires Python >= 3.10 and appropriate ONNX Runtime:
+Requires Python 3.10 and appropriate ONNX Runtime:
 
 ```bash
 uv sync --extra local_voice
@@ -415,11 +492,3 @@ uv sync --extra local_voice
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## Acknowledgments
-
-- [Apple ARKit](https://developer.apple.com/augmented-reality/arkit/) for the blendshape specification standard
-- [LAM Audio2Expression](https://github.com/aigc3d/LAM_Audio2Expression) for facial animation model
-- [Wav2Vec 2.0](https://ai.meta.com/blog/wav2vec-20-learning-the-structure-of-speech-from-raw-audio/) for speech representation learning
-- [Piper TTS](https://github.com/rhasspy/piper) for VITS ONNX text-to-speech
-- [faster-whisper](https://github.com/SYSTRAN/faster-whisper) for CTranslate2 speech-to-text
