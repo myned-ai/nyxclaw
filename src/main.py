@@ -20,12 +20,13 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 from contextlib import asynccontextmanager
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request, Response, status
+from fastapi import FastAPI, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 
-from auth import get_auth_middleware
 from core.logger import get_logger, setup_logging
-from core.settings import get_allowed_origins, get_settings
+from core.settings import get_settings
+from auth.setup_code_service import ensure_setup_code
+from auth.store import get_auth_store
 from routers import chat_router
 from services import get_wav2arkit_service
 
@@ -139,10 +140,11 @@ async def lifespan(app: FastAPI):
     logger.info(f"Wav2Arkit model: {settings.onnx_model_path}")
     logger.info(f"Debug: {settings.debug}")
     logger.info(f"Auth: {'Enabled' if settings.auth_enabled else 'Disabled'}")
-    if settings.auth_enabled:
-        allowed_origins = get_allowed_origins()
-        logger.info(f"Allowed Origins: {', '.join(allowed_origins)}")
     logger.info("=" * 60)
+
+    # Generate and print setup code if auth is enabled
+    if settings.auth_enabled:
+        ensure_setup_code(get_auth_store())
 
     # Initialize services (lazy loading - will connect on first request)
     get_wav2arkit_service()
@@ -196,53 +198,12 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Configure CORS for frontend development
-settings = get_settings()
-allowed_origins = get_allowed_origins() if settings.auth_enabled else ["*"]
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=allowed_origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Initialize authentication middleware
-auth_middleware = get_auth_middleware()
+"""
+NyxClaw server is now mobile-only. CORS middleware is not required and has been removed.
+"""
 
 # Include routers
 app.include_router(chat_router)
-
-
-@app.post("/api/auth/token")
-async def get_auth_token(request: Request):
-    """
-    Generate authentication token for WebSocket connection.
-
-    The widget should call this endpoint before connecting to WebSocket.
-    Origin is validated and a signed token is returned.
-
-    Returns:
-        {"token": "base64-encoded-token", "ttl": 3600}
-
-    Raises:
-        403: If origin is not allowed or auth is disabled
-    """
-    if not settings.auth_enabled or not auth_middleware:
-        raise HTTPException(status_code=403, detail="Authentication not enabled")
-
-    # Get origin from request headers
-    origin = request.headers.get("origin")
-    if not origin:
-        raise HTTPException(status_code=400, detail="Missing Origin header")
-
-    # Generate token for this origin
-    token = auth_middleware.generate_token_for_origin(origin)
-    if not token:
-        raise HTTPException(status_code=403, detail="Origin not allowed")
-
-    return {"token": token, "ttl": settings.auth_token_ttl, "origin": origin}
 
 
 @app.get("/inf")

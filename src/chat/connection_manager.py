@@ -26,10 +26,10 @@ class ConnectionManager:
         session_id: str,
         settings: Settings,
         wav2arkit_service: Wav2ArkitService,
+        auth_context: dict[str, str] | None = None,
     ) -> ChatSession:
-        await websocket.accept()
-
-        session = ChatSession(websocket, session_id, settings, wav2arkit_service)
+        # WebSocket is already accepted by the router (auth handshake happens before this)
+        session = ChatSession(websocket, session_id, settings, wav2arkit_service, auth_context=auth_context)
         self.sessions[websocket] = session
 
         await session.start()

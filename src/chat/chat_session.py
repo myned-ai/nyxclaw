@@ -27,6 +27,7 @@ class ChatSession:
         session_id: str,
         settings: Settings,
         wav2arkit_service: Wav2ArkitService,
+        auth_context: dict[str, str] | None = None,
     ):
         logger.info(f"Initializing ChatSession for client: {session_id}")
 
@@ -34,6 +35,7 @@ class ChatSession:
         self.session_id = session_id
         self.settings = settings
         self.wav2arkit_service = wav2arkit_service
+        self.auth_context: dict[str, str] = auth_context or {}
 
         # Unique Agent Instance per Session
         self.agent = create_agent_instance()
@@ -49,6 +51,8 @@ class ChatSession:
         # Client State
         self.is_streaming_audio = False
         self.user_id = ""
+        if self.auth_context.get("userId"):
+            self.user_id = self.auth_context["userId"]
 
         # Audio Debugging
         self.debug_file_path = None

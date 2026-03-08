@@ -1,0 +1,23 @@
+{
+  "devices": {
+    "1dc6ec21-e78f-4f2b-81ae-aad09c78c47b": {
+      "device_id": "1dc6ec21-e78f-4f2b-81ae-aad09c78c47b",
+      "public_key": "MCowBQYDK2VwAyEA1HlOJ-RikO9eVvThpLRQrvgW7PhWEeC_vIXceNE8zdM",
+      "algorithm": "ed25519",
+      "status": "active",
+      "created_at": "2026-03-08T00:00:28.421029+00:00"
+    }
+  },
+  "device_tokens": {
+    "1dc6ec21-e78f-4f2b-81ae-aad09c78c47b": {
+      "device_id": "1dc6ec21-e78f-4f2b-81ae-aad09c78c47b",
+      "token_hash": "de1889dda43d1ba972481cb6fc2f3df231bc5366b80d9696765c07860c62bddf",
+      "issued_at": "2026-03-08T00:00:28.438020+00:00",
+      "revoked": false
+    }
+  },
+  "bootstrap": {
+    "token_hash": "b7fdecaa308acb322cdb670076208a95536c70ea60ac2ea505d2aba104deefd9",
+    "created_at": "2026-03-07T23:26:55.707590+00:00"
+  }
+}

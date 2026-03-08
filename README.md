@@ -108,9 +108,8 @@ cp .env.example .env
 uv sync
 
 # 4. Download the Wav2Arkit model (required for all voice modes)
-pip install -U "huggingface_hub[cli]"
 mkdir -p pretrained_models/wav2arkit
-huggingface-cli download myned-ai/wav2arkit_cpu --local-dir pretrained_models/wav2arkit
+uv run --with "huggingface_hub[cli]" huggingface-cli download myned-ai/wav2arkit_cpu --local-dir pretrained_models/wav2arkit
 ```
 
 Now choose **one** of the two voice pipelines:
@@ -174,9 +173,8 @@ cp .env.example .env
 # Edit .env with your settings
 
 # 2. Download the ONNX model
-pip install -U "huggingface_hub[cli]"
 mkdir -p pretrained_models/wav2arkit
-huggingface-cli download myned-ai/wav2arkit_cpu --local-dir pretrained_models/wav2arkit
+uv run --with "huggingface_hub[cli]" huggingface-cli download myned-ai/wav2arkit_cpu --local-dir pretrained_models/wav2arkit
 
 # Optional: enable local voice build (faster-whisper / Piper TTS / Silero VAD)
 # Add in .env before build: INSTALL_LOCAL_VOICE=true
@@ -197,6 +195,12 @@ docker-compose --profile dev up
 ## Configuration
 
 All settings are configured via environment variables or `.env` file. See [.env.example](.env.example) for the full template.
+
+## Auth Migration Docs
+
+- Threat model: [`docs/auth/THREAT_MODEL.md`](docs/auth/THREAT_MODEL.md)
+- Cutover runbook: [`docs/auth/STAGED_ROLLOUT.md`](docs/auth/STAGED_ROLLOUT.md)
+- Mobile auth guide: [`docs/auth/MOBILE_APP_AUTH.md`](docs/auth/MOBILE_APP_AUTH.md)
 
 ### Agent Backend
 
@@ -258,8 +262,17 @@ All settings are configured via environment variables or `.env` file. See [.env.
 | `SERVER_HOST` | `0.0.0.0` | Server bind address |
 | `SERVER_PORT` | `8080` | Server port |
 | `DEBUG` | `false` | Enable debug logging |
-| `AUTH_ENABLED` | `false` | Enable HMAC token authentication |
-| `AUTH_SECRET_KEY` | *(auto-generated)* | HMAC signing key (`openssl rand -hex 32`) |
+| `AUTH_ENABLED` | `false` | Enable authentication enforcement |
+| `AUTH_MODE` | `device_challenge_jwt` | Auth mode for mobile clients |
+| `JWT_SIGNING_KEY` | *(empty)* | JWT signing secret (required when auth enabled) |
+| `JWT_ISSUER` | `nyxclaw` | JWT issuer claim |
+| `JWT_AUDIENCE` | `nyxclaw-mobile` | JWT audience claim |
+| `JWT_ACCESS_TTL_SEC` | `120` | Access token lifetime in seconds |
+| `JWT_REFRESH_TTL_SEC` | `2592000` | Refresh token lifetime in seconds |
+| `AUTH_CHALLENGE_TTL_SEC` | `120` | Challenge nonce lifetime in seconds |
+| `AUTH_REGISTRATION_POLICY` | `open` | Device registration policy (`open`, `invite`, `admin-approval`) |
+| `AUTH_MAX_CLOCK_SKEW_SEC` | `30` | Allowed client/server time skew for signed payloads |
+| `AUTH_MAX_SESSIONS_PER_DEVICE` | `5` | Max concurrent active sessions per device |
 
 ## Backend Setup
 
@@ -355,12 +368,15 @@ Then register it in `src/services/agent_service.py` and add the new `AGENT_TYPE`
 |--------|------|-------------|
 | `GET` | `/inf` | Server info (name, version, status) |
 | `GET` | `/health` | Health check (503 if unhealthy) |
-| `POST` | `/api/auth/token` | Generate HMAC auth token |
+| `POST` | `/api/auth/challenge` | Start device challenge auth |
+| `POST` | `/api/auth/complete` | Complete challenge and issue access/refresh tokens |
+| `POST` | `/api/auth/refresh` | Rotate refresh token and issue new access token |
+| `POST` | `/api/auth/logout` | Revoke current session |
 | `GET` | `/docs` | OpenAPI / Swagger UI |
 
 ### WebSocket (`/ws`)
 
-Connect to `ws://localhost:8080/ws` (or `wss://` with TLS). With auth: `ws://localhost:8080/ws?token=TOKEN`
+Connect to `ws://localhost:8080/ws` (or `wss://` with TLS). When auth is enabled, pass `Authorization: Bearer <access_token>`.
 
 **Client -> Server:**
 
@@ -439,21 +455,20 @@ During active conversation, CPU spikes as Wav2Arkit, Piper TTS, and faster-whisp
 
 ## Authentication
 
-HMAC-SHA256 signed tokens, origin-bound and time-limited.
+NyxClaw uses device challenge + JWT sessions:
 
 ```bash
 # Enable in .env
 AUTH_ENABLED=true
-AUTH_SECRET_KEY=$(openssl rand -hex 32)
-AUTH_ALLOWED_ORIGINS=https://yoursite.com,https://www.yoursite.com
+AUTH_MODE=device_challenge_jwt
+JWT_SIGNING_KEY=$(openssl rand -hex 32)
 
-# Get a token
-curl -X POST http://localhost:8080/api/auth/token \
-  -H "Origin: https://yoursite.com"
-
-# Connect
-ws://localhost:8080/ws?token=YOUR_TOKEN
+# Authenticate via /api/auth/challenge + /api/auth/complete
+# Then connect websocket with:
+# Authorization: Bearer <access_token>
 ```
+
+For a full setup and protocol walkthrough (registration, challenge signing, refresh rotation, websocket usage, and troubleshooting), see [`docs/auth/MOBILE_APP_AUTH.md`](docs/auth/MOBILE_APP_AUTH.md).
 
 ## Development
 

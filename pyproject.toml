@@ -37,6 +37,12 @@ dependencies = [
 
     # OpenAI SDK (lightweight — used by openai_realtime voice layer)
     "openai>=1.50.0",
+
+    # Signature verification for device challenge auth (Ed25519)
+    "cryptography>=42.0.0",
+
+    # QR code generation for setup code display in logs
+    "qrcode>=7.4.0",
 ]
 
 [project.optional-dependencies]

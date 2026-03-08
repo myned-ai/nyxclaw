@@ -44,10 +44,11 @@ class Settings(BaseSettings):
 
     # Authentication Configuration
     auth_enabled: bool = False
-    auth_secret_key: str = ""
-    auth_token_ttl: int = 3600
-    auth_allowed_origins: str = "http://localhost:5173,http://localhost:5174,http://localhost:5175"
     auth_enable_rate_limiting: bool = True
+    auth_setup_code_secret: str = ""  # HMAC secret for signing setup codes
+    auth_setup_code_url: str = ""  # Public-facing WebSocket URL for setup code (e.g. wss://myserver:8080/ws)
+    auth_store_path: str = "./data/auth_store.json"  # Persistent auth store file
+    auth_regenerate_setup_code: bool = False  # Set true + restart to force new setup code
 
     # Agent Configuration
     agent_type: str = "openclaw"  # "openclaw", "zeroclaw"
@@ -106,11 +107,3 @@ def get_settings() -> Settings:
     and reused throughout the application lifecycle.
     """
     return Settings()
-
-
-def get_allowed_origins() -> list[str]:
-    """Parse allowed origins from comma-separated string."""
-    settings = get_settings()
-    if not settings.auth_allowed_origins:
-        return []
-    return [origin.strip() for origin in settings.auth_allowed_origins.split(",") if origin.strip()]

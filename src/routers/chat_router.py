@@ -2,14 +2,15 @@ import uuid
 
 from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect
 
-from auth import get_auth_middleware
+from auth.device_verifier import get_device_verifier
+from auth.store import AuthStore, get_auth_store
+from auth.ws_auth import authenticate_websocket
 from chat import ConnectionManager, get_connection_manager
 from core.logger import get_logger
 from core.settings import Settings, get_settings
 from services import Wav2ArkitService, get_wav2arkit_service
 
 logger = get_logger(__name__)
-
 
 chat_router = APIRouter(tags=["chat"])
 
@@ -18,29 +19,38 @@ chat_router = APIRouter(tags=["chat"])
 async def websocket_endpoint(
     websocket: WebSocket,
     settings: Settings = Depends(get_settings),
+    auth_store: AuthStore = Depends(get_auth_store),
     wav2arkit_service: Wav2ArkitService = Depends(get_wav2arkit_service),
     chat_connection_manager: ConnectionManager = Depends(get_connection_manager),
 ) -> None:
-    # If using reverse proxy (NGINX/Cloudflare), headers might be filtered
-    # For now, we trust the standard UUID generation
     session_id = str(uuid.uuid4())
+    auth_context: dict[str, str] | None = None
 
-    # Auth check...
-    auth_middleware = get_auth_middleware()
+    # Accept the WebSocket first (auth happens inside the connection via challenge-response)
+    await websocket.accept()
 
-    if settings.auth_enabled and auth_middleware:
-        is_authenticated, error = await auth_middleware.authenticate_websocket(websocket, session_id)
-        if not is_authenticated:
-            await websocket.close(code=1008, reason=error)
-            return
+    if settings.auth_enabled:
+        verifier = get_device_verifier()
+        auth_context = await authenticate_websocket(
+            websocket=websocket,
+            auth_store=auth_store,
+            verifier=verifier,
+        )
+        if auth_context is None:
+            return  # auth failed — ws_auth already closed the connection
 
-    # Connect creates the specific session
-    await chat_connection_manager.connect(websocket, session_id, settings, wav2arkit_service)
+    # Auth passed (or disabled) — start the chat session
+    session = await chat_connection_manager.connect(
+        websocket,
+        session_id,
+        settings,
+        wav2arkit_service,
+        auth_context=auth_context,
+    )
 
     try:
         while True:
             data = await websocket.receive_json()
-            # Pass data to the specific manager/session
             await chat_connection_manager.handle_message(websocket, data)
     except WebSocketDisconnect:
         await chat_connection_manager.disconnect(websocket)

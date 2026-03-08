@@ -54,6 +54,8 @@ class RateLimiter:
         domain_refill_rate: float = 10.0,
         session_capacity: int = 30,
         session_refill_rate: float = 5.0,
+        endpoint_capacity: int = 40,
+        endpoint_refill_rate: float = 8.0,
     ):
         """
         Initialize Rate Limiter
@@ -68,6 +70,8 @@ class RateLimiter:
         self.domain_refill_rate = domain_refill_rate
         self.session_capacity = session_capacity
         self.session_refill_rate = session_refill_rate
+        self.endpoint_capacity = endpoint_capacity
+        self.endpoint_refill_rate = endpoint_refill_rate
 
         # Domain buckets: origin -> TokenBucket
         self.domain_buckets: dict[str, TokenBucket] = defaultdict(
@@ -77,6 +81,11 @@ class RateLimiter:
         # Session buckets: session_id -> TokenBucket
         self.session_buckets: dict[str, TokenBucket] = defaultdict(
             lambda: TokenBucket(self.session_capacity, self.session_refill_rate)
+        )
+
+        # Endpoint buckets: endpoint+key tuple hash -> TokenBucket
+        self.endpoint_buckets: dict[str, TokenBucket] = defaultdict(
+            lambda: TokenBucket(self.endpoint_capacity, self.endpoint_refill_rate)
         )
 
     def check_rate_limit(self, origin: str, session_id: str) -> tuple[bool, str | None]:
@@ -122,6 +131,28 @@ class RateLimiter:
         return {
             "domain_buckets": len(self.domain_buckets),
             "session_buckets": len(self.session_buckets),
+            "endpoint_buckets": len(self.endpoint_buckets),
             "domain_capacity": self.domain_capacity,
             "session_capacity": self.session_capacity,
+            "endpoint_capacity": self.endpoint_capacity,
         }
+
+    def check_endpoint_rate_limit(self, endpoint: str, *key_parts: str) -> tuple[bool, str | None]:
+        """Rate-limit an endpoint by a composite key.
+
+        Example keys:
+        - challenge: ip + device fingerprint
+        - complete: ip + device fingerprint + challenge_id
+        - refresh: session_id + refresh fingerprint + ip
+        - websocket: ip + subject/session
+        """
+        normalized = [endpoint.strip().lower()]
+        for part in key_parts:
+            candidate = (part or "unknown").strip().lower()
+            normalized.append(candidate if candidate else "unknown")
+
+        bucket_key = "|".join(normalized)
+        bucket = self.endpoint_buckets[bucket_key]
+        if not bucket.consume():
+            return False, f"Rate limit exceeded for endpoint: {endpoint}"
+        return True, None
