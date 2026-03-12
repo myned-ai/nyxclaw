@@ -790,18 +790,30 @@ class OpenAIRealtimeBackend(BaseAgent):
 
                 original, sanitized = item
 
-                # Emit transcript_delta from TTS worker so it stays in sync
-                # with actual audio playback (prevents virtual_cursor desync).
-                if self._on_transcript_delta and not self._response_cancelled:
-                    await self._on_transcript_delta(original, "assistant", item_id, None)
-
                 # Breath pause between sentences (not before the first)
                 if sentence_count > 0 and self._on_audio_delta and not self._response_cancelled:
                     await self._on_audio_delta(silence_pad)
 
+                # Emit transcript before TTS synthesis (same as ZeroClaw/Piper).
+                # Must not be inside the audio streaming loop because
+                # audio_chunk_queue (maxsize=15) blocks the TTS worker when
+                # OpenAI delivers faster than real-time, which would stall
+                # transcript emission while audio already in the queue keeps
+                # playing on the client.
+                if self._on_transcript_delta and not self._response_cancelled:
+                    await self._on_transcript_delta(original, "assistant", item_id, None)
+
                 logger.debug(f"TTS synthesizing: {sanitized!r}")
 
                 try:
+                    # Re-chunk OpenAI's variable-size HTTP streaming chunks
+                    # into fixed ~100ms (4800 bytes) pieces to match Piper TTS
+                    # delivery cadence.  Without this, OpenAI sends large
+                    # bursty chunks (8-16KB) that cause wav2arkit frame bursts
+                    # and blendshape/audio desync.
+                    delivery_bytes = 24000 // 10 * 2  # 4800 bytes = 100ms @ 24kHz PCM16
+                    rechunk_buf = bytearray()
+
                     async with self._openai.audio.speech.with_streaming_response.create(
                         model=self._rt.openai_tts_model,
                         voice=self._rt.openai_voice,
@@ -812,8 +824,17 @@ class OpenAIRealtimeBackend(BaseAgent):
                         async for chunk in response.iter_bytes():
                             if self._response_cancelled:
                                 break
-                            if self._on_audio_delta:
-                                await self._on_audio_delta(chunk)
+                            rechunk_buf.extend(chunk)
+                            while len(rechunk_buf) >= delivery_bytes:
+                                if self._response_cancelled:
+                                    break
+                                if self._on_audio_delta:
+                                    await self._on_audio_delta(bytes(rechunk_buf[:delivery_bytes]))
+                                del rechunk_buf[:delivery_bytes]
+
+                    # Flush any remaining audio in the re-chunk buffer
+                    if rechunk_buf and not self._response_cancelled and self._on_audio_delta:
+                        await self._on_audio_delta(bytes(rechunk_buf))
                 except Exception as exc:
                     logger.error(f"OpenAI TTS error: {exc}")
                     if self._response_cancelled:

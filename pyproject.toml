@@ -11,38 +11,28 @@ dependencies = [
     "fastapi>=0.109.0",
     "uvicorn[standard]>=0.27.0",
     "pydantic-settings>=2.1.0",
-
     # WebSocket support
     "websockets>=12.0",
-
     # Performance - Fast JSON serialization
     "orjson>=3.9.0",
-
     # Audio processing
     "numpy>=1.24.0",
     "librosa>=0.10.0",
     "scipy>=1.10.0",
-
     # Environment variables
     "python-dotenv>=1.0.0",
-
     # ONNX Runtime provider selection
     # - Windows: prefer DirectML EP (iGPU/dGPU acceleration)
     # - Other OS: keep default CPU runtime
     "onnxruntime-directml>=1.23.0; platform_system == 'Windows'",
     "onnxruntime>=1.23.2; platform_system != 'Windows'",
-
     # AI Agent dependencies
     "httpx>=0.27.0",  # Async HTTP client for OpenClaw agent (SSE streaming)
-
     # OpenAI SDK (lightweight — used by openai_realtime voice layer)
     "openai>=1.50.0",
-
     # Signature verification for device challenge auth (Ed25519)
     "cryptography>=42.0.0",
-
-    # QR code generation for setup code display in logs
-    "qrcode>=7.4.0",
+    "segno>=1.6.6",
 ]
 
 [project.optional-dependencies]

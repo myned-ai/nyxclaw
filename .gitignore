@@ -120,6 +120,9 @@ dmypy.json
 # uv
 .uv_cache/
 
+# Auth runtime state
+data/auth_store.json
+
 # Claude
 .claude
 CLAUDE.md

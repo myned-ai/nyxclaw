@@ -1,7 +1,10 @@
-"""Setup code generation — produces a signed, base64url-encoded setup code.
+"""Setup code generation for device pairing.
 
-The setup code encodes the server's WebSocket URL and a bootstrap token.
-Clients decode it to discover the server and pair for the first time.
+Two formats:
+- **QR code** (compact): `nyxclaw://<gateway-host>/ws?t=<token>` — small enough
+  for Version 3-4 QR (29-33 modules), easily scannable from a terminal.
+- **Text paste** (signed envelope): base64url JSON with HMAC-SHA256 signature,
+  for manual copy-paste when QR scanning isn't possible.
 """
 
 from __future__ import annotations
@@ -12,6 +15,9 @@ import hmac
 import json
 import secrets
 import time
+from urllib.parse import quote, urlparse
+
+import segno
 
 from auth.models import BootstrapRecord, utc_now
 from auth.store import AuthStore, hash_token
@@ -27,8 +33,8 @@ class SetupCodeService:
             raise ValueError("Setup code secret must not be empty")
         self._secret = secret.encode("utf-8")
 
-    def generate(self, *, gateway_url: str, bootstrap_token: str) -> str:
-        """Generate a signed setup code containing the gateway URL and bootstrap token."""
+    def generate_signed(self, *, gateway_url: str, bootstrap_token: str) -> str:
+        """Generate a signed base64url setup code (text-paste format)."""
         now = int(time.time())
         payload = {
             "issuedAt": now,
@@ -40,6 +46,15 @@ class SetupCodeService:
         envelope = {"v": 1, "p": payload, "s": signature}
         envelope_json = json.dumps(envelope, separators=(",", ":"), sort_keys=True)
         return base64.urlsafe_b64encode(envelope_json.encode("utf-8")).rstrip(b"=").decode("utf-8")
+
+    @staticmethod
+    def generate_qr_uri(*, gateway_url: str, bootstrap_token: str) -> str:
+        """Generate compact QR URI: nyxclaw://<host>/ws?t=<token>."""
+        parsed = urlparse(gateway_url)
+        # Strip scheme — the mobile app prepends wss://
+        host_and_path = parsed.netloc + parsed.path
+        token_encoded = quote(bootstrap_token, safe="")
+        return f"nyxclaw://{host_and_path}?t={token_encoded}"
 
     def _sign(self, payload_json: str) -> str:
         digest = hmac.new(self._secret, payload_json.encode("utf-8"), hashlib.sha256).digest()
@@ -72,40 +87,38 @@ def ensure_setup_code(auth_store: AuthStore) -> str | None:
 
     # Generate new bootstrap token
     bootstrap_token = secrets.token_urlsafe(32)
-    auth_store.set_bootstrap(BootstrapRecord(
-        token_hash=hash_token(bootstrap_token),
-        created_at=utc_now(),
-    ))
+    auth_store.set_bootstrap(
+        BootstrapRecord(
+            token_hash=hash_token(bootstrap_token),
+            created_at=utc_now(),
+        )
+    )
 
     service = SetupCodeService(secret=secret)
-    setup_code = service.generate(gateway_url=gateway_url, bootstrap_token=bootstrap_token)
+    setup_code = service.generate_signed(gateway_url=gateway_url, bootstrap_token=bootstrap_token)
+    qr_uri = service.generate_qr_uri(gateway_url=gateway_url, bootstrap_token=bootstrap_token)
 
-    _print_setup_code(setup_code)
+    _print_setup_code(setup_code=setup_code, qr_uri=qr_uri)
     return bootstrap_token
 
 
-def _print_setup_code(setup_code: str) -> None:
-    """Print setup code to logs, with QR code if qrcode library is available."""
+def _print_setup_code(*, setup_code: str, qr_uri: str) -> None:
+    """Print setup code and save QR as PNG."""
     logger.info("=" * 60)
-    logger.info("SETUP CODE (copy-paste or scan QR):")
+    logger.info("DEVICE PAIRING")
+    logger.info("")
+    logger.info("Scan the QR code with the mobile app,")
+    logger.info("or paste this setup code manually:")
     logger.info("")
     logger.info(f"  {setup_code}")
     logger.info("")
 
     try:
-        import qrcode  # type: ignore[import-untyped]
+        qr_path = "/app/pairing_qr.png"
+        qr = segno.make(qr_uri, error="m")
+        qr.save(qr_path, scale=10, border=4)
+        logger.info(f"QR code saved to: {qr_path}")
+    except OSError as exc:
+        logger.warning(f"Could not save QR code PNG: {exc}")
 
-        qr = qrcode.QRCode(border=1)
-        qr.add_data(setup_code)
-        qr.make(fit=True)
-        from io import StringIO
-
-        buf = StringIO()
-        qr.print_ascii(out=buf, invert=True)
-        for line in buf.getvalue().splitlines():
-            logger.info(line)
-    except ImportError:
-        logger.info("(Install 'qrcode' package to also display a scannable QR code)")
-
-    logger.info("")
     logger.info("=" * 60)

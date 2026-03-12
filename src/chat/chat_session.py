@@ -520,6 +520,12 @@ class ChatSession:
             msg["itemId"] = item_id
         if previous_item_id:
             msg["previousItemId"] = previous_item_id
+        logger.debug(
+            f"Session {self.session_id}: transcript_delta SEND text={text!r} "
+            f"startOffset={int(start_offset)} endOffset={int(end_offset)} "
+            f"total_audio_received={self.total_audio_received:.3f}s "
+            f"virtual_cursor={self.virtual_cursor_text_ms:.0f}ms"
+        )
         await self.send_json(msg)
 
     async def _handle_user_transcript(self, transcript: str, role: str = "user") -> None:
