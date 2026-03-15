@@ -30,7 +30,7 @@ services:
       - SERVER_PORT=8080
       - AUTH_ENABLED=${AUTH_ENABLED:-false}
       - AUTH_ENABLE_RATE_LIMITING=${AUTH_ENABLE_RATE_LIMITING:-true}
-      - AUTH_SETUP_CODE_SECRET=${AUTH_SETUP_CODE_SECRET:-}
+
       - AUTH_SETUP_CODE_URL=${AUTH_SETUP_CODE_URL:-}
       - AUTH_STORE_PATH=/app/data/auth_store.json
       - AUTH_REGENERATE_SETUP_CODE=${AUTH_REGENERATE_SETUP_CODE:-false}
@@ -72,11 +72,10 @@ services:
       - TTS_NOISE_W_SCALE=${TTS_NOISE_W_SCALE:-0.8}
       - TTS_LENGTH_SCALE=${TTS_LENGTH_SCALE:-0.95}
     volumes:
-      - ./pretrained_models/wav2arkit/wav2arkit_cpu.onnx:/app/pretrained_models/wav2arkit/wav2arkit_cpu.onnx:ro
-      - ./pretrained_models/wav2arkit/wav2arkit_cpu.onnx.data:/app/pretrained_models/wav2arkit/wav2arkit_cpu.onnx.data:ro
-      - ./pretrained_models/piper:/app/pretrained_models/piper:ro
-      - ./pretrained_models/faster_whisper_small_en:/app/pretrained_models/faster_whisper_small_en:ro
-      - ./pretrained_models/silero_vad.onnx:/app/pretrained_models/silero_vad.onnx:ro
+      # Uncomment to override baked-in models without rebuilding:
+      # - ./pretrained_models/wav2arkit:/app/pretrained_models/wav2arkit:ro
+      # - ./pretrained_models/piper:/app/pretrained_models/piper:ro
+      # - ./pretrained_models/faster_whisper_small_en:/app/pretrained_models/faster_whisper_small_en:ro
       - ./data:/app/data  # Persistent auth store
     restart: unless-stopped
     healthcheck:
@@ -107,7 +106,7 @@ services:
       - SERVER_PORT=8080
       - AUTH_ENABLED=${AUTH_ENABLED:-false}
       - AUTH_ENABLE_RATE_LIMITING=${AUTH_ENABLE_RATE_LIMITING:-true}
-      - AUTH_SETUP_CODE_SECRET=${AUTH_SETUP_CODE_SECRET:-}
+
       - AUTH_SETUP_CODE_URL=${AUTH_SETUP_CODE_URL:-}
       - AUTH_STORE_PATH=/app/data/auth_store.json
       - AUTH_REGENERATE_SETUP_CODE=${AUTH_REGENERATE_SETUP_CODE:-false}
@@ -149,10 +148,9 @@ services:
       - TTS_LENGTH_SCALE=${TTS_LENGTH_SCALE:-0.95}
     volumes:
       - .:/app
-      - ./pretrained_models/wav2arkit/wav2arkit_cpu.onnx:/app/pretrained_models/wav2arkit/wav2arkit_cpu.onnx:ro
-      - ./pretrained_models/wav2arkit/wav2arkit_cpu.onnx.data:/app/pretrained_models/wav2arkit/wav2arkit_cpu.onnx.data:ro
-      - ./pretrained_models/piper:/app/pretrained_models/piper:ro
-      - ./pretrained_models/faster_whisper_small_en:/app/pretrained_models/faster_whisper_small_en:ro
-      - ./pretrained_models/silero_vad.onnx:/app/pretrained_models/silero_vad.onnx:ro
+      # Uncomment to override baked-in models without rebuilding:
+      # - ./pretrained_models/wav2arkit:/app/pretrained_models/wav2arkit:ro
+      # - ./pretrained_models/piper:/app/pretrained_models/piper:ro
+      # - ./pretrained_models/faster_whisper_small_en:/app/pretrained_models/faster_whisper_small_en:ro
       - ./data:/app/data  # Persistent auth store
     command: uv run uvicorn src.main:app --host 0.0.0.0 --port 8080 --reload

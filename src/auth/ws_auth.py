@@ -181,6 +181,7 @@ async def _receive_with_timeout(websocket: WebSocket, timeout_sec: int) -> dict:
 
 
 async def _send_error(websocket: WebSocket, code: str, message: str) -> None:
+    logger.warning(f"Auth rejected: {code} — {message}")
     try:
         await websocket.send_json({
             "event": "connect.error",

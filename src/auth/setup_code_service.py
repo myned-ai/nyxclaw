@@ -10,8 +10,6 @@ Two formats:
 from __future__ import annotations
 
 import base64
-import hashlib
-import hmac
 import json
 import secrets
 import time
@@ -28,22 +26,18 @@ logger = get_logger(__name__)
 
 
 class SetupCodeService:
-    def __init__(self, secret: str) -> None:
-        if not secret.strip():
-            raise ValueError("Setup code secret must not be empty")
-        self._secret = secret.encode("utf-8")
+    def __init__(self) -> None:
+        pass
 
     def generate_signed(self, *, gateway_url: str, bootstrap_token: str) -> str:
-        """Generate a signed base64url setup code (text-paste format)."""
+        """Generate a base64url setup code (text-paste format)."""
         now = int(time.time())
         payload = {
             "issuedAt": now,
             "token": bootstrap_token.strip(),
             "url": gateway_url.strip(),
         }
-        payload_json = json.dumps(payload, separators=(",", ":"), sort_keys=True)
-        signature = self._sign(payload_json)
-        envelope = {"v": 1, "p": payload, "s": signature}
+        envelope = {"v": 1, "p": payload}
         envelope_json = json.dumps(envelope, separators=(",", ":"), sort_keys=True)
         return base64.urlsafe_b64encode(envelope_json.encode("utf-8")).rstrip(b"=").decode("utf-8")
 
@@ -56,20 +50,11 @@ class SetupCodeService:
         token_encoded = quote(bootstrap_token, safe="")
         return f"nyxclaw://{host_and_path}?t={token_encoded}"
 
-    def _sign(self, payload_json: str) -> str:
-        digest = hmac.new(self._secret, payload_json.encode("utf-8"), hashlib.sha256).digest()
-        return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("utf-8")
-
 
 def ensure_setup_code(auth_store: AuthStore) -> str | None:
     """Generate and print setup code at startup if needed. Returns the raw bootstrap token or None."""
     settings = get_settings()
     if not settings.auth_enabled:
-        return None
-
-    secret = settings.auth_setup_code_secret
-    if not secret.strip():
-        logger.warning("AUTH_SETUP_CODE_SECRET is not set — cannot generate setup code")
         return None
 
     gateway_url = settings.auth_setup_code_url
@@ -94,7 +79,7 @@ def ensure_setup_code(auth_store: AuthStore) -> str | None:
         )
     )
 
-    service = SetupCodeService(secret=secret)
+    service = SetupCodeService()
     setup_code = service.generate_signed(gateway_url=gateway_url, bootstrap_token=bootstrap_token)
     qr_uri = service.generate_qr_uri(gateway_url=gateway_url, bootstrap_token=bootstrap_token)
 
