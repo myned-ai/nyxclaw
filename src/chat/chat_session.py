@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import concurrent.futures
+import json
 import time
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,7 @@ from fastapi import WebSocket
 from core.logger import get_logger
 from core.settings import Settings
 from services import Wav2ArkitService, create_agent_instance
+from utils.thumbnail import get_link_thumbnail
 
 logger = get_logger(__name__)
 
@@ -119,6 +121,7 @@ class ChatSession:
             on_transcript_delta=self._handle_transcript_delta,
             on_interrupted=self._handle_interrupted,
             on_cancel_sync=self._on_agent_cancel_sync,
+            on_tool_call=self._handle_tool_call,
         )
 
     def _on_agent_cancel_sync(self) -> None:
@@ -135,9 +138,7 @@ class ChatSession:
             self._interrupt_sent = True
             current_offset_ms = 0
             if self.settings.blendshape_fps > 0:
-                current_offset_ms = int(
-                    (self.total_frames_emitted / self.settings.blendshape_fps) * 1000
-                )
+                current_offset_ms = int((self.total_frames_emitted / self.settings.blendshape_fps) * 1000)
             asyncio.create_task(self._send_barge_in_interrupt(current_offset_ms))
 
     async def _send_barge_in_interrupt(self, offset_ms: int) -> None:
@@ -152,9 +153,7 @@ class ChatSession:
                 }
             )
             await self.send_json({"type": "avatar_state", "state": "Listening"})
-            logger.info(
-                f"Session {self.session_id}: Barge-in interrupt sent immediately (offset={offset_ms}ms)"
-            )
+            logger.info(f"Session {self.session_id}: Barge-in interrupt sent immediately (offset={offset_ms}ms)")
         except Exception as e:
             logger.error(f"Session {self.session_id}: Failed to send barge-in interrupt: {e}")
 
@@ -207,6 +206,48 @@ class ChatSession:
                 logger.debug(f"Socket closed while sending to {self.session_id}: {e}")
             else:
                 logger.error(f"Error sending to client {self.session_id}: {e}")
+
+    async def _handle_tool_call(self, name: str, arguments: dict) -> None:
+        """Handle an agent event — forward rich content or tool calls to client."""
+
+        # Rich content from avatar channel (structured output: {speech, content})
+        if name == "rich_content":
+            content = arguments.get("content", "")
+            if content:
+                logger.info(f"Session {self.session_id}: Forwarding rich content ({len(content)} chars)")
+                await self.send_json(
+                    {
+                        "type": "rich_content",
+                        "content": content,
+                        "timestamp": int(time.time() * 1000),
+                    }
+                )
+            return
+
+        # Legacy: send_rich_content tool call (tool-based approach)
+        logger.info(f"Session {self.session_id}: Forwarding tool call '{name}' to client")
+        if name == "send_rich_content" and arguments.get("content_type") == "link_card":
+            payload_json = arguments.get("payload_json", "{}")
+            try:
+                payload = json.loads(payload_json)
+                url = payload.get("url")
+                if url and "thumbnail" not in payload:
+                    thumb_url = await get_link_thumbnail(url)
+                    if thumb_url:
+                        payload["thumbnail"] = thumb_url
+                        arguments["payload_json"] = json.dumps(payload)
+                        logger.info(f"Session {self.session_id}: Auto-injected thumbnail for link_card")
+            except Exception as e:
+                logger.warning(f"Session {self.session_id}: Error processing link_card payload: {e}")
+
+        await self.send_json(
+            {
+                "type": "trigger_action",
+                "function_name": name,
+                "arguments": arguments,
+                "timestamp": int(time.time() * 1000),
+            }
+        )
 
     async def _drain_queue(self, queue: asyncio.Queue) -> None:
         """Helper to flush an asyncio queue."""
@@ -501,9 +542,7 @@ class ChatSession:
 
         turn_id = self.current_turn_id if role == "assistant" else f"user_{int(time.time() * 1000)}"
         session_id = (
-            self.current_turn_session_id
-            if role == "assistant" and self.current_turn_session_id
-            else self.session_id
+            self.current_turn_session_id if role == "assistant" and self.current_turn_session_id else self.session_id
         )
         msg = {
             "type": "transcript_delta",
@@ -855,6 +894,16 @@ class ChatSession:
         elif msg_type == "interrupt":
             logger.info(f"Session {self.session_id}: Received explicit interrupt command from client")
             await self._handle_interrupted()
+
+        elif msg_type == "client_event":
+            if hasattr(self.agent, "handle_client_event"):
+                await self.agent.handle_client_event(
+                    name=data.get("name", ""),
+                    data=data.get("data", {}),
+                    directive=data.get("directive"),
+                    request_id=data.get("request_id"),
+                    attachments=data.get("attachments"),
+                )
 
         elif msg_type == "ping":
             await self.send_json(

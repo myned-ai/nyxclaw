@@ -99,8 +99,8 @@ async def test_transcript_emitted_before_audio():
     backend._on_transcript_delta = AsyncMock(side_effect=lambda *_a: call_order.append("transcript"))
     backend._on_audio_delta = AsyncMock(side_effect=lambda *_a: call_order.append("audio"))
 
-    queue: asyncio.Queue[tuple[str, str] | None] = asyncio.Queue()
-    await queue.put(("Hello.", "Hello."))
+    queue: asyncio.Queue[tuple[str, str, bool] | None] = asyncio.Queue()
+    await queue.put(("Hello.", "Hello.", False))
     await queue.put(None)
 
     await backend._tts_worker(queue, "item_1")
@@ -115,8 +115,8 @@ async def test_rechunk_large_chunks():
     big_chunk = b"\xAB" * 16000  # not a multiple of 4800
     backend = _make_backend(tts_chunks=[big_chunk])
 
-    queue: asyncio.Queue[tuple[str, str] | None] = asyncio.Queue()
-    await queue.put(("Test.", "Test."))
+    queue: asyncio.Queue[tuple[str, str, bool] | None] = asyncio.Queue()
+    await queue.put(("Test.", "Test.", False))
     await queue.put(None)
 
     await backend._tts_worker(queue, "item_1")
@@ -138,8 +138,8 @@ async def test_flush_remaining_buffer():
     small_chunk = b"\x02" * 1000
     backend = _make_backend(tts_chunks=[small_chunk])
 
-    queue: asyncio.Queue[tuple[str, str] | None] = asyncio.Queue()
-    await queue.put(("Hi.", "Hi."))
+    queue: asyncio.Queue[tuple[str, str, bool] | None] = asyncio.Queue()
+    await queue.put(("Hi.", "Hi.", False))
     await queue.put(None)
 
     await backend._tts_worker(queue, "item_1")
@@ -156,8 +156,8 @@ async def test_multiple_small_tts_chunks_rechunked():
     chunks = [b"\x03" * 2000] * 3
     backend = _make_backend(tts_chunks=chunks)
 
-    queue: asyncio.Queue[tuple[str, str] | None] = asyncio.Queue()
-    await queue.put(("Test.", "Test."))
+    queue: asyncio.Queue[tuple[str, str, bool] | None] = asyncio.Queue()
+    await queue.put(("Test.", "Test.", False))
     await queue.put(None)
 
     await backend._tts_worker(queue, "item_1")
@@ -184,9 +184,9 @@ async def test_bargein_stops_audio_emission():
 
     backend._on_audio_delta = AsyncMock(side_effect=audio_side_effect)
 
-    queue: asyncio.Queue[tuple[str, str] | None] = asyncio.Queue()
-    await queue.put(("First sentence.", "First sentence."))
-    await queue.put(("Second sentence.", "Second sentence."))
+    queue: asyncio.Queue[tuple[str, str, bool] | None] = asyncio.Queue()
+    await queue.put(("First sentence.", "First sentence.", False))
+    await queue.put(("Second sentence.", "Second sentence.", False))
     await queue.put(None)
 
     await backend._tts_worker(queue, "item_1")
@@ -210,9 +210,9 @@ async def test_multiple_sentences_each_get_transcript_before_audio():
     backend._on_transcript_delta = AsyncMock(side_effect=lambda *a: call_order.append(f"transcript:{a[0]}"))
     backend._on_audio_delta = AsyncMock(side_effect=lambda *_a: call_order.append("audio"))
 
-    queue: asyncio.Queue[tuple[str, str] | None] = asyncio.Queue()
-    await queue.put(("First.", "First."))
-    await queue.put(("Second.", "Second."))
+    queue: asyncio.Queue[tuple[str, str, bool] | None] = asyncio.Queue()
+    await queue.put(("First.", "First.", False))
+    await queue.put(("Second.", "Second.", False))
     await queue.put(None)
 
     await backend._tts_worker(queue, "item_1")
@@ -240,9 +240,9 @@ async def test_tts_error_continues_to_next_sentence():
     backend = _make_backend()
     backend._openai.audio.speech.with_streaming_response.create = MagicMock(side_effect=create_side_effect)
 
-    queue: asyncio.Queue[tuple[str, str] | None] = asyncio.Queue()
-    await queue.put(("Fails.", "Fails."))
-    await queue.put(("Works.", "Works."))
+    queue: asyncio.Queue[tuple[str, str, bool] | None] = asyncio.Queue()
+    await queue.put(("Fails.", "Fails.", False))
+    await queue.put(("Works.", "Works.", False))
     await queue.put(None)
 
     await backend._tts_worker(queue, "item_1")
@@ -270,9 +270,9 @@ async def test_silence_pad_between_sentences():
     audio_data = b"\x07" * DELIVERY_BYTES
     backend = _make_backend(tts_chunks=[audio_data])
 
-    queue: asyncio.Queue[tuple[str, str] | None] = asyncio.Queue()
-    await queue.put(("First.", "First."))
-    await queue.put(("Second.", "Second."))
+    queue: asyncio.Queue[tuple[str, str, bool] | None] = asyncio.Queue()
+    await queue.put(("First.", "First.", False))
+    await queue.put(("Second.", "Second.", False))
     await queue.put(None)
 
     await backend._tts_worker(queue, "item_1")
@@ -297,8 +297,8 @@ async def test_exact_multiple_of_delivery_bytes_no_flush():
     chunks = [b"\x08" * 9600]
     backend = _make_backend(tts_chunks=chunks)
 
-    queue: asyncio.Queue[tuple[str, str] | None] = asyncio.Queue()
-    await queue.put(("Test.", "Test."))
+    queue: asyncio.Queue[tuple[str, str, bool] | None] = asyncio.Queue()
+    await queue.put(("Test.", "Test.", False))
     await queue.put(None)
 
     await backend._tts_worker(queue, "item_1")
@@ -313,7 +313,7 @@ async def test_empty_queue_terminates_immediately():
     """Sending None immediately causes the worker to exit without any callbacks."""
     backend = _make_backend()
 
-    queue: asyncio.Queue[tuple[str, str] | None] = asyncio.Queue()
+    queue: asyncio.Queue[tuple[str, str, bool] | None] = asyncio.Queue()
     await queue.put(None)
 
     await backend._tts_worker(queue, "item_1")

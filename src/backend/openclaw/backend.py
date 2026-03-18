@@ -278,6 +278,7 @@ class OpenClawBackend(BaseAgent):
         on_interrupted: Callable[[], Awaitable[None]] | None = None,
         on_error: Callable[[Any], Awaitable[None]] | None = None,
         on_cancel_sync: Callable[[], None] | None = None,
+        on_tool_call: Callable[[str, dict], Awaitable[None]] | None = None,
     ) -> None:
         self._on_audio_delta = on_audio_delta
         self._on_transcript_delta = on_transcript_delta
@@ -287,6 +288,7 @@ class OpenClawBackend(BaseAgent):
         self._on_interrupted = on_interrupted
         self._on_error = on_error
         self._on_cancel_sync = on_cancel_sync
+        self._on_tool_call = on_tool_call
 
     # ================================================================
     # Lifecycle

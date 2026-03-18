@@ -1,7 +1,7 @@
 """
 Sample ZeroClaw Agent — Audio-Enabled
 
-Implements ZeroClaw gateway chat via WebSocket (`/ws/chat`) while reusing
+Implements ZeroClaw gateway chat via WebSocket (`/ws/avatar`) while reusing
 the same local STT/TTS flow used by the OpenClaw sample agent.
 """
 
@@ -19,7 +19,8 @@ import websockets
 
 from core.logger import get_logger
 from core.settings import get_settings
-from ..base_agent import BaseAgent, ConversationState
+
+from ..base_agent import TOOL_FILLERS, BaseAgent, ConversationState
 from .settings import get_zeroclaw_settings
 
 logger = get_logger(__name__)
@@ -28,15 +29,6 @@ _SENTENCE_BOUNDARY = re.compile(r"(?<=[.!?])\s+|\n+")
 # Clause-level split (comma, semicolon, colon, dash) — used for faster
 # TTS first-chunk when no sentence boundary has appeared yet.
 _CLAUSE_BOUNDARY = re.compile(r"(?<=[,;:\u2014])\s+")
-_TOOL_FILLERS = [
-    "On it.",
-    "One sec.",
-    "Working on it.",
-    "Let me handle that.",
-    "Give me a moment.",
-    "Hang on.",
-    "Let me take care of that.",
-]
 
 _UNSUPPORTED_TTS_CHARS = re.compile(
     r"["
@@ -58,7 +50,7 @@ class ZeroClawBackend(BaseAgent):
 
     Transport difference vs OpenClaw:
     - OpenClaw sample uses HTTP SSE (`/v1/chat/completions`)
-    - ZeroClaw uses WebSocket (`/ws/chat`)
+    - ZeroClaw uses WebSocket (`/ws/avatar`)
     """
 
     def __init__(self) -> None:
@@ -269,6 +261,7 @@ class ZeroClawBackend(BaseAgent):
         on_interrupted: Callable[[], Awaitable[None]] | None = None,
         on_error: Callable[[Any], Awaitable[None]] | None = None,
         on_cancel_sync: Callable[[], None] | None = None,
+        on_tool_call: Callable[[str, dict], Awaitable[None]] | None = None,
     ) -> None:
         self._on_audio_delta = on_audio_delta
         self._on_transcript_delta = on_transcript_delta
@@ -278,6 +271,7 @@ class ZeroClawBackend(BaseAgent):
         self._on_interrupted = on_interrupted
         self._on_error = on_error
         self._on_cancel_sync = on_cancel_sync
+        self._on_tool_call = on_tool_call
 
     def append_audio(self, audio_bytes: bytes) -> None:
         if not self._stt_available:
@@ -447,6 +441,12 @@ class ZeroClawBackend(BaseAgent):
 
                 original, sanitized, is_filler = item
 
+                # Skip filler if real content already arrived — the tool
+                # returned fast and there's no silence to fill.
+                if is_filler and not queue.empty():
+                    logger.debug("Filler skipped — real content already queued")
+                    continue
+
                 # Breath pause between sentences (not before the first)
                 if sentence_count > 0 and self._on_audio_delta and not self._response_cancelled:
                     await self._on_audio_delta(silence_pad)
@@ -515,7 +515,7 @@ class ZeroClawBackend(BaseAgent):
             raise ValueError(f"Unsupported ZeroClaw base URL scheme: {parsed.scheme}")
 
         ws_scheme = "wss" if scheme in {"https", "wss"} else "ws"
-        path = f"{parsed.path.rstrip('/')}/ws/chat" if parsed.path else "/ws/chat"
+        path = f"{parsed.path.rstrip('/')}/ws/avatar" if parsed.path else "/ws/avatar"
         query = parsed.query
 
         if zc.auth_token:
@@ -771,11 +771,30 @@ class ZeroClawBackend(BaseAgent):
                         await self._on_error({"error": error_msg})
                     break
 
+                if message_type == "rich_content":
+                    # Avatar channel: rich content (markdown, links, tables)
+                    # Forward directly to client — not spoken by TTS
+                    if self._on_tool_call:
+                        rc_content = str(message.get("content", ""))
+                        if rc_content:
+                            logger.info(f"Rich content received ({len(rc_content)} chars)")
+                            await self._on_tool_call("rich_content", {"content": rc_content})
+                    continue
+
                 if message_type == "tool_call":
+                    tool_name = message.get("name", "unknown")
+                    tool_args = message.get("args", {})
+
+                    # Rich-content tools bypass TTS — forward directly to client
+                    if tool_name == "send_rich_content" and self._on_tool_call:
+                        logger.info(f"Rich content tool call: {tool_name}")
+                        await self._on_tool_call(tool_name, tool_args)
+                        continue
+
+                    # All other tools: speak a filler phrase while they execute
                     if not spoke_filler and not full_response and not self._response_cancelled:
                         spoke_filler = True
-                        tool_name = message.get("name", "unknown")
-                        filler = random.choice(_TOOL_FILLERS)
+                        filler = random.choice(TOOL_FILLERS)
                         logger.info(f"Tool call: {tool_name} — filler: {filler!r}")
                         if self._tts_available:
                             sanitized = self._sanitize_for_tts(filler)
@@ -787,7 +806,7 @@ class ZeroClawBackend(BaseAgent):
                             await self._on_transcript_delta(filler, "assistant", item_id, None)
                     continue
 
-                if message_type == "chunk":
+                if message_type == "speech_chunk":
                     content = str(message.get("content", ""))
                 elif message_type == "done":
                     done_text = str(message.get("full_response", ""))
@@ -969,6 +988,33 @@ class ZeroClawBackend(BaseAgent):
 
         # Schedule via async helper so we wait for the old stream to drain
         asyncio.create_task(self._start_new_stream())
+
+    async def handle_client_event(
+        self,
+        name: str,
+        data: dict[str, Any] | None = None,
+        directive: str | None = None,
+        request_id: str | None = None,
+        attachments: list[dict[str, Any]] | None = None,
+    ) -> None:
+        """Forward a client event to ZeroClaw as a context message."""
+        parts = [f"SYSTEM EVENT — {name}"]
+        if directive:
+            parts.append(f"directive={directive}")
+        if data:
+            parts.append(f"data={json.dumps(data)}")
+        if attachments:
+            parts.append(f"attachments={json.dumps(attachments)}")
+        context_text = " | ".join(parts)
+
+        # Inject as a user message so the LLM sees it in context
+        if directive == "context":
+            # Silent absorption — append to history but don't trigger a response
+            self._append_message("user", context_text)
+            logger.info(f"Client event '{name}' absorbed as context (no response)")
+        else:
+            # 'speak' or 'trigger' — send as a regular message to get a response
+            self.send_text_message(context_text)
 
     async def _start_new_stream(self) -> None:
         """Wait for any in-flight stream to finish draining, then start a new one."""

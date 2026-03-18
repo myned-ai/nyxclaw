@@ -10,6 +10,16 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
+TOOL_FILLERS = [
+    "On it.",
+    "One sec.",
+    "Working on it.",
+    "Let me handle that.",
+    "Give me a moment.",
+    "Hang on.",
+    "Let me take care of that.",
+]
+
 
 @dataclass
 class ConversationState:
@@ -77,6 +87,7 @@ class BaseAgent(ABC):
         on_interrupted: Callable[[], Awaitable[None]] | None = None,
         on_error: Callable[[Any], Awaitable[None]] | None = None,
         on_cancel_sync: Callable[[], None] | None = None,
+        on_tool_call: Callable[[str, dict], Awaitable[None]] | None = None,
     ) -> None:
         """
         Set event handler callbacks.
@@ -89,6 +100,7 @@ class BaseAgent(ABC):
             on_user_transcript: Called with transcribed user speech
             on_interrupted: Called when user interrupts
             on_error: Called on errors
+            on_tool_call: Called when agent triggers a client action (name, arguments)
         """
         pass
 
@@ -124,6 +136,25 @@ class BaseAgent(ABC):
             audio_bytes: PCM16 audio bytes
         """
         pass
+
+    async def handle_client_event(  # noqa: B027
+        self,
+        name: str,
+        data: dict[str, Any] | None = None,
+        directive: str | None = None,
+        request_id: str | None = None,
+        attachments: list[dict[str, Any]] | None = None,
+    ) -> None:
+        """
+        Handle a client event forwarded from the avatar app.
+
+        Args:
+            name: Event name
+            data: Optional event payload
+            directive: How to handle — 'context', 'speak', or 'trigger'
+            request_id: Optional tracking ID
+            attachments: Optional list of attachment dicts
+        """
 
     @abstractmethod
     async def disconnect(self) -> None:

@@ -6,7 +6,7 @@ the configured LLM backend, and synthesizes speech via OpenAI TTS API.
 
 LLM routing by agent_type:
   - openclaw → HTTP SSE at /v1/chat/completions
-  - zeroclaw → WebSocket at /ws/chat
+  - zeroclaw → WebSocket at /ws/avatar
 
 Pipeline: Client audio → OpenAI Realtime (VAD+STT) → transcript
           → OpenClaw SSE / ZeroClaw WS (LLM) → sentence buffer
@@ -16,6 +16,7 @@ Pipeline: Client audio → OpenAI Realtime (VAD+STT) → transcript
 import asyncio
 import base64
 import json
+import random
 import re
 import time
 from collections.abc import AsyncGenerator, Awaitable, Callable
@@ -26,7 +27,7 @@ import httpx
 import orjson
 import websockets
 
-from backend.base_agent import BaseAgent, ConversationState
+from backend.base_agent import TOOL_FILLERS, BaseAgent, ConversationState
 from core.logger import get_logger
 from core.settings import get_settings
 
@@ -155,6 +156,7 @@ class OpenAIRealtimeBackend(BaseAgent):
         on_interrupted: Callable[[], Awaitable[None]] | None = None,
         on_error: Callable[[Any], Awaitable[None]] | None = None,
         on_cancel_sync: Callable[[], None] | None = None,
+        on_tool_call: (Callable[[str, dict], Awaitable[None]] | None) = None,
     ) -> None:
         self._on_audio_delta = on_audio_delta
         self._on_transcript_delta = on_transcript_delta
@@ -164,6 +166,7 @@ class OpenAIRealtimeBackend(BaseAgent):
         self._on_interrupted = on_interrupted
         self._on_error = on_error
         self._on_cancel_sync = on_cancel_sync
+        self._on_tool_call = on_tool_call
 
     # ================================================================
     # Lifecycle
@@ -276,7 +279,7 @@ class OpenAIRealtimeBackend(BaseAgent):
             raise ValueError(f"Unsupported ZeroClaw base URL scheme: {parsed.scheme}")
 
         ws_scheme = "wss" if scheme in {"https", "wss"} else "ws"
-        path = f"{parsed.path.rstrip('/')}/ws/chat" if parsed.path else "/ws/chat"
+        path = f"{parsed.path.rstrip('/')}/ws/avatar" if parsed.path else "/ws/avatar"
         query = parsed.query
 
         if rt.auth_token:
@@ -543,8 +546,16 @@ class OpenAIRealtimeBackend(BaseAgent):
                 if content and not self._response_cancelled:
                     yield content
 
-    async def _iter_tokens_ws(self) -> AsyncGenerator[str, None]:
-        """Yield text tokens from ZeroClaw WebSocket (/ws/chat)."""
+    async def _iter_tokens_ws(
+        self,
+        tts_queue: asyncio.Queue[tuple[str, str, bool] | None] | None = None,
+    ) -> AsyncGenerator[str, None]:
+        """Yield text tokens from ZeroClaw WebSocket (/ws/avatar).
+
+        When *tts_queue* is provided, filler phrases for non-rich tool calls
+        are pushed directly onto the TTS queue (with ``is_filler=True``) so
+        they play immediately without waiting for the next text chunk.
+        """
         user_content = ""
         for message in reversed(self._messages):
             if message.get("role") == "user":
@@ -559,6 +570,7 @@ class OpenAIRealtimeBackend(BaseAgent):
         await websocket.send(json.dumps({"type": "message", "content": user_content}))
 
         has_content = False
+        spoke_filler = False
 
         while True:
             if self._response_cancelled:
@@ -606,12 +618,34 @@ class OpenAIRealtimeBackend(BaseAgent):
                     await self._on_error({"error": error_msg})
                 break
 
-            if msg_type == "tool_call":
-                tool_name = message.get("name", "unknown")
-                logger.info(f"Tool call: {tool_name}")
+            if msg_type == "rich_content":
+                # Avatar channel: rich content — forward to client, not TTS
+                if self._on_tool_call:
+                    rc_content = str(message.get("content", ""))
+                    if rc_content:
+                        logger.info(f"Rich content received ({len(rc_content)} chars)")
+                        await self._on_tool_call("rich_content", {"content": rc_content})
                 continue
 
-            if msg_type == "chunk":
+            if msg_type == "tool_call":
+                tool_name = message.get("name", "unknown")
+                tool_args = message.get("args", {})
+
+                # All tools: speak a filler phrase while they execute
+                if not spoke_filler and not has_content and not self._response_cancelled:
+                    spoke_filler = True
+                    filler = random.choice(TOOL_FILLERS)
+                    logger.info(f"Tool call: {tool_name} — filler: {filler!r}")
+                    if tts_queue is not None:
+                        sanitized = self._sanitize_for_tts(filler)
+                        if sanitized:
+                            await tts_queue.put((filler, sanitized, True))
+                else:
+                    logger.info(f"Tool call: {tool_name}")
+
+                continue
+
+            if msg_type == "speech_chunk":
                 content = str(message.get("content", ""))
                 if content:
                     has_content = True
@@ -651,13 +685,14 @@ class OpenAIRealtimeBackend(BaseAgent):
         sentence_buffer = ""
 
         # TTS sentence queue (None = sentinel for "done")
-        tts_queue: asyncio.Queue[tuple[str, str] | None] = asyncio.Queue()
+        # Tuple: (original_text, sanitized_text, is_filler)
+        tts_queue: asyncio.Queue[tuple[str, str, bool] | None] = asyncio.Queue()
         tts_task = asyncio.create_task(self._tts_worker(tts_queue, item_id))
 
         try:
             # Choose LLM streaming method based on agent type
             if agent_type == "zeroclaw":
-                token_stream = self._iter_tokens_ws()
+                token_stream = self._iter_tokens_ws(tts_queue=tts_queue)
             else:
                 token_stream = self._iter_tokens_sse()
 
@@ -674,7 +709,7 @@ class OpenAIRealtimeBackend(BaseAgent):
                 for sent in sentences:
                     sanitized = self._sanitize_for_tts(sent)
                     if sanitized:
-                        await tts_queue.put((sent, sanitized))
+                        await tts_queue.put((sent, sanitized, False))
 
             # ── Stream done — flush remaining sentence to TTS ──────
             if not self._response_cancelled:
@@ -682,7 +717,7 @@ class OpenAIRealtimeBackend(BaseAgent):
                 if remaining:
                     sanitized = self._sanitize_for_tts(remaining)
                     if sanitized:
-                        await tts_queue.put((remaining, sanitized))
+                        await tts_queue.put((remaining, sanitized, False))
                 await tts_queue.put(None)
                 if tts_task:
                     await tts_task
@@ -771,7 +806,7 @@ class OpenAIRealtimeBackend(BaseAgent):
 
     async def _tts_worker(
         self,
-        queue: asyncio.Queue[tuple[str, str] | None],
+        queue: asyncio.Queue[tuple[str, str, bool] | None],
         item_id: str,
     ) -> None:
         """Synthesize queued sentences via OpenAI TTS API."""
@@ -788,19 +823,21 @@ class OpenAIRealtimeBackend(BaseAgent):
                 if self._response_cancelled:
                     break
 
-                original, sanitized = item
+                original, sanitized, is_filler = item
+
+                # Skip filler if real content already arrived — the tool
+                # returned fast and there's no silence to fill.
+                if is_filler and not queue.empty():
+                    logger.debug("Filler skipped — real content already queued")
+                    continue
 
                 # Breath pause between sentences (not before the first)
                 if sentence_count > 0 and self._on_audio_delta and not self._response_cancelled:
                     await self._on_audio_delta(silence_pad)
 
-                # Emit transcript before TTS synthesis (same as ZeroClaw/Piper).
-                # Must not be inside the audio streaming loop because
-                # audio_chunk_queue (maxsize=15) blocks the TTS worker when
-                # OpenAI delivers faster than real-time, which would stall
-                # transcript emission while audio already in the queue keeps
-                # playing on the client.
-                if self._on_transcript_delta and not self._response_cancelled:
+                # Skip filler — it's spoken but not part of the real transcript,
+                # and its offsets would corrupt the virtual cursor for real content.
+                if not is_filler and self._on_transcript_delta and not self._response_cancelled:
                     await self._on_transcript_delta(original, "assistant", item_id, None)
 
                 logger.debug(f"TTS synthesizing: {sanitized!r}")
