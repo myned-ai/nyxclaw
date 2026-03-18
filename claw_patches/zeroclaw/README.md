@@ -46,14 +46,24 @@ nyxclaw connects to `ws://<host>:<port>/ws/avatar` instead of `/ws/chat`.
 
 ## Files modified
 
-| File | Type | What changed |
-|------|------|-------------|
-| `src/providers/traits.rs` | MODIFIED | Added `response_format: Option<&serde_json::Value>` to `ChatRequest` struct. Removed `Copy` derive (Value isn't Copy). |
-| `src/providers/openai.rs` | MODIFIED | Added `response_format` field to `NativeChatRequest`, passed through in `chat()` method to OpenAI API. |
-| `src/agent/agent.rs` | MODIFIED | Added `response_format` field to Agent + setter. Added `turn_with_events()` method that streams tool_call/tool_result/chunk events via mpsc channel. |
-| `src/channels/nyxclaw.rs` | **NEW** | Dedicated avatar WebSocket channel. Sets structured JSON response format, uses `turn_with_events()`, parses `{speech, content}` response, sends `speech_chunk` + `rich_content` events. |
-| `src/gateway/mod.rs` | INJECTED | 3 lines added: import, `/ws/avatar` route, print line. Original file preserved. |
-| `src/channels/mod.rs` | INJECTED | 1 line added: `pub mod nyxclaw;`. Original file preserved. |
+### Full file replacements (patched copies in `src/`)
+
+| File | What changed |
+|------|-------------|
+| `src/providers/traits.rs` | Added `response_format: Option<&serde_json::Value>` to `ChatRequest`. Removed `Copy` derive. |
+| `src/providers/openai.rs` | Added `response_format` to `NativeChatRequest`, passed through in `chat()` to OpenAI API. |
+| `src/agent/agent.rs` | Added `response_format` field + setter. Added `turn_with_events()` for streaming events. |
+| `src/channels/nyxclaw.rs` | **NEW** — Avatar WebSocket channel (`/ws/avatar`). Structured JSON output, speech/content split. |
+
+### Line injections (original files preserved)
+
+| File | What injected |
+|------|--------------|
+| `src/agent/loop_.rs` | `response_format: None,` in `ChatRequest` construction (1 location) |
+| `src/providers/anthropic.rs` | `response_format: None,` in `ProviderChatRequest` construction (1 location) |
+| `src/providers/reliable.rs` | `response_format: None,` in `ChatRequest` constructions (6 locations) |
+| `src/channels/mod.rs` | `pub mod nyxclaw;` after `pub mod notion;` |
+| `src/gateway/mod.rs` | `use crate::channels::nyxclaw;` import + `/ws/avatar` route + print line |
 
 ## AGENTS.md — Required prompt addition
 

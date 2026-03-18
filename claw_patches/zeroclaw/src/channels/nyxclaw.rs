@@ -16,7 +16,7 @@
 //! Server -> Client: {"type":"done","full_response":"..."}
 //! ```
 
-use super::AppState;
+use crate::gateway::AppState;
 use axum::{
     extract::{
         ws::{Message, WebSocket},
