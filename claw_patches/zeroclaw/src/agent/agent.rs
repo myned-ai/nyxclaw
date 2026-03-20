@@ -6,11 +6,12 @@ use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
 use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::observability::{self, Observer, ObserverEvent};
-use crate::providers::{self, ChatMessage, ChatRequest, ConversationMessage, Provider};
+use crate::providers::{self, ChatMessage, ChatRequest, ChatResponse, ConversationMessage, Provider, StreamEvent};
 use crate::runtime;
 use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool, ToolSpec};
 use anyhow::Result;
+use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::io::Write as IoWrite;
 use std::sync::Arc;
@@ -552,47 +553,7 @@ impl Agent {
     }
 
     pub async fn turn(&mut self, user_message: &str) -> Result<String> {
-        if self.history.is_empty() {
-            let system_prompt = self.build_system_prompt()?;
-            self.history
-                .push(ConversationMessage::Chat(ChatMessage::system(
-                    system_prompt,
-                )));
-        }
-
-        if self.auto_save {
-            let _ = self
-                .memory
-                .store(
-                    "user_msg",
-                    user_message,
-                    MemoryCategory::Conversation,
-                    self.memory_session_id.as_deref(),
-                )
-                .await;
-        }
-
-        let context = self
-            .memory_loader
-            .load_context(
-                self.memory.as_ref(),
-                user_message,
-                self.memory_session_id.as_deref(),
-            )
-            .await
-            .unwrap_or_default();
-
-        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
-        let enriched = if context.is_empty() {
-            format!("[{now}] {user_message}")
-        } else {
-            format!("{context}[{now}] {user_message}")
-        };
-
-        self.history
-            .push(ConversationMessage::Chat(ChatMessage::user(enriched)));
-
-        let effective_model = self.classify_model(user_message);
+        let effective_model = self.prepare_turn(user_message).await?;
 
         for _ in 0..self.config.max_tool_iterations {
             let messages = self.tool_dispatcher.to_provider_messages(&self.history);
@@ -713,11 +674,10 @@ impl Agent {
         )
     }
 
-    pub async fn turn_with_events(
-        &mut self,
-        user_message: &str,
-        event_tx: tokio::sync::mpsc::Sender<serde_json::Value>,
-    ) -> Result<String> {
+    /// Shared turn preparation: init system prompt, persist user message,
+    /// load memory context, enrich message, push to history.
+    /// Returns the effective model name for this turn.
+    async fn prepare_turn(&mut self, user_message: &str) -> Result<String> {
         if self.history.is_empty() {
             let system_prompt = self.build_system_prompt()?;
             self.history
@@ -758,7 +718,15 @@ impl Agent {
         self.history
             .push(ConversationMessage::Chat(ChatMessage::user(enriched)));
 
-        let effective_model = self.classify_model(user_message);
+        Ok(self.classify_model(user_message))
+    }
+
+    pub async fn turn_with_events(
+        &mut self,
+        user_message: &str,
+        event_tx: tokio::sync::mpsc::Sender<serde_json::Value>,
+    ) -> Result<String> {
+        let effective_model = self.prepare_turn(user_message).await?;
 
         for _ in 0..self.config.max_tool_iterations {
             let messages = self.tool_dispatcher.to_provider_messages(&self.history);
@@ -889,6 +857,212 @@ impl Agent {
             });
 
             // Execute tools with event emission
+            let mut results = Vec::with_capacity(calls.len());
+            for call in &calls {
+                let _ = event_tx
+                    .send(serde_json::json!({
+                        "type": "tool_call",
+                        "name": call.name,
+                        "args": call.arguments.clone()
+                    }))
+                    .await;
+
+                let start = Instant::now();
+                let result = self.execute_tool_call(call).await;
+                let duration_ms = start.elapsed().as_millis() as u64;
+
+                let _ = event_tx
+                    .send(serde_json::json!({
+                        "type": "tool_result",
+                        "name": result.name,
+                        "output": result.output,
+                        "success": result.success,
+                        "duration_ms": duration_ms
+                    }))
+                    .await;
+
+                results.push(result);
+            }
+
+            let formatted = self.tool_dispatcher.format_results(&results);
+            self.history.push(formatted);
+            self.trim_history();
+        }
+
+        anyhow::bail!(
+            "Agent exceeded maximum tool iterations ({})",
+            self.config.max_tool_iterations
+        )
+    }
+
+    /// Streaming variant of `turn_with_events`.
+    ///
+    /// Uses the provider's `stream_chat()` so content deltas are forwarded to the
+    /// channel as they arrive (enabling incremental TTS).  Tool-call iterations
+    /// are accumulated from the stream and looped the same way as the non-streaming
+    /// path — only the final text-producing iteration actually streams to the caller.
+    ///
+    /// Falls back to `turn_with_events()` when the provider doesn't support streaming.
+    pub async fn turn_with_streaming(
+        &mut self,
+        user_message: &str,
+        event_tx: tokio::sync::mpsc::Sender<serde_json::Value>,
+    ) -> Result<String> {
+        if !self.provider.supports_streaming() {
+            return self.turn_with_events(user_message, event_tx).await;
+        }
+
+        let effective_model = self.prepare_turn(user_message).await?;
+
+        // ── Agent loop with streaming ─────────────────────────────────
+        for _ in 0..self.config.max_tool_iterations {
+            let messages = self.tool_dispatcher.to_provider_messages(&self.history);
+
+            // Response cache check (same as non-streaming)
+            let cache_key = if self.temperature == 0.0 {
+                self.response_cache.as_ref().map(|_| {
+                    let last_user = messages
+                        .iter()
+                        .rfind(|m| m.role == "user")
+                        .map(|m| m.content.as_str())
+                        .unwrap_or("");
+                    let system = messages
+                        .iter()
+                        .find(|m| m.role == "system")
+                        .map(|m| m.content.as_str());
+                    crate::memory::response_cache::ResponseCache::cache_key(
+                        &effective_model,
+                        system,
+                        last_user,
+                    )
+                })
+            } else {
+                None
+            };
+
+            if let (Some(ref cache), Some(ref key)) = (&self.response_cache, &cache_key) {
+                if let Ok(Some(cached)) = cache.get(key) {
+                    self.observer.record_event(&ObserverEvent::CacheHit {
+                        cache_type: "response".into(),
+                        tokens_saved: 0,
+                    });
+                    self.history
+                        .push(ConversationMessage::Chat(ChatMessage::assistant(
+                            cached.clone(),
+                        )));
+                    self.trim_history();
+
+                    for chunk in split_into_sentence_chunks(&cached, 100) {
+                        let _ = event_tx
+                            .send(serde_json::json!({
+                                "type": "speech_chunk",
+                                "content": chunk
+                            }))
+                            .await;
+                    }
+                    return Ok(cached);
+                }
+                self.observer.record_event(&ObserverEvent::CacheMiss {
+                    cache_type: "response".into(),
+                });
+            }
+
+            // ── Stream the LLM response ───────────────────────────────
+            let request = ChatRequest {
+                messages: &messages,
+                tools: if self.tool_dispatcher.should_send_tool_specs() {
+                    Some(&self.tool_specs)
+                } else {
+                    None
+                },
+                response_format: self.response_format.as_ref(),
+            };
+
+            let mut stream = self
+                .provider
+                .stream_chat(request, &effective_model, self.temperature);
+
+            let mut response: Option<ChatResponse> = None;
+
+            while let Some(event_result) = stream.next().await {
+                let event = match event_result {
+                    Ok(e) => e,
+                    Err(err) => return Err(anyhow::anyhow!("Stream error: {err}")),
+                };
+
+                match event {
+                    StreamEvent::ContentDelta(delta) => {
+                        // Forward content deltas to the channel for incremental parsing
+                        let _ = event_tx
+                            .send(serde_json::json!({
+                                "type": "content_delta",
+                                "content": delta
+                            }))
+                            .await;
+                    }
+                    StreamEvent::ToolCallDelta { .. } => {
+                        // Accumulated inside the provider's stream — no action needed here.
+                        // The final ChatResponse in Done will contain the parsed tool calls.
+                    }
+                    StreamEvent::Done(chat_response) => {
+                        response = Some(chat_response);
+                    }
+                }
+            }
+
+            let response = response.ok_or_else(|| {
+                anyhow::anyhow!("Stream ended without producing a response")
+            })?;
+
+            // Signal that streaming for this iteration is complete
+            let _ = event_tx
+                .send(serde_json::json!({ "type": "content_done" }))
+                .await;
+
+            // ── Dispatch: text-only or tool calls ─────────────────────
+            let (text, calls) = self.tool_dispatcher.parse_response(&response);
+
+            if calls.is_empty() {
+                // Final text response — streaming already forwarded the deltas
+                let final_text = if text.is_empty() {
+                    response.text.unwrap_or_default()
+                } else {
+                    text
+                };
+
+                if let (Some(ref cache), Some(ref key)) = (&self.response_cache, &cache_key) {
+                    let token_count = response
+                        .usage
+                        .as_ref()
+                        .and_then(|u| u.output_tokens)
+                        .unwrap_or(0);
+                    #[allow(clippy::cast_possible_truncation)]
+                    let _ = cache.put(key, &effective_model, &final_text, token_count as u32);
+                }
+
+                self.history
+                    .push(ConversationMessage::Chat(ChatMessage::assistant(
+                        final_text.clone(),
+                    )));
+                self.trim_history();
+
+                return Ok(final_text);
+            }
+
+            // Tool-call iteration: emit events and loop
+            if !text.is_empty() {
+                self.history
+                    .push(ConversationMessage::Chat(ChatMessage::assistant(
+                        text.clone(),
+                    )));
+            }
+
+            self.history.push(ConversationMessage::AssistantToolCalls {
+                text: response.text.clone(),
+                tool_calls: response.tool_calls.clone(),
+                reasoning_content: response.reasoning_content.clone(),
+            });
+
             let mut results = Vec::with_capacity(calls.len());
             for call in &calls {
                 let _ = event_tx

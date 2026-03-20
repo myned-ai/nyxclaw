@@ -2,7 +2,7 @@
 ZeroClaw Agent Configuration
 
 Settings for the ZeroClaw agent with local STT/TTS support.
-ZeroClaw chat uses a WebSocket endpoint at `/ws/chat`.
+ZeroClaw chat uses a WebSocket endpoint at `/ws/avatar`.
 """
 
 from functools import lru_cache

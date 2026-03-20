@@ -50,10 +50,10 @@ nyxclaw connects to `ws://<host>:<port>/ws/avatar` instead of `/ws/chat`.
 
 | File | What changed |
 |------|-------------|
-| `src/providers/traits.rs` | Added `response_format: Option<&serde_json::Value>` to `ChatRequest`. Removed `Copy` derive. |
-| `src/providers/openai.rs` | Added `response_format` to `NativeChatRequest`, passed through in `chat()` to OpenAI API. |
-| `src/agent/agent.rs` | Added `response_format` field + setter. Added `turn_with_events()` for streaming events. |
-| `src/channels/nyxclaw.rs` | **NEW** — Avatar WebSocket channel (`/ws/avatar`). Structured JSON output, speech/content split. |
+| `src/providers/traits.rs` | Added `response_format` to `ChatRequest`, `StreamEvent` enum, `stream_chat()` trait method. |
+| `src/providers/openai.rs` | Added `response_format` + `stream` to `NativeChatRequest`, SSE streaming structs, `stream_chat()` impl. |
+| `src/agent/agent.rs` | Added `response_format` field + setter, `turn_with_events()`, `turn_with_streaming()` (streaming agent turn). |
+| `src/channels/nyxclaw.rs` | **NEW** — Avatar WebSocket channel with incremental JSON extraction: streams `speech_chunk` events as the LLM generates, not after. |
 
 ### Line injections (original files preserved)
 
@@ -62,6 +62,8 @@ nyxclaw connects to `ws://<host>:<port>/ws/avatar` instead of `/ws/chat`.
 | `src/agent/loop_.rs` | `response_format: None,` in `ChatRequest` construction (1 location) |
 | `src/providers/anthropic.rs` | `response_format: None,` in `ProviderChatRequest` construction (1 location) |
 | `src/providers/reliable.rs` | `response_format: None,` in `ChatRequest` constructions (6 locations) |
+| `src/providers/mod.rs` | `StreamEvent` added to re-export list |
+| `Cargo.toml` | `async-stream = "0.3"` dependency added |
 | `src/channels/mod.rs` | `pub mod nyxclaw;` after `pub mod notion;` |
 | `src/gateway/mod.rs` | `use crate::channels::nyxclaw;` import + `/ws/avatar` route + print line |
 
@@ -135,7 +137,7 @@ User asks to compare things:
 {"type": "tool_result", "name": "web_fetch", "output": "...", "success": true, "duration_ms": 1200}
 {"type": "speech_chunk", "content": "Here's the Wikipedia page for Rome, take a look."}
 {"type": "rich_content", "content": "**Rome - Wikipedia**\nhttps://en.wikipedia.org/wiki/Rome\n\n..."}
-{"type": "done", "full_response": "{\"speech\": \"...\", \"content\": \"...\"}"}
+{"type": "done", "full_response": "Here's the Wikipedia page for Rome, take a look."}
 {"type": "error", "message": "..."}
 ```
 

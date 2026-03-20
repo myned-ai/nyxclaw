@@ -1,18 +1,14 @@
 """Tests for rich content features in ChatSession and backends.
 
 Covers:
-- _handle_tool_call with link_card thumbnail injection
-- _handle_tool_call passthrough for non-link_card
-- _handle_tool_call with bad JSON in payload_json
+- _handle_tool_call with rich_content forwarding
+- _handle_tool_call ignoring non-rich_content tool calls
 - client_event handling (context directive, speak directive, unknown)
 - Filler skip logic in TTS worker
-- send_server_event / send_rich_content message shapes
 """
 
 import asyncio
-import json
 import sys
-import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -59,101 +55,52 @@ def _make_chat_session():
 
 class TestHandleToolCall:
     @pytest.mark.asyncio
-    @patch("chat.chat_session.get_link_thumbnail", new_callable=AsyncMock)
-    async def test_link_card_injects_thumbnail(self, mock_thumb):
-        mock_thumb.return_value = "https://cdn.example.com/thumb.jpg"
+    async def test_rich_content_forwarded_to_client(self):
+        """rich_content tool call sends rich_content message to client."""
         session = _make_chat_session()
 
-        payload = json.dumps({"url": "https://example.com/article", "title": "Test"})
-        arguments = {"content_type": "link_card", "payload_json": payload}
+        await session._handle_tool_call("rich_content", {"content": "## Hello\nSome markdown"})
 
-        await session._handle_tool_call("send_rich_content", arguments)
-
-        mock_thumb.assert_called_once_with("https://example.com/article")
-
-        # Verify thumbnail was injected into payload_json
-        sent_args = session.send_json.call_args[0][0]
-        result_payload = json.loads(sent_args["arguments"]["payload_json"])
-        assert result_payload["thumbnail"] == "https://cdn.example.com/thumb.jpg"
-        assert sent_args["type"] == "trigger_action"
-        assert sent_args["function_name"] == "send_rich_content"
-
-    @pytest.mark.asyncio
-    @patch("chat.chat_session.get_link_thumbnail", new_callable=AsyncMock)
-    async def test_link_card_skips_thumbnail_when_already_present(self, mock_thumb):
-        session = _make_chat_session()
-
-        payload = json.dumps({
-            "url": "https://example.com",
-            "thumbnail": "https://existing.com/img.jpg",
-        })
-        arguments = {"content_type": "link_card", "payload_json": payload}
-
-        await session._handle_tool_call("send_rich_content", arguments)
-
-        # Should not attempt to fetch thumbnail since one exists
-        mock_thumb.assert_not_called()
-
-    @pytest.mark.asyncio
-    @patch("chat.chat_session.get_link_thumbnail", new_callable=AsyncMock)
-    async def test_link_card_no_thumbnail_when_fetch_returns_none(self, mock_thumb):
-        mock_thumb.return_value = None
-        session = _make_chat_session()
-
-        payload = json.dumps({"url": "https://example.com"})
-        arguments = {"content_type": "link_card", "payload_json": payload}
-
-        await session._handle_tool_call("send_rich_content", arguments)
-
-        # payload_json should remain unchanged (no thumbnail key)
-        sent_args = session.send_json.call_args[0][0]
-        result_payload = json.loads(sent_args["arguments"]["payload_json"])
-        assert "thumbnail" not in result_payload
-
-    @pytest.mark.asyncio
-    async def test_non_link_card_passes_through_unmodified(self):
-        session = _make_chat_session()
-
-        arguments = {"content_type": "image", "payload_json": '{"src": "img.png"}'}
-
-        with patch("chat.chat_session.get_link_thumbnail", new_callable=AsyncMock) as mock_thumb:
-            await session._handle_tool_call("send_rich_content", arguments)
-            mock_thumb.assert_not_called()
-
-        sent_args = session.send_json.call_args[0][0]
-        assert sent_args["type"] == "trigger_action"
-        assert sent_args["arguments"] == arguments
-
-    @pytest.mark.asyncio
-    async def test_non_rich_content_tool_passes_through(self):
-        session = _make_chat_session()
-
-        arguments = {"query": "weather NYC"}
-
-        with patch("chat.chat_session.get_link_thumbnail", new_callable=AsyncMock) as mock_thumb:
-            await session._handle_tool_call("web_search", arguments)
-            mock_thumb.assert_not_called()
-
-        sent_args = session.send_json.call_args[0][0]
-        assert sent_args["type"] == "trigger_action"
-        assert sent_args["function_name"] == "web_search"
-
-    @pytest.mark.asyncio
-    @patch("chat.chat_session.get_link_thumbnail", new_callable=AsyncMock)
-    async def test_bad_json_in_payload_json_still_sends(self, mock_thumb):
-        """Malformed payload_json should not crash — still forwards the tool call."""
-        session = _make_chat_session()
-
-        arguments = {"content_type": "link_card", "payload_json": "not-json{{{"}
-
-        await session._handle_tool_call("send_rich_content", arguments)
-
-        # Should still send the trigger_action despite JSON parse error
         session.send_json.assert_called_once()
-        sent_args = session.send_json.call_args[0][0]
-        assert sent_args["type"] == "trigger_action"
-        # payload_json unchanged since parsing failed
-        assert sent_args["arguments"]["payload_json"] == "not-json{{{"
+        sent = session.send_json.call_args[0][0]
+        assert sent["type"] == "rich_content"
+        assert sent["content"] == "## Hello\nSome markdown"
+
+    @pytest.mark.asyncio
+    async def test_rich_content_empty_content_not_sent(self):
+        """rich_content with empty content string should not send anything."""
+        session = _make_chat_session()
+
+        await session._handle_tool_call("rich_content", {"content": ""})
+
+        session.send_json.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_rich_content_missing_content_key_not_sent(self):
+        """rich_content with no content key should not send anything."""
+        session = _make_chat_session()
+
+        await session._handle_tool_call("rich_content", {})
+
+        session.send_json.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_non_rich_content_tool_not_forwarded(self):
+        """Other tool calls are logged but not forwarded to client."""
+        session = _make_chat_session()
+
+        await session._handle_tool_call("web_search", {"query": "weather NYC"})
+
+        session.send_json.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_send_rich_content_tool_not_forwarded(self):
+        """Legacy send_rich_content tool name is no longer forwarded."""
+        session = _make_chat_session()
+
+        await session._handle_tool_call("send_rich_content", {"content_type": "link_card"})
+
+        session.send_json.assert_not_called()
 
 
 # ================================================================

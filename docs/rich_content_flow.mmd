@@ -1,0 +1,36 @@
+sequenceDiagram
+    participant App as Mobile App
+    participant Nyx as nyxclaw
+    participant ZC as ZeroClaw
+    participant LLM as OpenAI (gpt-4o)
+
+    App->>Nyx: audio (PCM16 @ 24kHz)
+    Nyx->>Nyx: VAD + STT → transcript
+    Nyx->>ZC: {"type":"message","content":"What is the Wikipedia page for Rome?"}
+    Note over Nyx,ZC: WebSocket /ws/avatar
+
+    ZC->>LLM: chat completion (response_format: {speech, content})
+
+    Note over ZC: Agent loop — LLM may call tools
+    ZC-->>Nyx: {"type":"tool_call","name":"shell","args":{...}}
+    ZC-->>Nyx: {"type":"tool_result","name":"shell","output":"..."}
+
+    Note over ZC: LLM returns final JSON
+    LLM->>ZC: {"speech":"Here's the page.","content":"**Rome**\nhttps://en.wikipedia.org/wiki/Rome"}
+
+    Note over ZC: Avatar channel parses JSON
+    ZC->>Nyx: {"type":"speech_chunk","content":"Here's the page."}
+    ZC->>Nyx: {"type":"rich_content","content":"**Rome**\nhttps://..."}
+    ZC->>Nyx: {"type":"done","full_response":"Here's the page."}
+
+    Note over Nyx: nyxclaw routes each event
+    Nyx->>Nyx: speech_chunk → TTS → wav2arkit
+    Nyx->>App: sync_frame (audio + blendshapes)
+    Nyx->>App: transcript_delta (speech text only)
+    Nyx->>App: rich_content (markdown content)
+    Nyx->>App: transcript_done
+
+    Note over App: App renders
+    App->>App: sync_frame → avatar lip-syncs
+    App->>App: transcript_delta → text bubble
+    App->>App: rich_content → chat view + card

@@ -323,12 +323,15 @@ AGENT_MODEL=openclaw:main
 
 ### ZeroClaw
 
+Requires the nyxclaw avatar channel patch applied to ZeroClaw. See `claw_patches/zeroclaw/README.md` for setup.
+
 ```dotenv
 AGENT_TYPE=zeroclaw
-BASE_URL=http://127.0.0.1:5555
+BASE_URL=http://127.0.0.1:42617
 AUTH_TOKEN=your-zeroclaw-token
-AGENT_MODEL=zeroclaw:main
 ```
+
+The patched ZeroClaw exposes `/ws/avatar` — a dedicated channel that returns structured `{speech, content}` JSON via `response_format`. nyxclaw connects to this endpoint automatically when `AGENT_TYPE=zeroclaw`.
 
 ### Custom Backends
 
@@ -397,13 +400,42 @@ Connect to `ws://localhost:8080/ws` (or `wss://` with TLS). When auth is enabled
 | `sync_frame` | Audio + 52 ARKit blendshapes (30 FPS) |
 | `audio_chunk` | Audio-only fallback (no blendshape model) |
 | `audio_end` | AI response turn finished |
-| `transcript_delta` | Streaming text fragment |
+| `transcript_delta` | Streaming text fragment (speech text only, no rich content) |
 | `transcript_done` | Complete turn transcript |
+| `rich_content` | Markdown content for the chat view (URLs, tables, etc.) — see [Rich Content](#rich-content) |
 | `interrupt` | User interrupted AI — includes `offsetMs` cutoff |
 | `avatar_state` | `"Listening"` or `"Responding"` |
 | `pong` | Heartbeat response |
 
-See the WebSocket protocol table above for message types and fields.
+### Rich Content
+
+When the LLM's response includes content better seen than heard (URLs, tables, structured data), the server splits the response:
+
+- **`speech`** → avatar speaks a short phrase ("Here's the Wikipedia page, take a look.") via TTS + blendshapes
+- **`content`** → forwarded as a `rich_content` message to the client as markdown
+
+```json
+{"type": "rich_content", "content": "**Rome - Wikipedia**\nhttps://en.wikipedia.org/wiki/Rome\n\nRome is the capital city of Italy."}
+```
+
+This is enforced by `response_format: json_schema` at the LLM API level — the LLM always returns `{speech, content}` JSON. ZeroClaw's `/ws/avatar` channel parses the JSON and sends separate `speech_chunk` + `rich_content` events. nyxclaw relays `rich_content` to the client without translation.
+
+When `content` is empty, no `rich_content` message is sent — the avatar just speaks normally.
+
+The client should:
+1. Detect URLs in content → render as link cards
+2. Detect markdown tables → render as table cards
+3. Switch from full avatar view → chat view when `rich_content` arrives
+
+See [docs/rich_content_flow.png](docs/rich_content_flow.png) for the full sequence diagram.
+
+### Claw Patches
+
+Backend-specific patches live in `claw_patches/`. Each patch adds a dedicated nyxclaw avatar channel with `response_format` support for structured `{speech, content}` output.
+
+| Patch | Backend | Description |
+|-------|---------|-------------|
+| `claw_patches/zeroclaw/` | ZeroClaw v0.5.0 | Adds `/ws/avatar` endpoint, `response_format` passthrough to OpenAI provider, structured response parsing. See [patch README](claw_patches/zeroclaw/README.md). |
 
 ## Docker
 

@@ -177,7 +177,8 @@ async fn handle_avatar_socket(socket: WebSocket, state: AppState, session_id: Op
     let mut agent = match crate::agent::Agent::from_config(&config) {
         Ok(a) => a,
         Err(e) => {
-            let err = serde_json::json!({"type": "error", "message": format!("Failed to initialise agent: {e}")});
+            tracing::error!("Failed to initialise agent for avatar session: {e:#}");
+            let err = serde_json::json!({"type": "error", "message": "Failed to initialise agent"});
             let _ = sender.send(Message::Text(err.to_string().into())).await;
             return;
         }
@@ -306,7 +307,284 @@ async fn handle_avatar_socket(socket: WebSocket, state: AppState, session_id: Op
     }
 }
 
+// ── Incremental JSON extractor for `{speech, content}` ────────────────
+//
+// Parses streaming JSON tokens to extract the `speech` field value as it
+// arrives, enabling sentence-split `speech_chunk` events mid-stream.
+// The `content` field is accumulated and emitted as `rich_content` at the end.
+//
+// State machine:
+//   PREFIX  → scanning for `"speech":"` or `"content":"`
+//   SPEECH  → inside the speech string value
+//   MIDDLE  → between speech and content fields
+//   CONTENT → inside the content string value
+//   DONE    → both fields extracted
+
+/// Tracks the JSON parsing depth to know when we're inside a string value
+/// that isn't one of our target fields. This prevents false matches on
+/// `"speech":"` appearing inside another field's value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExtractState {
+    /// Outside any string value — looking for a field key.
+    TopLevel,
+    /// Inside a JSON string that is a field key.
+    InKey,
+    /// Just saw `"speech":` — expecting the opening `"` of the value.
+    ExpectSpeechValue,
+    /// Just saw `"content":` — expecting the opening `"` of the value.
+    ExpectContentValue,
+    /// Just saw an unknown key — expecting the opening `"` of its value to skip.
+    ExpectOtherValue,
+    /// Inside the `speech` string value — characters go to TTS.
+    InSpeech,
+    /// Inside the `content` string value.
+    InContent,
+    /// Inside some other string value (skip until closing `"`).
+    InOtherValue,
+    /// Both fields extracted.
+    Done,
+}
+
+struct AvatarJsonExtractor {
+    state: ExtractState,
+    /// Accumulated speech text (unescaped).
+    speech: String,
+    /// Accumulated content text (unescaped).
+    content: String,
+    /// Buffer for the current field being read.
+    value_buf: String,
+    /// Current key name being accumulated.
+    key_buf: String,
+    /// Whether the previous character was a backslash (JSON escape).
+    escaped: bool,
+    /// Track which fields we've completed.
+    found_speech: bool,
+    found_content: bool,
+}
+
+impl AvatarJsonExtractor {
+    fn new() -> Self {
+        Self {
+            state: ExtractState::TopLevel,
+            speech: String::new(),
+            content: String::new(),
+            value_buf: String::new(),
+            key_buf: String::new(),
+            escaped: false,
+            found_speech: false,
+            found_content: false,
+        }
+    }
+
+    /// Feed new characters from the stream. Returns any new speech text
+    /// that should be fed to the sentence splitter.
+    fn feed(&mut self, text: &str) -> Option<String> {
+        let mut new_speech = String::new();
+
+        for ch in text.chars() {
+            match self.state {
+                ExtractState::TopLevel => {
+                    if ch == '"' {
+                        self.key_buf.clear();
+                        self.escaped = false;
+                        self.state = ExtractState::InKey;
+                    }
+                    // Ignore other chars (braces, commas, colons, whitespace)
+                }
+                ExtractState::InKey => {
+                    if self.escaped {
+                        self.key_buf.push(ch);
+                        self.escaped = false;
+                    } else if ch == '\\' {
+                        self.escaped = true;
+                    } else if ch == '"' {
+                        // Key complete — check what field this is
+                        if !self.found_speech && self.key_buf == "speech" {
+                            self.state = ExtractState::ExpectSpeechValue;
+                        } else if !self.found_content && self.key_buf == "content" {
+                            self.state = ExtractState::ExpectContentValue;
+                        } else {
+                            // Unknown key — skip its string value if present.
+                            self.state = ExtractState::ExpectOtherValue;
+                        }
+                    } else {
+                        self.key_buf.push(ch);
+                    }
+                }
+                ExtractState::ExpectSpeechValue => {
+                    // Wait for the opening `"` of the string value (skip `:` and whitespace)
+                    if ch == '"' {
+                        self.value_buf.clear();
+                        self.escaped = false;
+                        self.state = ExtractState::InSpeech;
+                    }
+                }
+                ExtractState::ExpectContentValue => {
+                    if ch == '"' {
+                        self.value_buf.clear();
+                        self.escaped = false;
+                        self.state = ExtractState::InContent;
+                    }
+                }
+                ExtractState::ExpectOtherValue => {
+                    // Wait for the opening `"` of the value (skip `:` and whitespace)
+                    if ch == '"' {
+                        self.escaped = false;
+                        self.state = ExtractState::InOtherValue;
+                    }
+                }
+                ExtractState::InSpeech => {
+                    if self.escaped {
+                        let unescaped = match ch {
+                            'n' => '\n',
+                            't' => '\t',
+                            'r' => '\r',
+                            '"' => '"',
+                            '\\' => '\\',
+                            '/' => '/',
+                            // For \uXXXX, just pass through the 'u' — imperfect but
+                            // rare in speech text and won't break sentence splitting.
+                            _ => ch,
+                        };
+                        new_speech.push(unescaped);
+                        self.value_buf.push(unescaped);
+                        self.escaped = false;
+                    } else if ch == '\\' {
+                        self.escaped = true;
+                    } else if ch == '"' {
+                        // End of speech value
+                        self.speech = std::mem::take(&mut self.value_buf);
+                        self.found_speech = true;
+                        self.state = if self.found_content {
+                            ExtractState::Done
+                        } else {
+                            ExtractState::TopLevel
+                        };
+                    } else {
+                        new_speech.push(ch);
+                        self.value_buf.push(ch);
+                    }
+                }
+                ExtractState::InContent => {
+                    if self.escaped {
+                        let unescaped = match ch {
+                            'n' => '\n',
+                            't' => '\t',
+                            'r' => '\r',
+                            '"' => '"',
+                            '\\' => '\\',
+                            '/' => '/',
+                            _ => ch,
+                        };
+                        self.value_buf.push(unescaped);
+                        self.escaped = false;
+                    } else if ch == '\\' {
+                        self.escaped = true;
+                    } else if ch == '"' {
+                        self.content = std::mem::take(&mut self.value_buf);
+                        self.found_content = true;
+                        self.state = if self.found_speech {
+                            ExtractState::Done
+                        } else {
+                            ExtractState::TopLevel
+                        };
+                    } else {
+                        self.value_buf.push(ch);
+                    }
+                }
+                ExtractState::InOtherValue => {
+                    // Skip non-target string values
+                    if self.escaped {
+                        self.escaped = false;
+                    } else if ch == '\\' {
+                        self.escaped = true;
+                    } else if ch == '"' {
+                        self.state = ExtractState::TopLevel;
+                    }
+                }
+                ExtractState::Done => {}
+            }
+        }
+
+        if new_speech.is_empty() {
+            None
+        } else {
+            Some(new_speech)
+        }
+    }
+
+    /// Finalize: if the stream ended mid-field, capture remaining value.
+    fn finalize(&mut self) {
+        match self.state {
+            ExtractState::InSpeech => {
+                self.speech = std::mem::take(&mut self.value_buf);
+                self.found_speech = true;
+            }
+            ExtractState::InContent => {
+                self.content = std::mem::take(&mut self.value_buf);
+                self.found_content = true;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Route a single streaming event from the agent turn to the WebSocket client.
+///
+/// Handles `tool_call`/`tool_result` (forwarded), `content_delta` (fed into
+/// the JSON extractor → sentence splitter → `speech_chunk`), and `content_done`
+/// (flushes the sentence buffer).
+async fn dispatch_stream_event(
+    event: &serde_json::Value,
+    extractor: &mut AvatarJsonExtractor,
+    sentence_buf: &mut String,
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+) {
+    let Some(obj) = event.as_object() else { return };
+    let Some(t) = obj.get("type").and_then(|v| v.as_str()) else { return };
+
+    match t {
+        "tool_call" | "tool_result" => {
+            let _ = sender.send(Message::Text(event.to_string().into())).await;
+        }
+        "content_delta" => {
+            if let Some(delta) = obj.get("content").and_then(|v| v.as_str()) {
+                if let Some(new_speech) = extractor.feed(delta) {
+                    sentence_buf.push_str(&new_speech);
+                    let sentences = extract_complete_sentences(sentence_buf);
+                    for sentence in sentences {
+                        if !sentence.is_empty() {
+                            let chunk = serde_json::json!({
+                                "type": "speech_chunk",
+                                "content": sentence,
+                            });
+                            let _ = sender.send(Message::Text(chunk.to_string().into())).await;
+                        }
+                    }
+                }
+            }
+        }
+        "content_done" => {
+            extractor.finalize();
+            let remaining = sentence_buf.trim().to_string();
+            if !remaining.is_empty() {
+                let chunk = serde_json::json!({
+                    "type": "speech_chunk",
+                    "content": remaining,
+                });
+                let _ = sender.send(Message::Text(chunk.to_string().into())).await;
+            }
+            sentence_buf.clear();
+        }
+        _ => {}
+    }
+}
+
 /// Process a single avatar message through the agent, streaming events back.
+///
+/// Uses `turn_with_streaming` to receive content deltas incrementally, then
+/// runs them through `AvatarJsonExtractor` to split speech from rich content
+/// in real time.
 async fn process_avatar_message(
     state: &AppState,
     agent: &mut crate::agent::Agent,
@@ -329,17 +607,18 @@ async fn process_avatar_message(
         "channel": "avatar",
     }));
 
-    // Create event channel for turn_with_events
+    // Create event channel for streaming turn
     let (event_tx, mut event_rx) = mpsc::channel::<serde_json::Value>(64);
 
-    // Run turn_with_events and event forwarding concurrently via select loop.
-    // We can't move sender into a spawned task (it's borrowed), so we drive
-    // both the agent turn and the event channel in the same task.
-    let turn_handle = {
-        let mut final_response: Option<Result<String, anyhow::Error>> = None;
+    // Incremental JSON extractor and sentence buffer
+    let mut extractor = AvatarJsonExtractor::new();
+    let mut sentence_buf = String::new();
 
-        // Use tokio::select to concurrently drive both the turn and event forwarding
-        let turn_fut = agent.turn_with_events(content, event_tx);
+    // Run turn_with_streaming and event forwarding concurrently via select loop.
+    let turn_handle = {
+        let final_response: Option<Result<String, anyhow::Error>>;
+
+        let turn_fut = agent.turn_with_streaming(content, event_tx);
         tokio::pin!(turn_fut);
 
         loop {
@@ -349,35 +628,59 @@ async fn process_avatar_message(
                     break;
                 }
                 Some(event) = event_rx.recv() => {
-                    let _ = sender.send(Message::Text(event.to_string().into())).await;
+                    dispatch_stream_event(
+                        &event, &mut extractor, &mut sentence_buf, sender,
+                    ).await;
                 }
             }
         }
 
-        // Drain any remaining events
+        // Drain remaining events
         while let Ok(event) = event_rx.try_recv() {
-            let _ = sender.send(Message::Text(event.to_string().into())).await;
+            dispatch_stream_event(
+                &event, &mut extractor, &mut sentence_buf, sender,
+            ).await;
         }
 
-        final_response.unwrap()
+        match final_response {
+            Some(r) => r,
+            None => Err(anyhow::anyhow!("Agent turn did not produce a response")),
+        }
     };
 
     match turn_handle {
         Ok(response) => {
-            // Persist assistant response
+            // Persist assistant response (raw JSON for history)
             if let Some(ref backend) = state.session_backend {
                 let assistant_msg = crate::providers::ChatMessage::assistant(&response);
                 let _ = backend.append(session_key, &assistant_msg);
             }
 
-            // Try to parse as structured avatar JSON {speech, content}
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&response) {
-                let speech = parsed["speech"].as_str().unwrap_or("");
-                let rich_content = parsed["content"].as_str().unwrap_or("");
+            // Finalize extractor (in case it wasn't finalized during drain)
+            extractor.finalize();
 
-                // Send speech as sentence-split chunks
-                if !speech.is_empty() {
-                    for sentence in split_sentences(speech) {
+            // Fallback: if the streaming extractor didn't find the fields
+            // (e.g., provider fell back to non-streaming), parse the full response.
+            if !extractor.found_speech && !extractor.found_content {
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&response) {
+                    let speech = parsed["speech"].as_str().unwrap_or("");
+                    let rich = parsed["content"].as_str().unwrap_or("");
+                    if !speech.is_empty() {
+                        for sentence in split_sentences(speech) {
+                            if !sentence.is_empty() {
+                                let chunk = serde_json::json!({
+                                    "type": "speech_chunk",
+                                    "content": sentence,
+                                });
+                                let _ = sender.send(Message::Text(chunk.to_string().into())).await;
+                            }
+                        }
+                    }
+                    extractor.speech = speech.to_string();
+                    extractor.content = rich.to_string();
+                } else {
+                    // Not JSON at all — raw text fallback
+                    for sentence in split_sentences(&response) {
                         if !sentence.is_empty() {
                             let chunk = serde_json::json!({
                                 "type": "speech_chunk",
@@ -386,32 +689,28 @@ async fn process_avatar_message(
                             let _ = sender.send(Message::Text(chunk.to_string().into())).await;
                         }
                     }
-                }
-
-                // Send rich content if non-empty
-                if !rich_content.is_empty() {
-                    let rc = serde_json::json!({
-                        "type": "rich_content",
-                        "content": rich_content,
-                    });
-                    let _ = sender.send(Message::Text(rc.to_string().into())).await;
-                }
-            } else {
-                // Fallback: LLM didn't follow JSON format, send raw text as speech
-                for sentence in split_sentences(&response) {
-                    if !sentence.is_empty() {
-                        let chunk = serde_json::json!({
-                            "type": "speech_chunk",
-                            "content": sentence,
-                        });
-                        let _ = sender.send(Message::Text(chunk.to_string().into())).await;
-                    }
+                    extractor.speech = response.clone();
                 }
             }
 
+            // Send rich content if non-empty
+            if !extractor.content.is_empty() {
+                let rc = serde_json::json!({
+                    "type": "rich_content",
+                    "content": extractor.content,
+                });
+                let _ = sender.send(Message::Text(rc.to_string().into())).await;
+            }
+
+            // Send done with speech text only
+            let speech_text = if extractor.speech.is_empty() {
+                response.clone()
+            } else {
+                extractor.speech.clone()
+            };
             let done = serde_json::json!({
                 "type": "done",
-                "full_response": response,
+                "full_response": speech_text,
             });
             let _ = sender.send(Message::Text(done.to_string().into())).await;
 
@@ -439,6 +738,32 @@ async fn process_avatar_message(
             }));
         }
     }
+}
+
+/// Extract complete sentences from a buffer, leaving the remainder.
+/// Splits at `.`, `!`, `?` followed by a space or end of string.
+fn extract_complete_sentences(buf: &mut String) -> Vec<String> {
+    let mut sentences = Vec::new();
+    let mut last_split = 0;
+
+    let chars: Vec<char> = buf.chars().collect();
+    for (i, &ch) in chars.iter().enumerate() {
+        if (ch == '.' || ch == '!' || ch == '?')
+            && (i + 1 >= chars.len() || chars[i + 1] == ' ' || chars[i + 1] == '\n')
+        {
+            let sentence: String = chars[last_split..=i].iter().collect();
+            let trimmed = sentence.trim().to_string();
+            if !trimmed.is_empty() {
+                sentences.push(trimmed);
+            }
+            last_split = i + 1;
+        }
+    }
+
+    // Keep the remainder in the buffer
+    *buf = chars[last_split..].iter().collect();
+
+    sentences
 }
 
 /// Split text into sentences at `.`, `!`, `?` boundaries, keeping the

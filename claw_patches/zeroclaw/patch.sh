@@ -149,9 +149,38 @@ fi
 
 echo ""
 
-# ── Step 3: Register channel module + route ────────────────
+# ── Step 3: Inject StreamEvent re-export into providers/mod.rs ─
+echo "Step 3: Adding StreamEvent re-export to providers/mod.rs..."
+echo ""
+PROVIDERS_MOD="${ZEROCLAW_DIR}/src/providers/mod.rs"
+if [ -f "${PROVIDERS_MOD}" ] && ! grep -q "StreamEvent" "${PROVIDERS_MOD}"; then
+    backup_file "src/providers/mod.rs"
+    sed -i.bak 's/ToolCall, ToolResultMessage,/StreamEvent, ToolCall, ToolResultMessage,/' "${PROVIDERS_MOD}"
+    rm -f "${PROVIDERS_MOD}.bak"
+    echo "  INJECT src/providers/mod.rs (added StreamEvent)"
+else
+    echo "  SKIP  src/providers/mod.rs (StreamEvent already present)"
+fi
+echo ""
 
-echo "Step 3: Registering nyxclaw channel..."
+# ── Step 4: Add async_stream dependency (for streaming SSE) ─
+echo "Step 4: Adding async_stream dependency..."
+echo ""
+CARGO_TOML="${ZEROCLAW_DIR}/Cargo.toml"
+if [ -f "${CARGO_TOML}" ] && ! grep -q "async-stream" "${CARGO_TOML}"; then
+    backup_file "Cargo.toml"
+    sed -i.bak '/^\[dependencies\]/a\
+async-stream = "0.3"' "${CARGO_TOML}"
+    rm -f "${CARGO_TOML}.bak"
+    echo "  INJECT Cargo.toml (added async-stream)"
+else
+    echo "  SKIP  Cargo.toml (async-stream already present)"
+fi
+echo ""
+
+# ── Step 5: Register channel module + route ────────────────
+
+echo "Step 5: Registering nyxclaw channel..."
 echo ""
 
 # channels/mod.rs — add module declaration

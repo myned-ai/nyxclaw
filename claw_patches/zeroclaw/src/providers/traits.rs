@@ -131,6 +131,28 @@ pub struct StreamChunk {
     pub token_count: usize,
 }
 
+/// An event from a streaming chat response that can carry both text content
+/// and tool call deltas, enabling the agent loop to stream text while still
+/// detecting tool calls.
+#[derive(Debug, Clone)]
+pub enum StreamEvent {
+    /// Incremental text content from the LLM response.
+    ContentDelta(String),
+    /// Incremental tool call data. `index` disambiguates parallel tool calls.
+    /// `id` and `name` arrive on the first delta for a given index; subsequent
+    /// deltas carry only `arguments_delta`.
+    ToolCallDelta {
+        index: usize,
+        id: Option<String>,
+        name: Option<String>,
+        arguments_delta: Option<String>,
+    },
+    /// Stream finished. Carries the aggregated `ChatResponse` (text, tool_calls,
+    /// usage) so the agent loop has everything it needs for history and tool
+    /// dispatch without re-parsing.
+    Done(ChatResponse),
+}
+
 impl StreamChunk {
     /// Create a new non-final chunk.
     pub fn delta(text: impl Into<String>) -> Self {
@@ -418,6 +440,28 @@ pub trait Provider: Send + Sync {
             usage: None,
             reasoning_content: None,
         })
+    }
+
+    /// Streaming chat with full `ChatRequest` (tools + response_format).
+    /// Returns a stream of `StreamEvent`s: content deltas, tool call deltas,
+    /// and a final `Done` carrying the aggregated `ChatResponse`.
+    ///
+    /// Default implementation falls back to non-streaming `chat()` and emits
+    /// the full response as a single `ContentDelta` + `Done`.
+    fn stream_chat(
+        &self,
+        _request: ChatRequest<'_>,
+        _model: &str,
+        _temperature: f64,
+    ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+        // Default: not supported — agent falls back to non-streaming path
+        let err = StreamEvent::Done(ChatResponse {
+            text: None,
+            tool_calls: Vec::new(),
+            usage: None,
+            reasoning_content: None,
+        });
+        stream::once(async move { Ok(err) }).boxed()
     }
 
     /// Whether provider supports streaming responses.

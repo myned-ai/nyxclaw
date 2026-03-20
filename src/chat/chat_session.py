@@ -1,7 +1,6 @@
 import asyncio
 import base64
 import concurrent.futures
-import json
 import time
 from pathlib import Path
 from typing import Any
@@ -12,7 +11,6 @@ from fastapi import WebSocket
 from core.logger import get_logger
 from core.settings import Settings
 from services import Wav2ArkitService, create_agent_instance
-from utils.thumbnail import get_link_thumbnail
 
 logger = get_logger(__name__)
 
@@ -224,30 +222,8 @@ class ChatSession:
                 )
             return
 
-        # Legacy: send_rich_content tool call (tool-based approach)
-        logger.info(f"Session {self.session_id}: Forwarding tool call '{name}' to client")
-        if name == "send_rich_content" and arguments.get("content_type") == "link_card":
-            payload_json = arguments.get("payload_json", "{}")
-            try:
-                payload = json.loads(payload_json)
-                url = payload.get("url")
-                if url and "thumbnail" not in payload:
-                    thumb_url = await get_link_thumbnail(url)
-                    if thumb_url:
-                        payload["thumbnail"] = thumb_url
-                        arguments["payload_json"] = json.dumps(payload)
-                        logger.info(f"Session {self.session_id}: Auto-injected thumbnail for link_card")
-            except Exception as e:
-                logger.warning(f"Session {self.session_id}: Error processing link_card payload: {e}")
-
-        await self.send_json(
-            {
-                "type": "trigger_action",
-                "function_name": name,
-                "arguments": arguments,
-                "timestamp": int(time.time() * 1000),
-            }
-        )
+        # Other tool calls — log but don't forward to client
+        logger.info(f"Session {self.session_id}: Tool call '{name}' (not forwarded)")
 
     async def _drain_queue(self, queue: asyncio.Queue) -> None:
         """Helper to flush an asyncio queue."""

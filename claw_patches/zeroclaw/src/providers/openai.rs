@@ -1,9 +1,10 @@
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, TokenUsage, ToolCall as ProviderToolCall,
+    Provider, StreamEvent, StreamError, StreamResult, TokenUsage, ToolCall as ProviderToolCall,
 };
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
+use futures_util::{stream, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
@@ -64,6 +65,8 @@ struct NativeChatRequest {
     tool_choice: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_format: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    stream: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -161,6 +164,49 @@ struct NativeResponseMessage {
     reasoning_content: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<NativeToolCall>>,
+}
+
+// ── SSE streaming response structs ────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct SseChunk {
+    choices: Vec<SseChoice>,
+    #[serde(default)]
+    usage: Option<UsageInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SseChoice {
+    delta: SseDelta,
+    #[serde(default)]
+    finish_reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SseDelta {
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<SseToolCallDelta>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SseToolCallDelta {
+    index: usize,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    function: Option<SseFunctionDelta>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SseFunctionDelta {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
 }
 
 impl NativeResponseMessage {
@@ -414,6 +460,7 @@ impl Provider for OpenAiProvider {
             tool_choice: tools.as_ref().map(|_| "auto".to_string()),
             tools,
             response_format: request.response_format.cloned(),
+            stream: false,
         };
 
         let response = self
@@ -481,6 +528,7 @@ impl Provider for OpenAiProvider {
             tool_choice: native_tools.as_ref().map(|_| "auto".to_string()),
             tools: native_tools,
             response_format: None,
+            stream: false,
         };
 
         let response = self
@@ -510,6 +558,229 @@ impl Provider for OpenAiProvider {
         let mut result = Self::parse_native_response(message);
         result.usage = usage;
         Ok(result)
+    }
+
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+
+    fn stream_chat(
+        &self,
+        request: ProviderChatRequest<'_>,
+        model: &str,
+        temperature: f64,
+    ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+        let credential = match self.credential.clone() {
+            Some(c) => c,
+            None => {
+                return stream::once(async {
+                    Err(StreamError::Provider(
+                        "OpenAI API key not set".to_string(),
+                    ))
+                })
+                .boxed();
+            }
+        };
+
+        let adjusted_temperature = Self::adjust_temperature_for_model(model, temperature);
+        let tools = Self::convert_tools(request.tools);
+        let native_request = NativeChatRequest {
+            model: model.to_string(),
+            messages: Self::convert_messages(request.messages),
+            temperature: adjusted_temperature,
+            tool_choice: tools.as_ref().map(|_| "auto".to_string()),
+            tools,
+            response_format: request.response_format.cloned(),
+            stream: true,
+        };
+
+        let url = format!("{}/chat/completions", self.base_url);
+        let client = self.http_client();
+
+        // Spawn the SSE stream processing as an async_stream.
+        let s = async_stream::try_stream! {
+            let response = client
+                .post(&url)
+                .header("Authorization", format!("Bearer {credential}"))
+                .json(&native_request)
+                .send()
+                .await
+                .map_err(StreamError::Http)?;
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| "unknown error".to_string());
+                Err(StreamError::Provider(format!(
+                    "OpenAI {status}: {body}"
+                )))?;
+                return;
+            }
+
+            // Accumulators for building the final ChatResponse
+            let mut full_content = String::new();
+            let mut reasoning_content = String::new();
+            // tool_calls: indexed by position, accumulating (id, name, arguments)
+            let mut tool_calls: Vec<(String, String, String)> = Vec::new();
+            let mut usage_info: Option<UsageInfo> = None;
+
+            // Read SSE lines from the response body
+            let mut bytes_stream = response.bytes_stream();
+            let mut line_buf = String::new();
+
+            while let Some(bytes_result) = bytes_stream.next().await {
+                let bytes = bytes_result.map_err(StreamError::Http)?;
+                let text = String::from_utf8_lossy(&bytes);
+
+                // SSE can deliver multiple lines per chunk
+                line_buf.push_str(&text);
+
+                while let Some(newline_pos) = line_buf.find('\n') {
+                    let line = line_buf[..newline_pos].trim_end_matches('\r').to_string();
+                    line_buf = line_buf[newline_pos + 1..].to_string();
+
+                    if line.is_empty() {
+                        continue;
+                    }
+
+                    let data = match line.strip_prefix("data: ") {
+                        Some(d) => d,
+                        None => continue,
+                    };
+
+                    if data == "[DONE]" {
+                        // Build final ChatResponse and emit Done
+                        let parsed_tool_calls = tool_calls
+                            .into_iter()
+                            .map(|(id, name, args)| ProviderToolCall {
+                                id,
+                                name,
+                                arguments: args,
+                            })
+                            .collect::<Vec<_>>();
+
+                        let usage = usage_info.map(|u| TokenUsage {
+                            input_tokens: u.prompt_tokens,
+                            output_tokens: u.completion_tokens,
+                            cached_input_tokens: u
+                                .prompt_tokens_details
+                                .and_then(|d| d.cached_tokens),
+                        });
+
+                        let text_out = if full_content.is_empty() {
+                            None
+                        } else {
+                            Some(full_content.clone())
+                        };
+                        let reasoning = if reasoning_content.is_empty() {
+                            None
+                        } else {
+                            Some(reasoning_content.clone())
+                        };
+
+                        yield StreamEvent::Done(ProviderChatResponse {
+                            text: text_out,
+                            tool_calls: parsed_tool_calls,
+                            usage,
+                            reasoning_content: reasoning,
+                        });
+                        return;
+                    }
+
+                    let chunk: SseChunk = match serde_json::from_str(data) {
+                        Ok(c) => c,
+                        Err(_) => continue,
+                    };
+
+                    // Capture usage if present (OpenAI sends it on the final chunk
+                    // when stream_options.include_usage is set, but also on [DONE]-adjacent chunks)
+                    if let Some(u) = chunk.usage {
+                        usage_info = Some(u);
+                    }
+
+                    let Some(choice) = chunk.choices.into_iter().next() else {
+                        continue;
+                    };
+
+                    // Content deltas
+                    if let Some(content) = choice.delta.content {
+                        if !content.is_empty() {
+                            full_content.push_str(&content);
+                            yield StreamEvent::ContentDelta(content);
+                        }
+                    }
+
+                    // Reasoning content (thinking models)
+                    if let Some(rc) = choice.delta.reasoning_content {
+                        if !rc.is_empty() {
+                            reasoning_content.push_str(&rc);
+                        }
+                    }
+
+                    // Tool call deltas
+                    if let Some(tc_deltas) = choice.delta.tool_calls {
+                        for tc in tc_deltas {
+                            let idx = tc.index;
+                            if idx > 64 {
+                                // Reject absurd indices to prevent OOM
+                                continue;
+                            }
+                            // Grow accumulator vec if needed
+                            while tool_calls.len() <= idx {
+                                tool_calls.push((String::new(), String::new(), String::new()));
+                            }
+                            if let Some(id) = &tc.id {
+                                tool_calls[idx].0 = id.clone();
+                            }
+                            let fn_name = tc.function.as_ref().and_then(|f| f.name.clone());
+                            let fn_args = tc.function.as_ref().and_then(|f| f.arguments.clone());
+
+                            if let Some(ref name) = fn_name {
+                                tool_calls[idx].1 = name.clone();
+                            }
+                            if let Some(ref args) = fn_args {
+                                tool_calls[idx].2.push_str(args);
+                            }
+
+                            yield StreamEvent::ToolCallDelta {
+                                index: idx,
+                                id: tc.id,
+                                name: fn_name,
+                                arguments_delta: fn_args,
+                            };
+                        }
+                    }
+                }
+            }
+
+            // If we get here without [DONE], emit Done with what we have
+            let parsed_tool_calls = tool_calls
+                .into_iter()
+                .map(|(id, name, args)| ProviderToolCall {
+                    id,
+                    name,
+                    arguments: args,
+                })
+                .collect::<Vec<_>>();
+
+            let text_out = if full_content.is_empty() { None } else { Some(full_content) };
+            let reasoning = if reasoning_content.is_empty() { None } else { Some(reasoning_content) };
+
+            yield StreamEvent::Done(ProviderChatResponse {
+                text: text_out,
+                tool_calls: parsed_tool_calls,
+                usage: usage_info.map(|u| TokenUsage {
+                    input_tokens: u.prompt_tokens,
+                    output_tokens: u.completion_tokens,
+                    cached_input_tokens: u.prompt_tokens_details.and_then(|d| d.cached_tokens),
+                }),
+                reasoning_content: reasoning,
+            });
+        };
+
+        Box::pin(s)
     }
 
     async fn warmup(&self) -> anyhow::Result<()> {
