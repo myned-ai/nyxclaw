@@ -147,6 +147,62 @@ if [ -f "${FILE}" ] && ! grep -q "response_format" "${FILE}"; then
     echo "  INJECT src/providers/reliable.rs (6 locations)"
 fi
 
+# reliable.rs — add stream_chat delegation (so ReliableProvider delegates
+# stream_chat to the inner provider instead of returning empty default)
+FILE="${ZEROCLAW_DIR}/src/providers/reliable.rs"
+if [ -f "${FILE}" ] && ! grep -q "fn stream_chat(" "${FILE}"; then
+    # First ensure StreamEvent is imported
+    if ! grep -q "StreamEvent" "${FILE}"; then
+        sed -i.bak 's/ChatResponse, StreamChunk,/ChatResponse, StreamChunk, StreamEvent,/' "${FILE}"
+        rm -f "${FILE}.bak"
+    fi
+    python3 -c "
+import re, sys
+with open(sys.argv[1], 'r') as f:
+    content = f.read()
+
+injection = '''
+    fn stream_chat(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: f64,
+    ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+        // Delegate to the first provider that supports streaming
+        for (_name, provider) in &self.providers {
+            if provider.supports_streaming() {
+                let current_model = match self.model_chain(model).first() {
+                    Some(m) => m.to_string(),
+                    None => model.to_string(),
+                };
+                return provider.stream_chat(request, &current_model, temperature);
+            }
+        }
+        // Fallback: default empty Done
+        stream::once(async {
+            Ok(StreamEvent::Done(ChatResponse {
+                text: None,
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            }))
+        }).boxed()
+    }
+
+'''
+
+# Insert before fn stream_chat_with_system
+content = content.replace(
+    '    fn stream_chat_with_system(',
+    injection + '    fn stream_chat_with_system(',
+    1,
+)
+with open(sys.argv[1], 'w') as f:
+    f.write(content)
+" "${FILE}"
+    echo "  INJECT src/providers/reliable.rs (stream_chat delegation)"
+fi
+
 echo ""
 
 # ── Step 3: Inject StreamEvent re-export into providers/mod.rs ─

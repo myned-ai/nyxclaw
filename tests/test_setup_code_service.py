@@ -12,6 +12,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+pytest.importorskip("segno")
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from auth.setup_code_service import (  # noqa: E402

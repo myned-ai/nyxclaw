@@ -14,10 +14,13 @@ import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
 # Add project src to path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 
+@pytest.mark.asyncio
 async def test_cancel_sync_callback_fires():
     """cancel_response() must call _on_cancel_sync synchronously."""
     from backend.zeroclaw.backend import ZeroClawBackend as ZeroClawAgent
@@ -42,6 +45,7 @@ async def test_cancel_sync_callback_fires():
     print("  PASS: cancel_response() fires on_cancel_sync")
 
 
+@pytest.mark.asyncio
 async def test_cancel_playback_aborts_response_end():
     """_handle_response_end must exit immediately when _cancel_playback is set."""
     from chat.chat_session import ChatSession
@@ -83,6 +87,7 @@ async def test_cancel_playback_aborts_response_end():
     print(f"  PASS: _handle_response_end aborted in {elapsed_ms:.1f}ms with _cancel_playback=True")
 
 
+@pytest.mark.asyncio
 async def test_cancel_playback_reset_on_response_start():
     """_cancel_playback must reset to False on new response start."""
     from chat.chat_session import ChatSession
@@ -128,6 +133,7 @@ async def test_cancel_playback_reset_on_response_start():
     print("  PASS: _cancel_playback resets on new response start")
 
 
+@pytest.mark.asyncio
 async def test_is_responding_stays_true_during_response_end():
     """is_responding must stay True while _on_response_end waits for audio drain."""
     from backend.zeroclaw.backend import ZeroClawBackend as ZeroClawAgent
@@ -169,6 +175,7 @@ async def test_is_responding_stays_true_during_response_end():
     print("  PASS: is_responding stays True during _on_response_end callback")
 
 
+@pytest.mark.asyncio
 async def test_bargein_during_playback_calls_interrupted():
     """When barge-in fires during _on_response_end, _on_interrupted must be called."""
     from backend.zeroclaw.backend import ZeroClawBackend as ZeroClawAgent
@@ -221,6 +228,7 @@ async def test_bargein_during_playback_calls_interrupted():
     print("  PASS: barge-in during playback triggers _on_interrupted callback")
 
 
+@pytest.mark.asyncio
 async def test_response_end_loop_exits_on_cancel():
     """The audio stabilization loop must check _cancel_playback on every tick."""
     from chat.chat_session import ChatSession
