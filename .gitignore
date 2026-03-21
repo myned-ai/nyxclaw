@@ -6,6 +6,13 @@
 .env
 .env.local
 .env.production
+
+# Runtime data (auth tokens, device records)
+data/
+
+# Local dev scripts and tests
+scripts/
+tests/
 *.eval
 
 # Scripts

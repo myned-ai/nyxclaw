@@ -2,6 +2,26 @@
 
 **Voice-to-avatar server for Claw-based AI agents**
 
+<table align="center">
+  <tr>
+    <td align="center">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="docs/assets/openclaw-logo-text-dark.svg" width="180">
+        <source media="(prefers-color-scheme: light)" srcset="docs/assets/openclaw-logo-text.svg" width="180">
+        <img src="docs/assets/openclaw-logo-text.svg" alt="OpenClaw" width="180">
+      </picture>
+    </td>
+    <td align="center">
+      <img src="docs/assets/nyx.png" alt="Nyx" width="100">
+    </td>
+    <td align="center">
+      <img src="docs/assets/zeroclaw.png" alt="ZeroClaw" width="180">
+    </td>
+  </tr>
+  <tr>
+    <td colspan="3" align="center"><em>...more claws coming soon!</em></td>
+  </tr>
+</table>
 
 ## What It Does
 
