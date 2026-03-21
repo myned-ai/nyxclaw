@@ -50,6 +50,10 @@ class OpenAIRealtimeSettings(BaseSettings):
     agent_id: str | None = None
     max_retries: int = 2
 
+    # ── Avatar endpoint (patched OpenClaw only) ────────────────
+    avatar_endpoint: str = "/v1/chat/completions/avatar"
+    use_avatar_endpoint: bool = False
+
     # ── Sentence / Transcript ──────────────────────────────────────
     tts_sentence_max_chars: int = 200
     transcript_speed: float = 20.0  # chars/sec

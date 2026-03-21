@@ -44,6 +44,33 @@ cargo run -- gateway
 
 nyxclaw connects to `ws://<host>:<port>/ws/avatar` instead of `/ws/chat`.
 
+## Authentication
+
+ZeroClaw uses bearer tokens for WebSocket auth. nyxclaw sends the token as a `?token=` query parameter on the WebSocket connection.
+
+### Getting the token
+
+Generate a pairing token inside the ZeroClaw container:
+
+```bash
+docker exec <zeroclaw-container> zeroclaw gateway get-paircode --new
+```
+
+This prints a token like `zc_abc123def456...`. Copy it.
+
+### Configuring nyxclaw
+
+Add the token to nyxclaw's `.env`:
+
+```env
+AGENT_TYPE=zeroclaw
+BASE_URL=http://<zeroclaw-host>:<port>
+AUTH_TOKEN=zc_YOUR_TOKEN_HERE
+USE_AVATAR_ENDPOINT=true
+```
+
+nyxclaw will connect to `ws://<host>:<port>/ws/avatar?token=<AUTH_TOKEN>`.
+
 ## Files modified
 
 ### Full file replacements (patched copies in `src/`)

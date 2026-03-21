@@ -51,6 +51,10 @@ class OpenClawSettings(BaseSettings):
     agent_id: str | None = None
     max_retries: int = 2
 
+    # Avatar endpoint (patched OpenClaw only)
+    avatar_endpoint: str = "/v1/chat/completions/avatar"
+    use_avatar_endpoint: bool = False
+
     # ── STT: faster-whisper + Silero VAD ────────────────────────────
     stt_enabled: bool = True
     stt_model: str = "small.en"

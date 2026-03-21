@@ -546,6 +546,99 @@ class OpenAIRealtimeBackend(BaseAgent):
                 if content and not self._response_cancelled:
                     yield content
 
+    async def _iter_tokens_avatar_sse(self) -> AsyncGenerator[str, None]:
+        """Yield speech text from OpenClaw avatar SSE endpoint.
+
+        Uses /v1/chat/completions/avatar which returns custom SSE event types:
+        speech_chunk, rich_content, tool_call, tool_result, done.
+
+        Speech chunks are already sentence-split by the server, so we yield
+        them directly for TTS without buffering.
+        """
+        if not self._http_client:
+            return
+
+        rt = self._rt
+        payload: dict[str, Any] = {
+            "model": rt.agent_model,
+            "messages": list(self._messages),
+            "stream": True,
+        }
+        if rt.user_id:
+            payload["user"] = rt.user_id
+
+        endpoint = rt.avatar_endpoint
+        current_event: str | None = None
+
+        async with self._http_client.stream("POST", endpoint, json=payload) as response:
+            if response.status_code != 200:
+                body = await response.aread()
+                error_msg = f"LLM {response.status_code}: {body.decode('utf-8', errors='replace')}"
+                logger.error(error_msg)
+                if self._on_error:
+                    await self._on_error({"error": error_msg})
+                return
+
+            async for line in response.aiter_lines():
+                if self._response_cancelled:
+                    break
+
+                if line.startswith("event: "):
+                    current_event = line[7:].strip()
+                    continue
+
+                if not line.startswith("data: "):
+                    if line == "":
+                        current_event = None
+                    continue
+                data_str = line[6:]
+                if data_str == "[DONE]":
+                    break
+
+                try:
+                    data = orjson.loads(data_str)
+                except Exception:
+                    current_event = None
+                    continue
+
+                if current_event == "speech_chunk":
+                    content = data.get("content", "")
+                    if content and not self._response_cancelled:
+                        yield content
+
+                elif current_event == "rich_content":
+                    rc_content = data.get("content", "")
+                    if rc_content and self._on_tool_call:
+                        logger.info(f"Rich content received ({len(rc_content)} chars)")
+                        await self._on_tool_call("rich_content", {"content": rc_content})
+
+                elif current_event == "tool_call":
+                    tool_name = data.get("name", "unknown")
+                    logger.info(f"Tool call: {tool_name}")
+                    if self._on_tool_call:
+                        await self._on_tool_call(
+                            "tool_call",
+                            {"name": tool_name, "tool_call_id": data.get("tool_call_id")},
+                        )
+
+                elif current_event == "tool_result":
+                    tool_name = data.get("name", "unknown")
+                    success = data.get("success", True)
+                    duration_ms = data.get("duration_ms")
+                    logger.info(f"Tool result: {tool_name} success={success} ({duration_ms}ms)")
+                    if self._on_tool_call:
+                        await self._on_tool_call(
+                            "tool_result",
+                            {"name": tool_name, "success": success, "duration_ms": duration_ms},
+                        )
+
+                elif current_event == "done":
+                    # Server sends authoritative speech text — yield if not
+                    # already covered by speech_chunk events
+                    pass
+
+                current_event = None
+
     async def _iter_tokens_ws(
         self,
         tts_queue: asyncio.Queue[tuple[str, str, bool] | None] | None = None,
@@ -691,8 +784,11 @@ class OpenAIRealtimeBackend(BaseAgent):
 
         try:
             # Choose LLM streaming method based on agent type
+            use_avatar = agent_type == "openclaw" and self._rt.use_avatar_endpoint
             if agent_type == "zeroclaw":
                 token_stream = self._iter_tokens_ws(tts_queue=tts_queue)
+            elif use_avatar:
+                token_stream = self._iter_tokens_avatar_sse()
             else:
                 token_stream = self._iter_tokens_sse()
 
@@ -700,24 +796,31 @@ class OpenAIRealtimeBackend(BaseAgent):
                 if self._response_cancelled:
                     break
 
-                full_response += content
-                self._state.transcript_buffer = full_response
-
-                # Sentence buffering → TTS
-                sentence_buffer += content
-                sentences, sentence_buffer = self._extract_sentences(sentence_buffer)
-                for sent in sentences:
-                    sanitized = self._sanitize_for_tts(sent)
+                # Avatar SSE yields pre-split sentences — enqueue directly
+                if use_avatar:
+                    full_response += (" " if full_response else "") + content
+                    self._state.transcript_buffer = full_response
+                    sanitized = self._sanitize_for_tts(content)
                     if sanitized:
-                        await tts_queue.put((sent, sanitized, False))
+                        await tts_queue.put((content, sanitized, False))
+                else:
+                    full_response += content
+                    self._state.transcript_buffer = full_response
+                    sentence_buffer += content
+                    sentences, sentence_buffer = self._extract_sentences(sentence_buffer)
+                    for sent in sentences:
+                        sanitized = self._sanitize_for_tts(sent)
+                        if sanitized:
+                            await tts_queue.put((sent, sanitized, False))
 
             # ── Stream done — flush remaining sentence to TTS ──────
             if not self._response_cancelled:
-                remaining = sentence_buffer.strip()
-                if remaining:
-                    sanitized = self._sanitize_for_tts(remaining)
-                    if sanitized:
-                        await tts_queue.put((remaining, sanitized, False))
+                if not use_avatar:
+                    remaining = sentence_buffer.strip()
+                    if remaining:
+                        sanitized = self._sanitize_for_tts(remaining)
+                        if sanitized:
+                            await tts_queue.put((remaining, sanitized, False))
                 await tts_queue.put(None)
                 if tts_task:
                     await tts_task

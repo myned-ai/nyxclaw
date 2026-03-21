@@ -57,6 +57,9 @@ services:
       - SESSION_KEY=${SESSION_KEY}
       - AGENT_ID=${AGENT_ID}
       - MAX_RETRIES=${MAX_RETRIES:-2}
+      # Avatar endpoint (patched OpenClaw/ZeroClaw)
+      - AVATAR_ENDPOINT=${AVATAR_ENDPOINT:-/v1/chat/completions/avatar}
+      - USE_AVATAR_ENDPOINT=${USE_AVATAR_ENDPOINT:-false}
       # STT/TTS Configuration
       - STT_ENABLED=${STT_ENABLED:-true}
       - STT_MODEL=${STT_MODEL:-small.en}
@@ -132,6 +135,9 @@ services:
       - SESSION_KEY=${SESSION_KEY}
       - AGENT_ID=${AGENT_ID}
       - MAX_RETRIES=${MAX_RETRIES:-2}
+      # Avatar endpoint (patched OpenClaw/ZeroClaw)
+      - AVATAR_ENDPOINT=${AVATAR_ENDPOINT:-/v1/chat/completions/avatar}
+      - USE_AVATAR_ENDPOINT=${USE_AVATAR_ENDPOINT:-false}
       # STT/TTS Configuration
       - STT_ENABLED=${STT_ENABLED:-true}
       - STT_MODEL=${STT_MODEL:-small.en}

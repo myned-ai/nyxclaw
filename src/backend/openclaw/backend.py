@@ -303,9 +303,7 @@ class OpenClawBackend(BaseAgent):
 
         # 1. Validate token
         if not oc.auth_token:
-            raise ValueError(
-                "AUTH_TOKEN is required — set it in .env or match gateway.auth.token in openclaw.json"
-            )
+            raise ValueError("AUTH_TOKEN is required — set it in .env or match gateway.auth.token in openclaw.json")
 
         # 2. HTTP client
         headers: dict[str, str] = {
@@ -704,7 +702,12 @@ class OpenClawBackend(BaseAgent):
 
         try:
             turn_metrics["oc_request_start_at"] = time.perf_counter()
-            async with self._http_client.stream("POST", "/v1/chat/completions", json=payload) as response:
+
+            # Choose endpoint: avatar (structured JSON SSE) or standard OpenAI-compat
+            use_avatar = self._oc.use_avatar_endpoint
+            endpoint = self._oc.avatar_endpoint if use_avatar else "/v1/chat/completions"
+
+            async with self._http_client.stream("POST", endpoint, json=payload) as response:
                 if response.status_code != 200:
                     body = await response.aread()
                     error_msg = f"OpenClaw {response.status_code}: {body.decode('utf-8', errors='replace')}"
@@ -713,51 +716,24 @@ class OpenClawBackend(BaseAgent):
                         await self._on_error({"error": error_msg})
                     return
 
-                # ── Parse SSE stream ────────────────────────────────
-                async for line in response.aiter_lines():
-                    if self._response_cancelled:
-                        break
-
-                    if not line.startswith("data: "):
-                        continue
-                    data = line[6:]
-                    if data == "[DONE]":
-                        break
-
-                    try:
-                        chunk = orjson.loads(data)
-                    except Exception:
-                        continue
-
-                    choices = chunk.get("choices", [])
-                    if not choices:
-                        continue
-                    content = choices[0].get("delta", {}).get("content")
-                    if not content or self._response_cancelled:
-                        continue
-
-                    if turn_metrics["oc_first_token_at"] is None:
-                        turn_metrics["oc_first_token_at"] = time.perf_counter()
-
-                    full_response += content
-                    self._state.transcript_buffer = full_response
-
-                    # Stream transcript deltas to the client as tokens arrive
-                    # (same as OpenAI/Gemini — word-level for real-time subtitles).
-                    if self._on_transcript_delta and not self._response_cancelled:
-                        await self._on_transcript_delta(content, "assistant", item_id, None)
-
-                    # Sentence buffering → TTS
-                    if self._tts_available:
-                        sentence_buffer += content
-                        sentences, sentence_buffer = self._extract_sentences(sentence_buffer)
-                        for sent in sentences:
-                            sanitized = self._sanitize_for_tts(sent)
-                            if not sanitized:
-                                continue
-                            if turn_metrics["tts_first_sentence_at"] is None:
-                                turn_metrics["tts_first_sentence_at"] = time.perf_counter()
-                            await tts_queue.put((sent, sanitized))
+                if use_avatar:
+                    full_response, sentence_buffer = await self._parse_avatar_sse(
+                        response,
+                        full_response,
+                        sentence_buffer,
+                        turn_metrics,
+                        tts_queue,
+                        item_id,
+                    )
+                else:
+                    full_response, sentence_buffer = await self._parse_openai_sse(
+                        response,
+                        full_response,
+                        sentence_buffer,
+                        turn_metrics,
+                        tts_queue,
+                        item_id,
+                    )
 
             # ── SSE done — flush remaining sentence to TTS ──────────
             if self._tts_available:
@@ -847,6 +823,177 @@ class OpenClawBackend(BaseAgent):
             self._metric_input_source = "stt"
 
             self._active_stream_task = None
+
+    # ================================================================
+    # SSE parsers
+    # ================================================================
+
+    async def _parse_openai_sse(
+        self,
+        response: httpx.Response,
+        full_response: str,
+        sentence_buffer: str,
+        turn_metrics: dict[str, Any],
+        tts_queue: asyncio.Queue[tuple[str, str] | None],
+        item_id: str,
+    ) -> tuple[str, str]:
+        """Parse standard OpenAI-compatible SSE stream (data-only lines)."""
+        async for line in response.aiter_lines():
+            if self._response_cancelled:
+                break
+
+            if not line.startswith("data: "):
+                continue
+            data = line[6:]
+            if data == "[DONE]":
+                break
+
+            try:
+                chunk = orjson.loads(data)
+            except Exception:
+                continue
+
+            choices = chunk.get("choices", [])
+            if not choices:
+                continue
+            content = choices[0].get("delta", {}).get("content")
+            if not content or self._response_cancelled:
+                continue
+
+            if turn_metrics["oc_first_token_at"] is None:
+                turn_metrics["oc_first_token_at"] = time.perf_counter()
+
+            full_response += content
+            self._state.transcript_buffer = full_response
+
+            if self._on_transcript_delta and not self._response_cancelled:
+                await self._on_transcript_delta(content, "assistant", item_id, None)
+
+            if self._tts_available:
+                sentence_buffer += content
+                sentences, sentence_buffer = self._extract_sentences(sentence_buffer)
+                for sent in sentences:
+                    sanitized = self._sanitize_for_tts(sent)
+                    if not sanitized:
+                        continue
+                    if turn_metrics["tts_first_sentence_at"] is None:
+                        turn_metrics["tts_first_sentence_at"] = time.perf_counter()
+                    await tts_queue.put((sent, sanitized))
+
+        return full_response, sentence_buffer
+
+    async def _parse_avatar_sse(
+        self,
+        response: httpx.Response,
+        full_response: str,
+        sentence_buffer: str,
+        turn_metrics: dict[str, Any],
+        tts_queue: asyncio.Queue[tuple[str, str] | None],
+        item_id: str,
+    ) -> tuple[str, str]:
+        """Parse avatar SSE stream with custom event types.
+
+        The avatar endpoint emits named SSE events:
+        - ``event: speech_chunk`` — sentence of speech text → TTS
+        - ``event: rich_content`` — markdown/links → forward to client
+        - ``event: tool_call`` — tool invocation started
+        - ``event: tool_result`` — tool finished
+        - ``event: done`` — final response with full_response text
+        """
+        current_event: str | None = None
+
+        async for line in response.aiter_lines():
+            if self._response_cancelled:
+                break
+
+            # SSE event type line
+            if line.startswith("event: "):
+                current_event = line[7:].strip()
+                continue
+
+            # SSE data line
+            if not line.startswith("data: "):
+                if line == "":
+                    current_event = None  # reset on blank line
+                continue
+            data_str = line[6:]
+            if data_str == "[DONE]":
+                break
+
+            try:
+                data = orjson.loads(data_str)
+            except Exception:
+                current_event = None
+                continue
+
+            if current_event == "speech_chunk":
+                content = data.get("content", "")
+                if not content or self._response_cancelled:
+                    current_event = None
+                    continue
+
+                if turn_metrics["oc_first_token_at"] is None:
+                    turn_metrics["oc_first_token_at"] = time.perf_counter()
+
+                full_response += (" " if full_response else "") + content
+                self._state.transcript_buffer = full_response
+
+                # Stream transcript delta (full sentence at once)
+                if self._on_transcript_delta and not self._response_cancelled:
+                    await self._on_transcript_delta(content, "assistant", item_id, None)
+
+                # Send directly to TTS (already sentence-split by the server)
+                if self._tts_available and not self._response_cancelled:
+                    sanitized = self._sanitize_for_tts(content)
+                    if sanitized:
+                        if turn_metrics["tts_first_sentence_at"] is None:
+                            turn_metrics["tts_first_sentence_at"] = time.perf_counter()
+                        await tts_queue.put((content, sanitized))
+
+            elif current_event == "rich_content":
+                rc_content = data.get("content", "")
+                if rc_content and self._on_tool_call:
+                    logger.info(f"Rich content received ({len(rc_content)} chars)")
+                    await self._on_tool_call("rich_content", {"content": rc_content})
+
+            elif current_event == "tool_call":
+                tool_name = data.get("name", "unknown")
+                logger.info(f"Tool call: {tool_name}")
+                if self._on_tool_call:
+                    await self._on_tool_call(
+                        "tool_call",
+                        {
+                            "name": tool_name,
+                            "tool_call_id": data.get("tool_call_id"),
+                        },
+                    )
+
+            elif current_event == "tool_result":
+                tool_name = data.get("name", "unknown")
+                success = data.get("success", True)
+                duration_ms = data.get("duration_ms")
+                logger.info(f"Tool result: {tool_name} success={success} ({duration_ms}ms)")
+                if self._on_tool_call:
+                    await self._on_tool_call(
+                        "tool_result",
+                        {
+                            "name": tool_name,
+                            "success": success,
+                            "duration_ms": duration_ms,
+                        },
+                    )
+
+            elif current_event == "done":
+                # Use the speech text as the final response (not the raw JSON)
+                done_response = data.get("full_response", "")
+                if done_response:
+                    full_response = done_response
+
+            current_event = None
+
+        # Avatar endpoint handles sentence splitting server-side,
+        # so sentence_buffer stays empty
+        return full_response, ""
 
     # ================================================================
     # TTS worker
