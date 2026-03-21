@@ -4,7 +4,7 @@ Patches for OpenClaw **v2026.3.13** that add a dedicated avatar SSE endpoint (`/
 
 ## What this patch does
 
-Adds a new HTTP SSE endpoint that forces the LLM to respond with structured JSON via `extraSystemPrompt` injection:
+Adds a new HTTP SSE endpoint that forces the LLM to respond with structured JSON:
 
 ```json
 {"speech": "Here's what I found, take a look.", "content": "**Rome - Wikipedia**\nhttps://en.wikipedia.org/wiki/Rome"}
@@ -14,19 +14,6 @@ Adds a new HTTP SSE endpoint that forces the LLM to respond with structured JSON
 - `content` — streamed as `event: rich_content` SSE event → app renders cards/links/tables
 - Tool calls/results stream as `event: tool_call` / `event: tool_result` during agent execution
 - The existing `/v1/chat/completions` endpoint is unchanged
-
-## Architecture
-
-OpenClaw uses an external PI agent runtime (`@mariozechner/pi-coding-agent`) that doesn't expose `response_format`. Instead:
-
-1. **`extraSystemPrompt`** — injects the JSON response format instructions into the agent's system prompt
-2. **`avatar-http.ts`** — new SSE handler that subscribes to agent events, accumulates the JSON response, incrementally extracts the `speech` field, and emits custom SSE event types
-3. **`server-http.ts`** — one injection to register the `/v1/chat/completions/avatar` route
-
-The `extraSystemPrompt` approach works because:
-- OpenClaw's agent pipeline already supports `extraSystemPrompt` all the way through
-- Claude and GPT-4 reliably produce JSON when instructed in the system prompt (especially with structured examples)
-- No modifications needed to the agent runner, LLM provider, or session manager
 
 ## Usage
 
@@ -82,67 +69,6 @@ USE_AVATAR_ENDPOINT=true
 
 nyxclaw will send `Authorization: Bearer your_secret_token_here` on all requests to `/v1/chat/completions/avatar`.
 
-## Files
-
-### New files (in `src/gateway/`)
-
-| File | What it does |
-|------|-------------|
-| `avatar-http.ts` | Avatar SSE endpoint handler. Clones `openai-http.ts` pattern, adds `extraSystemPrompt` for JSON format, incrementally extracts `speech` → `speech_chunk` events, emits `rich_content` on completion. |
-
-### Line injections (original files preserved)
-
-| File | What injected |
-|------|--------------|
-| `server-http.ts` | Import + route registration for `/v1/chat/completions/avatar` in the request pipeline |
-
-## SSE Protocol: `/v1/chat/completions/avatar`
-
-### Request (POST)
-
-Same as `/v1/chat/completions`:
-```json
-{
-  "model": "openclaw:main",
-  "stream": true,
-  "messages": [{"role": "user", "content": "Show me the Wikipedia page for Rome"}]
-}
-```
-
-Auth: `Authorization: Bearer <gateway-token>` (same as existing endpoint).
-
-### Response (SSE stream)
-
-Standard SSE format with custom event types:
-
-```
-event: tool_call
-data: {"name": "web_fetch", "args": {"url": "https://en.wikipedia.org/wiki/Rome"}}
-
-event: tool_result
-data: {"name": "web_fetch", "success": true, "duration_ms": 1200}
-
-event: speech_chunk
-data: {"content": "Here's the Wikipedia page for Rome, take a look."}
-
-event: rich_content
-data: {"content": "**Rome - Wikipedia**\nhttps://en.wikipedia.org/wiki/Rome\n\n..."}
-
-event: done
-data: {"full_response": "Here's the Wikipedia page for Rome, take a look."}
-
-data: [DONE]
-```
-
-### Key differences from `/v1/chat/completions`
-
-| Feature | `/v1/chat/completions` | `/v1/chat/completions/avatar` |
-|---------|----------------------|------------------------------|
-| Response format | Raw text chunks | Structured `{speech, content}` JSON |
-| SSE event types | `data:` only (OpenAI format) | `event: speech_chunk`, `event: rich_content`, `event: tool_call`, `event: tool_result`, `event: done` |
-| System prompt | Unchanged | `extraSystemPrompt` injected with JSON format instructions |
-| Tool visibility | Hidden | Streamed as events |
-
 ## AGENTS.md — Required prompt addition
 
 You must manually add the following **Response format** section to your workspace `AGENTS.md` (located at `~/.openclaw/workspace/AGENTS.md`, or wherever `OPENCLAW_WORKSPACE_DIR` points):
@@ -194,7 +120,142 @@ User asks to compare things:
 - Never put raw JSON or code in speech
 ```
 
-**Note:** The avatar endpoint also injects these instructions via `extraSystemPrompt`, so the LLM receives them even without `AGENTS.md`. However, adding them to `AGENTS.md` reinforces the format and improves reliability
+**Note:** The avatar endpoint also injects these instructions via `extraSystemPrompt`, so the LLM receives them even without `AGENTS.md`. However, adding them to `AGENTS.md` reinforces the format and improves reliability.
+
+## Performance Tuning
+
+For real-time voice, latency matters. These OpenClaw settings reduce time-to-first-token (TTFT) significantly. Add them to your `openclaw.json` (located at your `OPENCLAW_CONFIG_DIR`, e.g. `~/.openclaw/openclaw.json` on the host, mounted as `/home/node/.openclaw/openclaw.json` in Docker):
+
+```json
+{
+  "agents": {
+    "defaults": {
+      "thinkingDefault": "off",
+      "humanDelay": { "mode": "off" },
+      "blockStreamingDefault": "off",
+      "timeoutSeconds": 30,
+      "models": {
+        "openai/gpt-4.1": {
+          "params": {
+            "temperature": 0.4,
+            "maxTokens": 400
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+Replace `openai/gpt-4.1` with your actual model. Merge these into your existing `openclaw.json` — don't overwrite the `gateway` section.
+
+### What each setting does
+
+| Setting | Value | Effect |
+|---------|-------|--------|
+| `thinkingDefault` | `"off"` | Disables chain-of-thought reasoning — biggest TTFT win |
+| `humanDelay` | `"off"` | Removes artificial 800–2500ms typing delay between responses |
+| `blockStreamingDefault` | `"off"` | Streams raw tokens instead of buffering into blocks |
+| `timeoutSeconds` | `30` | Fails fast instead of hanging on slow requests |
+| `temperature` | `0.4` | Lower randomness = faster token selection |
+| `maxTokens` | `400` | Caps response length — voice responses should be short |
+
+### Benchmark results (gpt-4.1)
+
+| | TTFS (time to first speech) | Total |
+|---|---|---|
+| **Default config** | 2.6s | 3.1s |
+| **Optimized (warm)** | 1.1s | 1.4s |
+
+### Model-specific notes
+
+- **`fastMode: true`** — only works with reasoning models (o3, o4-mini). Sends `reasoning.effort: "low"`. Do **not** use with gpt-4.1 or claude — will cause 400 errors.
+- **Anthropic models** — add `"cacheRetention": "short"` to enable prompt caching (5min TTL, reduces input processing time).
+
+These values are optimized for snappy voice responses. Depending on your use case you may want different tradeoffs — for example, raising `maxTokens` if your agent gives detailed answers, enabling `thinkingDefault: "minimal"` if response quality matters more than speed, or increasing `temperature` for more creative output. Experiment and find what works best for your setup.
+
+## SSE Protocol Reference
+
+### Request (POST)
+
+Same as `/v1/chat/completions`:
+```json
+{
+  "model": "openclaw:main",
+  "stream": true,
+  "messages": [{"role": "user", "content": "Show me the Wikipedia page for Rome"}]
+}
+```
+
+Auth: `Authorization: Bearer <gateway-token>` (same as existing endpoint).
+
+### Response (SSE stream)
+
+Standard SSE format with custom event types:
+
+```
+event: tool_call
+data: {"name": "web_fetch", "args": {"url": "https://en.wikipedia.org/wiki/Rome"}}
+
+event: tool_result
+data: {"name": "web_fetch", "success": true, "duration_ms": 1200}
+
+event: speech_chunk
+data: {"content": "Here's the Wikipedia page for Rome, take a look."}
+
+event: rich_content
+data: {"content": "**Rome - Wikipedia**\nhttps://en.wikipedia.org/wiki/Rome\n\n..."}
+
+event: done
+data: {"full_response": "Here's the Wikipedia page for Rome, take a look."}
+
+data: [DONE]
+```
+
+### Key differences from `/v1/chat/completions`
+
+| Feature | `/v1/chat/completions` | `/v1/chat/completions/avatar` |
+|---------|----------------------|------------------------------|
+| Response format | Raw text chunks | Structured `{speech, content}` JSON |
+| SSE event types | `data:` only (OpenAI format) | `event: speech_chunk`, `event: rich_content`, `event: tool_call`, `event: tool_result`, `event: done` |
+| System prompt | Unchanged | `extraSystemPrompt` injected with JSON format instructions |
+| Tool visibility | Hidden | Streamed as events |
+
+## How it works
+
+OpenClaw uses an external PI agent runtime (`@mariozechner/pi-coding-agent`) that doesn't expose `response_format`. Instead:
+
+1. **`extraSystemPrompt`** — injects the JSON response format instructions into the agent's system prompt
+2. **`avatar-http.ts`** — new SSE handler that subscribes to agent events, accumulates the JSON response, incrementally extracts the `speech` field, and emits custom SSE event types
+3. **`server-http.ts`** — one injection to register the `/v1/chat/completions/avatar` route
+
+The `extraSystemPrompt` approach works because:
+- OpenClaw's agent pipeline already supports `extraSystemPrompt` all the way through
+- Claude and GPT-4 reliably produce JSON when instructed in the system prompt (especially with structured examples)
+- No modifications needed to the agent runner, LLM provider, or session manager
+
+### Files modified
+
+**New files:**
+
+| File | What it does |
+|------|-------------|
+| `src/gateway/avatar-http.ts` | Avatar SSE endpoint handler. Adds `extraSystemPrompt` for JSON format, incrementally extracts `speech` → `speech_chunk` events, emits `rich_content` on completion. |
+
+**Line injections (original files preserved):**
+
+| File | What injected |
+|------|--------------|
+| `server-http.ts` | Import + route registration for `/v1/chat/completions/avatar` in the request pipeline |
+
+## Compatibility
+
+- **OpenClaw v2026.3.13** — tested and supported
+- **Other versions** — `server-http.ts` request pipeline structure may differ; manual adjustment may be needed
+
+### Provider support
+
+Since we use `extraSystemPrompt` (not `response_format`), this works with **any LLM provider** that OpenClaw supports — Claude, GPT-4, Gemini, etc. The LLM just needs to follow JSON instructions in the system prompt.
 
 ## Reverting
 
@@ -204,12 +265,3 @@ cp -r /path/to/openclaw/.nyxclaw-patch-backup/* /path/to/openclaw/
 rm -rf /path/to/openclaw/.nyxclaw-patch-backup
 rm /path/to/openclaw/src/gateway/avatar-http.ts
 ```
-
-## Compatibility
-
-- **OpenClaw v2026.3.13** — target version
-- **Other versions** — `server-http.ts` request pipeline structure may differ; manual adjustment may be needed
-
-### Provider support
-
-Since we use `extraSystemPrompt` (not `response_format`), this works with **any LLM provider** that OpenClaw supports — Claude, GPT-4, Gemini, etc. The LLM just needs to follow JSON instructions in the system prompt.

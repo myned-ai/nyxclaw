@@ -71,29 +71,6 @@ USE_AVATAR_ENDPOINT=true
 
 nyxclaw will connect to `ws://<host>:<port>/ws/avatar?token=<AUTH_TOKEN>`.
 
-## Files modified
-
-### Full file replacements (patched copies in `src/`)
-
-| File | What changed |
-|------|-------------|
-| `src/providers/traits.rs` | Added `response_format` to `ChatRequest`, `StreamEvent` enum, `stream_chat()` trait method. |
-| `src/providers/openai.rs` | Added `response_format` + `stream` to `NativeChatRequest`, SSE streaming structs, `stream_chat()` impl. |
-| `src/agent/agent.rs` | Added `response_format` field + setter, `turn_with_events()`, `turn_with_streaming()` (streaming agent turn). |
-| `src/channels/nyxclaw.rs` | **NEW** — Avatar WebSocket channel with incremental JSON extraction: streams `speech_chunk` events as the LLM generates, not after. |
-
-### Line injections (original files preserved)
-
-| File | What injected |
-|------|--------------|
-| `src/agent/loop_.rs` | `response_format: None,` in `ChatRequest` construction (1 location) |
-| `src/providers/anthropic.rs` | `response_format: None,` in `ProviderChatRequest` construction (1 location) |
-| `src/providers/reliable.rs` | `response_format: None,` in `ChatRequest` constructions (6 locations) |
-| `src/providers/mod.rs` | `StreamEvent` added to re-export list |
-| `Cargo.toml` | `async-stream = "0.3"` dependency added |
-| `src/channels/mod.rs` | `pub mod nyxclaw;` after `pub mod notion;` |
-| `src/gateway/mod.rs` | `use crate::channels::nyxclaw;` import + `/ws/avatar` route + print line |
-
 ## AGENTS.md — Required prompt addition
 
 You must manually add the following **Response format** section to your `playground/AGENTS.md`:
@@ -145,7 +122,69 @@ User asks to compare things:
 - Never put raw JSON or code in speech
 ```
 
-## WebSocket protocol: `/ws/avatar`
+## Performance Tuning
+
+For real-time voice, latency matters. These ZeroClaw settings reduce time-to-first-token (TTFT) significantly. Edit your `config.toml` (located at `~/.zeroclaw/config.toml`, or `/zeroclaw-data/.zeroclaw/config.toml` inside Docker):
+
+```toml
+default_temperature = 0.5
+provider_timeout_secs = 30
+
+[agent]
+compact_context = true
+max_tool_iterations = 4
+max_history_messages = 15
+max_context_tokens = 12000
+parallel_tools = true
+
+[runtime]
+reasoning_enabled = false
+```
+
+### What each setting does
+
+| Setting | Default | Recommended | Effect |
+|---------|---------|-------------|--------|
+| `default_temperature` | `0.7` | `0.5` | Less sampling overhead, slightly faster token selection |
+| `provider_timeout_secs` | `120` | `30` | Fail fast instead of hanging on slow requests |
+| `compact_context` | `false` | `true` | Reduces system prompt and context payload sent to the LLM |
+| `max_tool_iterations` | `10` | `4` | Limits tool-call round-trips per turn (each is a full LLM call) |
+| `max_history_messages` | `50` | `15` | Less conversation history = fewer input tokens = faster TTFT |
+| `max_context_tokens` | `32000` | `12000` | Triggers context compaction sooner, keeping payload lean |
+| `parallel_tools` | `false` | `true` | Runs multiple tool calls concurrently instead of sequentially |
+| `reasoning_enabled` | `false` | `false` | Keep disabled — reasoning adds seconds of thinking delay |
+
+### Model selection
+
+Model choice is the single biggest latency factor. Fast options:
+
+| Model | Provider | TTFT | Notes |
+|-------|----------|------|-------|
+| `gpt-4.1-mini` | `openai` | ~1s | Good balance of speed and quality |
+| `gpt-4.1-nano` | `openai` | ~0.5s | Fastest, lower quality |
+| `claude-haiku-4-5` | `anthropic` | ~0.8s | Fast, good quality |
+| `llama-3.3-70b-versatile` | `groq` | ~0.3s | Groq LPU hardware, very fast |
+
+Set in `config.toml`:
+```toml
+default_provider = "openai"
+default_model = "gpt-4.1-mini"
+```
+
+### Automatic optimizations (no config needed)
+
+- **Streaming** — the avatar channel uses `turn_with_streaming()` which streams tokens as they arrive. Speech starts as soon as the first sentence is complete.
+- **Prompt caching** — Anthropic and OpenAI providers automatically cache system prompts. Repeated turns with the same system prompt benefit from cache hits (up to 90% reduction in input processing time).
+- **HTTP warmup** — ZeroClaw pre-warms provider HTTP connection pools (TLS + HTTP/2) at startup, eliminating cold-start latency on the first request.
+- **Response caching** — set `response_cache_enabled = true` in `[memory]` and `temperature = 0.0` to cache responses for repeated queries. Useful for common greetings or FAQ-type questions.
+
+### Identity prompt size
+
+Your `playground/AGENTS.md`, `IDENTITY.md`, and `SOUL.md` files are injected into the system prompt. Larger files = more input tokens = higher TTFT. Keep them concise for voice use cases.
+
+These values are optimized for snappy voice responses. Depending on your use case you may want different tradeoffs — for example, raising `max_history_messages` for longer conversations, enabling `reasoning_enabled` for complex tasks, or increasing `max_tool_iterations` if your agent uses many tools. Experiment and find what works best for your setup.
+
+## WebSocket Protocol: `/ws/avatar`
 
 ### Client → Server
 
@@ -177,14 +216,30 @@ User asks to compare things:
 | Cancel support | No | Yes (`{"type": "cancel"}`) |
 | LLM constraint | `response_format` not set | `response_format: json_schema` enforced |
 
-## Reverting
+## How it works
 
-To revert all patches:
-```bash
-cp -r /path/to/zeroclaw/.nyxclaw-patch-backup/* /path/to/zeroclaw/
-rm -rf /path/to/zeroclaw/.nyxclaw-patch-backup
-rm /path/to/zeroclaw/src/channels/nyxclaw.rs
-```
+### Files modified
+
+**Full file replacements (patched copies in `src/`):**
+
+| File | What changed |
+|------|-------------|
+| `src/providers/traits.rs` | Added `response_format` to `ChatRequest`, `StreamEvent` enum, `stream_chat()` trait method. |
+| `src/providers/openai.rs` | Added `response_format` + `stream` to `NativeChatRequest`, SSE streaming structs, `stream_chat()` impl. |
+| `src/agent/agent.rs` | Added `response_format` field + setter, `turn_with_events()`, `turn_with_streaming()` (streaming agent turn). |
+| `src/channels/nyxclaw.rs` | **NEW** — Avatar WebSocket channel with incremental JSON extraction: streams `speech_chunk` events as the LLM generates, not after. |
+
+**Line injections (original files preserved):**
+
+| File | What injected |
+|------|--------------|
+| `src/agent/loop_.rs` | `response_format: None,` in `ChatRequest` construction (1 location) |
+| `src/providers/anthropic.rs` | `response_format: None,` in `ProviderChatRequest` construction (1 location) |
+| `src/providers/reliable.rs` | `response_format: None,` in `ChatRequest` constructions (6 locations) + `stream_chat()` delegation |
+| `src/providers/mod.rs` | `StreamEvent` added to re-export list |
+| `Cargo.toml` | `async-stream = "0.3"` dependency added |
+| `src/channels/mod.rs` | `pub mod nyxclaw;` after `pub mod notion;` |
+| `src/gateway/mod.rs` | `use crate::channels::nyxclaw;` import + `/ws/avatar` route + print line |
 
 ## Compatibility
 
@@ -258,3 +313,12 @@ Anthropic and Gemini use different APIs for structured output:
 - **Gemini**: Uses `generationConfig.response_mime_type: "application/json"` + `generationConfig.response_schema: {...}`.
 
 These require provider-specific patches beyond the OpenAI pattern. Contributions welcome.
+
+## Reverting
+
+To revert all patches:
+```bash
+cp -r /path/to/zeroclaw/.nyxclaw-patch-backup/* /path/to/zeroclaw/
+rm -rf /path/to/zeroclaw/.nyxclaw-patch-backup
+rm /path/to/zeroclaw/src/channels/nyxclaw.rs
+```
