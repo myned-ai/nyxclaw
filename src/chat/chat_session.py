@@ -213,13 +213,14 @@ class ChatSession:
             content = arguments.get("content", "")
             if content:
                 logger.info(f"Session {self.session_id}: Forwarding rich content ({len(content)} chars)")
-                await self.send_json(
-                    {
-                        "type": "rich_content",
-                        "content": content,
-                        "timestamp": int(time.time() * 1000),
-                    }
-                )
+                msg: dict = {
+                    "type": "rich_content",
+                    "content": content,
+                    "timestamp": int(time.time() * 1000),
+                }
+                if self.current_turn_id:
+                    msg["previousItemId"] = self.current_turn_id
+                await self.send_json(msg)
             return
 
         # Other tool calls — log but don't forward to client
