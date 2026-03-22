@@ -98,7 +98,9 @@ Both backends work without the avatar patch — set `USE_AVATAR_ENDPOINT=false` 
 ## Configuration
 
 All settings are configured via environment variables or `.env` file. See [.env.example](.env.example) for the full template.
-xs
+
+> **One session at a time.** NyxClaw serves a single active connection — one avatar, one audio stream. You can pair multiple devices (phone, tablet, desktop) for convenience, but only one connects at a time. Treat the setup code like a password — anyone with it can pair a device and talk to your AI agent.
+
 ## Rich Content
 
 When the LLM's response includes content better seen than heard (URLs, tables, structured data), the avatar patch splits the response:

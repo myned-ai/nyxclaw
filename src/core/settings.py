@@ -50,6 +50,11 @@ class Settings(BaseSettings):
     auth_store_path: str = "./data/auth_store.json"  # Persistent auth store file
     auth_regenerate_setup_code: bool = False  # Set true + restart to force new setup code
 
+    # Cloudflare Tunnel
+    provisioning_api_url: str = "https://api.nyxclaw.ai"
+    device_id_path: str = "./data/device_id"
+    tunnel_config_path: str = "./data/tunnel.json"
+
     # Agent Configuration
     agent_type: str = "openclaw"  # "openclaw", "zeroclaw"
     voice_mode: str = "local"  # "local" (Piper TTS + faster-whisper) or "openai" (OpenAI Realtime + TTS API)

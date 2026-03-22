@@ -79,7 +79,7 @@ services:
       # - ./pretrained_models/wav2arkit:/app/pretrained_models/wav2arkit:ro
       # - ./pretrained_models/piper:/app/pretrained_models/piper:ro
       # - ./pretrained_models/faster_whisper_small_en:/app/pretrained_models/faster_whisper_small_en:ro
-      - ./data:/app/data  # Persistent auth store
+      - ./data:/app/data  # Persistent auth store + tunnel config
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
@@ -87,6 +87,33 @@ services:
       timeout: 10s
       retries: 3
       start_period: 10s
+
+  # ============================================================================
+  # Cloudflare Tunnel (automatic TLS — wss:// access from anywhere)
+  # ============================================================================
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    container_name: nyxclaw-tunnel
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo "Waiting for tunnel token (timeout: 5min)..."
+        tries=0
+        while [ ! -f /data/tunnel_token ]; do
+          tries=$$((tries + 1))
+          if [ $$tries -ge 150 ]; then
+            echo "No tunnel token after 5 minutes. Tunnel not available."
+            exit 1
+          fi
+          sleep 2
+        done
+        echo "Token found, starting tunnel"
+        exec cloudflared tunnel run --token "$$(cat /data/tunnel_token)"
+    volumes:
+      - ./data:/data:ro
+    depends_on:
+      - server
+    restart: unless-stopped
 
   # ============================================================================
   # NyxClaw (Development with hot reload)

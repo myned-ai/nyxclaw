@@ -29,6 +29,7 @@ from auth.setup_code_service import ensure_setup_code
 from auth.store import get_auth_store
 from routers import chat_router
 from services import get_wav2arkit_service
+from services.tunnel_service import ensure_tunnel
 
 logger = get_logger(__name__)
 
@@ -141,6 +142,20 @@ async def lifespan(app: FastAPI):
     logger.info(f"Debug: {settings.debug}")
     logger.info(f"Auth: {'Enabled' if settings.auth_enabled else 'Disabled'}")
     logger.info("=" * 60)
+
+    # Provision Cloudflare Tunnel (auto-generates device ID on first boot)
+    tunnel_config = await ensure_tunnel(
+        device_id_path=settings.device_id_path,
+        tunnel_config_path=settings.tunnel_config_path,
+        provisioning_api_url=settings.provisioning_api_url,
+    )
+    if tunnel_config:
+        # Override setup code URL with the tunnel hostname
+        if not settings.auth_setup_code_url:
+            settings.auth_setup_code_url = f"wss://{tunnel_config.hostname}/ws"
+        logger.info(f"Tunnel: wss://{tunnel_config.hostname}/ws")
+    else:
+        logger.warning("Tunnel: not available (local network only)")
 
     # Generate and print setup code if auth is enabled
     if settings.auth_enabled:
