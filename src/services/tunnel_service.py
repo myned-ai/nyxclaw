@@ -5,6 +5,7 @@ and stale token detection. The tunnel itself is run by cloudflared
 (Docker sidecar or local daemon) — this module manages the config.
 """
 
+import asyncio
 import json
 import stat
 import uuid
@@ -163,6 +164,32 @@ async def check_tunnel_status(
         return True
 
 
+async def _wait_for_dns(provisioning_api_url: str, timeout: int = 120) -> None:
+    """Wait until external DNS resolves. Docker Desktop DNS proxy can be slow."""
+    import socket
+    from urllib.parse import urlparse
+
+    hostname = urlparse(provisioning_api_url).hostname
+    if not hostname:
+        return
+
+    deadline = asyncio.get_event_loop().time() + timeout
+    attempt = 0
+    while asyncio.get_event_loop().time() < deadline:
+        try:
+            await asyncio.to_thread(socket.getaddrinfo, hostname, 443)
+            if attempt > 0:
+                logger.info(f"DNS ready (resolved {hostname} after {attempt} attempts)")
+            return
+        except socket.gaierror:
+            attempt += 1
+            if attempt == 1:
+                logger.info(f"Waiting for DNS to resolve {hostname}...")
+            await asyncio.sleep(3)
+
+    logger.warning(f"DNS did not resolve {hostname} within {timeout}s")
+
+
 async def ensure_tunnel(
     device_id_path: str = "./data/device_id",
     tunnel_config_path: str = "./data/tunnel.json",
@@ -186,12 +213,22 @@ async def ensure_tunnel(
             logger.info("Stored tunnel was cleaned up, re-provisioning...")
             clear_tunnel_config(tunnel_config_path)
 
+    # Wait for DNS to be ready (Docker Desktop DNS proxy can take 30-60s)
+    await _wait_for_dns(provisioning_api_url)
+
     # Provision new tunnel
-    try:
-        config = await provision_tunnel(device_id, provisioning_api_url)
-        save_tunnel_config(config, tunnel_config_path)
-        return config
-    except httpx.HTTPError as exc:
-        logger.error(f"Tunnel provisioning failed: {exc}")
-        logger.warning("Server will start in local-only mode (no wss:// access)")
-        return None
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
+        try:
+            config = await provision_tunnel(device_id, provisioning_api_url)
+            save_tunnel_config(config, tunnel_config_path)
+            return config
+        except Exception as exc:
+            if attempt < max_attempts:
+                wait = attempt * 5
+                logger.warning(f"Tunnel provisioning attempt {attempt}/{max_attempts} failed: {exc}. Retrying in {wait}s...")
+                await asyncio.sleep(wait)
+            else:
+                logger.error(f"Tunnel provisioning failed after {max_attempts} attempts: {exc}")
+                logger.warning("Server will start in local-only mode (no wss:// access)")
+                return None

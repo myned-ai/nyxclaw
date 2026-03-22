@@ -34,6 +34,10 @@ services:
       - AUTH_SETUP_CODE_URL=${AUTH_SETUP_CODE_URL:-}
       - AUTH_STORE_PATH=/app/data/auth_store.json
       - AUTH_REGENERATE_SETUP_CODE=${AUTH_REGENERATE_SETUP_CODE:-false}
+      # Cloudflare Tunnel provisioning
+      - PROVISIONING_API_URL=${PROVISIONING_API_URL:-https://nyxclaw-provisioner.nyxclaw.workers.dev}
+      - DEVICE_ID_PATH=/app/data/device_id
+      - TUNNEL_CONFIG_PATH=/app/data/tunnel.json
       - DEBUG=${DEBUG:-false}
       - DEBUG_AUDIO_CAPTURE=${DEBUG_AUDIO_CAPTURE:-false}
       # Agent Configuration
@@ -80,6 +84,9 @@ services:
       # - ./pretrained_models/piper:/app/pretrained_models/piper:ro
       # - ./pretrained_models/faster_whisper_small_en:/app/pretrained_models/faster_whisper_small_en:ro
       - ./data:/app/data  # Persistent auth store + tunnel config
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
@@ -94,25 +101,12 @@ services:
   tunnel:
     image: cloudflare/cloudflared:latest
     container_name: nyxclaw-tunnel
-    entrypoint: ["/bin/sh", "-c"]
-    command:
-      - |
-        echo "Waiting for tunnel token (timeout: 5min)..."
-        tries=0
-        while [ ! -f /data/tunnel_token ]; do
-          tries=$$((tries + 1))
-          if [ $$tries -ge 150 ]; then
-            echo "No tunnel token after 5 minutes. Tunnel not available."
-            exit 1
-          fi
-          sleep 2
-        done
-        echo "Token found, starting tunnel"
-        exec cloudflared tunnel run --token "$$(cat /data/tunnel_token)"
+    command: tunnel run --token-file /data/tunnel_token
     volumes:
       - ./data:/data:ro
     depends_on:
-      - server
+      server:
+        condition: service_healthy
     restart: unless-stopped
 
   # ============================================================================

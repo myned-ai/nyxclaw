@@ -5,7 +5,7 @@
 
 ## What It Does
 
-NyxClaw is a real-time WebSocket server that bridges a 3D avatar frontend and Claw-based AI backends (OpenClaw, ZeroClaw, etc). It runs the [**Wav2Arkit ONNX**](https://huggingface.co/myned-ai/wav2arkit_cpu) model on every audio chunk, generating 52 ARKit facial blendshapes at 30 FPS so a 3D avatar can lip-sync in real time on CPU.
+NyxClaw is a real-time WebSocket server that bridges our **Any Claw** companion mobile avatar app (based on [Myned](https://myned.ai)'s Nyx) and Claw-based AI backends ([OpenClaw](https://github.com/openclaw/openclaw), [ZeroClaw](https://github.com/zeroclaw-labs/zeroclaw)). It runs the [**Wav2Arkit ONNX**](https://huggingface.co/myned-ai/wav2arkit_cpu) model on every audio chunk, generating 52 ARKit facial blendshapes at 30 FPS for real-time lip-sync on CPU.
 
 Two voice pipelines are supported:
 
@@ -23,47 +23,36 @@ Both pipelines run Wav2Arkit on every audio chunk for facial animation.
 ### Docker (recommended)
 
 ```bash
-# 1. Clone and configure
 git clone https://github.com/myned-ai/nyxclaw.git
 cd nyxclaw
 cp .env.example .env
-# Edit .env with your settings (see Configuration below)
+# Edit .env with your backend settings (BASE_URL, AUTH_TOKEN — see Backend Setup below)
 
-# 2. Build and run (port 8081)
-# The Wav2Arkit model is downloaded automatically during the Docker build.
 docker compose up --build -d
-
-# 3. View logs
-docker compose logs -f
 ```
 
-To enable local voice (Piper TTS + faster-whisper) in Docker, set `INSTALL_LOCAL_VOICE=true` in `.env` before building.
-
-### Local Development
+On first boot, NyxClaw downloads models, provisions a Cloudflare Tunnel, and starts serving. Check the logs for your secure URL:
 
 ```bash
-# 1. Install uv
-curl -LsSf https://astral.sh/uv/install.sh | sh  # macOS/Linux
-# or: powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"  # Windows
-
-# 2. Clone and configure
-git clone https://github.com/myned-ai/nyxclaw.git
-cd nyxclaw
-cp .env.example .env
-
-# 3. Install dependencies
-uv sync                        # OpenAI voice mode
-# or: uv sync --extra local_voice  # local voice mode (Piper TTS + faster-whisper)
-
-# 4. Download models
-mkdir -p pretrained_models/wav2arkit
-uv run --with "huggingface_hub[cli]" huggingface-cli download myned-ai/wav2arkit_cpu --local-dir pretrained_models/wav2arkit
-
-# 5. Run
-uv run python src/main.py
+docker compose logs -f nyxclaw
+# Tunnel: wss://a3f7b2c1.nyxclaw.ai/ws
 ```
 
-Server starts at `http://localhost:8080`
+Your mobile app connects to that `wss://` URL — no port forwarding or TLS certs needed.
+
+To enable local voice (Piper TTS + faster-whisper), set `INSTALL_LOCAL_VOICE=true` in `.env` before building.
+
+### Install script (Linux / macOS / Windows)
+
+Installs NyxClaw + Cloudflare Tunnel as system services. Handles `uv`, `cloudflared`, model downloads, tunnel provisioning, and service registration (systemd / launchd / Windows service) automatically.
+
+```bash
+# Linux / macOS
+./install.sh
+
+# Windows (PowerShell as Administrator)
+.\install.ps1
+```
 
 ## Backend Setup
 
@@ -101,18 +90,43 @@ All settings are configured via environment variables or `.env` file. See [.env.
 
 > **One session at a time.** NyxClaw serves a single active connection — one avatar, one audio stream. You can pair multiple devices (phone, tablet, desktop) for convenience, but only one connects at a time. Treat the setup code like a password — anyone with it can pair a device and talk to your AI agent.
 
-## Rich Content
+## Claw Patches
 
-When the LLM's response includes content better seen than heard (URLs, tables, structured data), the avatar patch splits the response:
+Backend-specific patches that add the avatar endpoint with structured `{speech, content}` output. When the LLM's response includes content better seen than heard (URLs, tables, structured data), the patch splits the response:
 
 - **`speech`** → avatar speaks a short phrase ("Here's the Wikipedia page, take a look.")
 - **`content`** → forwarded as a `rich_content` message (markdown) to the client
 
-```json
-{"type": "rich_content", "content": "**Rome - Wikipedia**\nhttps://en.wikipedia.org/wiki/Rome"}
-```
+| Patch | Backend | Endpoint | Docs |
+|-------|---------|----------|------|
+| `claw_patches/openclaw/` | OpenClaw v2026.3.13 | `/v1/chat/completions/avatar` (HTTP SSE) | [README](claw_patches/openclaw/README.md) |
+| `claw_patches/zeroclaw/` | ZeroClaw v0.5.0 | `/ws/avatar` (WebSocket) | [README](claw_patches/zeroclaw/README.md) |
 
-This requires a patched backend (`USE_AVATAR_ENDPOINT=true`). Without the patch, all LLM output is treated as speech.
+Without the patch, all LLM output is treated as speech — no `rich_content` messages.
+
+## Bring Your Own Tunnel
+
+NyxClaw auto-provisions a free Cloudflare Tunnel on first boot (`wss://<id>.nyxclaw.ai`). This service has limited capacity. You can use any reverse proxy or tunneling solution instead — NyxClaw just needs something that terminates TLS and forwards traffic to `localhost:8080`:
+
+- **Cloudflare Tunnel** (your own account) — run `cloudflared tunnel` with your own token
+- **Tailscale** — encrypted mesh VPN, stable DNS, zero config
+- **nginx / Caddy** — traditional reverse proxy with Let's Encrypt
+- **ngrok** — quick dev tunnels
+
+Set `AUTH_SETUP_CODE_URL=wss://your-domain/ws` in `.env` so the QR code contains your custom URL.
+
+## Resource Requirements
+
+| Component | Memory | Mode |
+|-----------|--------|------|
+| Python + FastAPI + ONNX Runtime | ~500 MB | Both |
+| Wav2Arkit (blendshape inference) | ~200 MB | Both |
+| faster-whisper small.en (speech recognition) | ~500 MB | Local only |
+| Piper TTS VITS (speech synthesis) | ~100 MB | Local only |
+| Silero VAD (voice activity detection) | ~10 MB | Local only |
+
+**OpenAI Voice:** 1 GB RAM, 1 core minimum. Recommended 1.5 GB, 2 cores.
+**Local Voice:** 2 GB RAM, 2 cores minimum. Recommended 3–4 GB, 4 cores (STT, TTS, and blendshapes run concurrently during barge-in).
 
 ## WebSocket Protocol (`/ws`)
 
@@ -137,28 +151,6 @@ This requires a patched backend (`USE_AVATAR_ENDPOINT=true`). Without the patch,
 | `transcript_done` | Complete turn transcript |
 | `rich_content` | Markdown content for the chat view |
 | `avatar_state` | `"Listening"` or `"Responding"` |
-
-## Claw Patches
-
-Backend-specific patches that add the avatar endpoint with structured `{speech, content}` output:
-
-| Patch | Backend | Endpoint | Docs |
-|-------|---------|----------|------|
-| `claw_patches/openclaw/` | OpenClaw v2026.3.13 | `/v1/chat/completions/avatar` (HTTP SSE) | [README](claw_patches/openclaw/README.md) |
-| `claw_patches/zeroclaw/` | ZeroClaw v0.5.0 | `/ws/avatar` (WebSocket) | [README](claw_patches/zeroclaw/README.md) |
-
-
-## Resource Requirements
-
-| Component | Memory |
-|-----------|--------|
-| Wav2Arkit ONNX | ~200 MB |
-| ONNX Runtime | ~200 MB |
-| Python + FastAPI | ~300 MB |
-| faster-whisper small.en (local voice only) | ~500 MB |
-| Piper TTS (local voice only) | ~100 MB |
-
-**Minimum:** 2 GB RAM, 2 CPU cores. **Recommended:** 3–4 GB RAM, 4 cores.
 
 ## License
 

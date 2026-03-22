@@ -13,6 +13,7 @@ Or run directly:
     python main.py
 """
 
+import asyncio
 import warnings
 
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -143,21 +144,27 @@ async def lifespan(app: FastAPI):
     logger.info(f"Auth: {'Enabled' if settings.auth_enabled else 'Disabled'}")
     logger.info("=" * 60)
 
-    # Provision Cloudflare Tunnel (auto-generates device ID on first boot)
-    tunnel_config = await ensure_tunnel(
-        device_id_path=settings.device_id_path,
-        tunnel_config_path=settings.tunnel_config_path,
-        provisioning_api_url=settings.provisioning_api_url,
-    )
-    if tunnel_config:
-        # Override setup code URL with the tunnel hostname
-        if not settings.auth_setup_code_url:
-            settings.auth_setup_code_url = f"wss://{tunnel_config.hostname}/ws"
-        logger.info(f"Tunnel: wss://{tunnel_config.hostname}/ws")
-    else:
-        logger.warning("Tunnel: not available (local network only)")
+    # Provision Cloudflare Tunnel in background (DNS may not be ready at startup)
+    async def _provision_tunnel_background() -> None:
+        await asyncio.sleep(10)  # let Docker DNS settle
+        tunnel_config = await ensure_tunnel(
+            device_id_path=settings.device_id_path,
+            tunnel_config_path=settings.tunnel_config_path,
+            provisioning_api_url=settings.provisioning_api_url,
+        )
+        if tunnel_config:
+            if not settings.auth_setup_code_url:
+                settings.auth_setup_code_url = f"wss://{tunnel_config.hostname}/ws"
+            logger.info(f"Tunnel: wss://{tunnel_config.hostname}/ws")
+            # Regenerate setup code with the wss:// URL if auth is enabled
+            if settings.auth_enabled:
+                ensure_setup_code(get_auth_store())
+        else:
+            logger.warning("Tunnel: not available (local network only)")
 
-    # Generate and print setup code if auth is enabled
+    asyncio.create_task(_provision_tunnel_background())
+
+    # Generate and print setup code if auth is enabled (initial, may update after tunnel provisioning)
     if settings.auth_enabled:
         ensure_setup_code(get_auth_store())
 
