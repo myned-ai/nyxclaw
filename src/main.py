@@ -153,8 +153,7 @@ async def lifespan(app: FastAPI):
             provisioning_api_url=settings.provisioning_api_url,
         )
         if tunnel_config:
-            if not settings.auth_setup_code_url:
-                settings.auth_setup_code_url = f"wss://{tunnel_config.hostname}/ws"
+            settings.auth_setup_code_url = f"wss://{tunnel_config.hostname}/ws"
             logger.info(f"Tunnel: wss://{tunnel_config.hostname}/ws")
             # Regenerate setup code with the wss:// URL if auth is enabled
             if settings.auth_enabled:
