@@ -13,6 +13,11 @@ data/
 # Local dev scripts and tests
 scripts/
 tests/
+
+# Internal infrastructure (not shipped to users)
+provisioning-worker/
+docs/CLOUDFLARE_*.md
+docs/SECURITY_*.md
 *.eval
 
 # Scripts

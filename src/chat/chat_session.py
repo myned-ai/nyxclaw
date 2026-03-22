@@ -855,6 +855,10 @@ class ChatSession:
             if self.is_streaming_audio:
                 audio_b64 = data.get("data", "")
                 if audio_b64:
+                    # Reject oversized audio chunks (max ~750KB PCM = ~15s at 24kHz)
+                    if len(audio_b64) > 1_000_000:
+                        logger.warning(f"Session {self.session_id}: Audio chunk too large ({len(audio_b64)} bytes), dropping")
+                        return
                     audio_bytes = base64.b64decode(audio_b64)
 
                     # Debug: Save raw input audio

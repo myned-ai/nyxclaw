@@ -1,5 +1,6 @@
 import uuid
 
+import orjson
 from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect
 
 from auth.device_verifier import get_device_verifier
@@ -50,7 +51,16 @@ async def websocket_endpoint(
 
     try:
         while True:
-            data = await websocket.receive_json()
+            raw = await websocket.receive_text()
+            # Guard against oversized messages (1MB limit)
+            if len(raw) > 1_048_576:
+                logger.warning(f"Session {session_id}: Message too large ({len(raw)} bytes), dropping")
+                continue
+            try:
+                data = orjson.loads(raw)
+            except Exception:
+                logger.warning(f"Session {session_id}: Invalid JSON message, dropping")
+                continue
             await chat_connection_manager.handle_message(websocket, data)
     except WebSocketDisconnect:
         await chat_connection_manager.disconnect(websocket)
