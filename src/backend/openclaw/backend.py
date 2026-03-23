@@ -278,7 +278,7 @@ class OpenClawBackend(BaseAgent):
         on_interrupted: Callable[[], Awaitable[None]] | None = None,
         on_error: Callable[[Any], Awaitable[None]] | None = None,
         on_cancel_sync: Callable[[], None] | None = None,
-        on_tool_call: Callable[[str, dict], Awaitable[None]] | None = None,
+        on_tool_call: Callable[[str, dict, str | None], Awaitable[None]] | None = None,
     ) -> None:
         self._on_audio_delta = on_audio_delta
         self._on_transcript_delta = on_transcript_delta
@@ -954,7 +954,7 @@ class OpenClawBackend(BaseAgent):
                 rc_content = data.get("content", "")
                 if rc_content and self._on_tool_call:
                     logger.info(f"Rich content received ({len(rc_content)} chars)")
-                    await self._on_tool_call("rich_content", {"content": rc_content})
+                    await self._on_tool_call("rich_content", {"content": rc_content}, item_id)
 
             elif current_event == "tool_call":
                 tool_name = data.get("name", "unknown")
@@ -966,6 +966,7 @@ class OpenClawBackend(BaseAgent):
                             "name": tool_name,
                             "tool_call_id": data.get("tool_call_id"),
                         },
+                        item_id,
                     )
 
             elif current_event == "tool_result":
@@ -981,6 +982,7 @@ class OpenClawBackend(BaseAgent):
                             "success": success,
                             "duration_ms": duration_ms,
                         },
+                        item_id,
                     )
 
             elif current_event == "done":

@@ -156,7 +156,7 @@ class OpenAIRealtimeBackend(BaseAgent):
         on_interrupted: Callable[[], Awaitable[None]] | None = None,
         on_error: Callable[[Any], Awaitable[None]] | None = None,
         on_cancel_sync: Callable[[], None] | None = None,
-        on_tool_call: (Callable[[str, dict], Awaitable[None]] | None) = None,
+        on_tool_call: (Callable[[str, dict, str | None], Awaitable[None]] | None) = None,
     ) -> None:
         self._on_audio_delta = on_audio_delta
         self._on_transcript_delta = on_transcript_delta
@@ -610,7 +610,7 @@ class OpenAIRealtimeBackend(BaseAgent):
                     rc_content = data.get("content", "")
                     if rc_content and self._on_tool_call:
                         logger.info(f"Rich content received ({len(rc_content)} chars)")
-                        await self._on_tool_call("rich_content", {"content": rc_content})
+                        await self._on_tool_call("rich_content", {"content": rc_content}, self._state.item_id)
 
                 elif current_event == "tool_call":
                     tool_name = data.get("name", "unknown")
@@ -619,6 +619,7 @@ class OpenAIRealtimeBackend(BaseAgent):
                         await self._on_tool_call(
                             "tool_call",
                             {"name": tool_name, "tool_call_id": data.get("tool_call_id")},
+                            self._state.item_id,
                         )
 
                 elif current_event == "tool_result":
@@ -630,6 +631,7 @@ class OpenAIRealtimeBackend(BaseAgent):
                         await self._on_tool_call(
                             "tool_result",
                             {"name": tool_name, "success": success, "duration_ms": duration_ms},
+                            self._state.item_id,
                         )
 
                 elif current_event == "done":
@@ -717,7 +719,7 @@ class OpenAIRealtimeBackend(BaseAgent):
                     rc_content = str(message.get("content", ""))
                     if rc_content:
                         logger.info(f"Rich content received ({len(rc_content)} chars)")
-                        await self._on_tool_call("rich_content", {"content": rc_content})
+                        await self._on_tool_call("rich_content", {"content": rc_content}, self._state.item_id)
                 continue
 
             if msg_type == "tool_call":
@@ -767,6 +769,7 @@ class OpenAIRealtimeBackend(BaseAgent):
 
         # ── Signal response start ───────────────────────────────────
         self._state.session_id = session_id
+        self._state.item_id = item_id
         self._state.is_responding = True
         self._state.transcript_buffer = ""
         self._state.audio_done = False

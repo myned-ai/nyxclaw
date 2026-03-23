@@ -93,7 +93,7 @@ Your responses are consumed by a voice + avatar system. Every response you gener
 ### `content` — what appears in the chat (rich content)
 - Put URLs, links, tables, code snippets, structured data, and detailed information here.
 - Use markdown formatting — the app renders it.
-- Set to empty string `""` when there's nothing visual to show.
+- Set to empty string `""` when there's nothing visual to show — including error messages, apologies, explanations, and status updates. Only use `content` for URLs, tables, code, or structured data.
 - If you browsed a URL the user asked for, put the URL here.
 - If you compared items, put a markdown table here.
 - If you found search results, put the links here.
@@ -120,6 +120,7 @@ User asks to compare things:
 - Never narrate table data in speech
 - Never leave speech empty — always say something
 - Never put raw JSON or code in speech
+- Never put error messages or apologies in content — those belong in speech only
 ```
 
 ## Performance Tuning

@@ -26,6 +26,7 @@ class ConversationState:
     """State tracking for an active conversation."""
 
     session_id: str | None = None
+    item_id: str | None = None
     is_responding: bool = False
     transcript_buffer: str = ""
     audio_done: bool = False  # Track if response audio is complete
@@ -87,7 +88,7 @@ class BaseAgent(ABC):
         on_interrupted: Callable[[], Awaitable[None]] | None = None,
         on_error: Callable[[Any], Awaitable[None]] | None = None,
         on_cancel_sync: Callable[[], None] | None = None,
-        on_tool_call: Callable[[str, dict], Awaitable[None]] | None = None,
+        on_tool_call: Callable[[str, dict, str | None], Awaitable[None]] | None = None,
     ) -> None:
         """
         Set event handler callbacks.
@@ -100,7 +101,7 @@ class BaseAgent(ABC):
             on_user_transcript: Called with transcribed user speech
             on_interrupted: Called when user interrupts
             on_error: Called on errors
-            on_tool_call: Called when agent triggers a client action (name, arguments)
+            on_tool_call: Called when agent triggers a client action (name, arguments, item_id)
         """
         pass
 

@@ -14,6 +14,27 @@ from services import Wav2ArkitService, create_agent_instance
 
 logger = get_logger(__name__)
 
+# Patterns that indicate content worth showing in the chat UI.
+# Plain text explanations / apologies from the LLM should stay in speech only.
+import re
+
+_RICH_PATTERNS = re.compile(
+    r"https?://"        # URLs
+    r"|^\|.+\|$"        # Markdown table rows
+    r"|^```"            # Code blocks
+    r"|^#{1,6}\s"       # Markdown headers
+    r"|!\[.*\]\(.*\)"   # Images
+    r"|^\d+\.\s\*\*"    # Numbered bold lists (e.g. "1. **Title**")
+    r"|^\*\*[^*]+\*\*"  # Bold text at start of line
+    r"|\[.*\]\(.*\)",   # Markdown links
+    re.MULTILINE,
+)
+
+
+def _has_rich_elements(content: str) -> bool:
+    """Return True if content has URLs, tables, code, or markdown formatting."""
+    return bool(_RICH_PATTERNS.search(content))
+
 
 class ChatSession:
     """
@@ -205,22 +226,26 @@ class ChatSession:
             else:
                 logger.error(f"Error sending to client {self.session_id}: {e}")
 
-    async def _handle_tool_call(self, name: str, arguments: dict) -> None:
+    async def _handle_tool_call(self, name: str, arguments: dict, item_id: str | None = None) -> None:
         """Handle an agent event — forward rich content or tool calls to client."""
 
         # Rich content from avatar channel (structured output: {speech, content})
         if name == "rich_content":
             content = arguments.get("content", "")
-            if content:
+            if content and _has_rich_elements(content):
                 logger.info(f"Session {self.session_id}: Forwarding rich content ({len(content)} chars)")
                 msg: dict = {
                     "type": "rich_content",
                     "content": content,
                     "timestamp": int(time.time() * 1000),
                 }
-                if self.current_turn_id:
+                if item_id:
+                    msg["previousItemId"] = item_id
+                elif self.current_turn_id:
                     msg["previousItemId"] = self.current_turn_id
                 await self.send_json(msg)
+            elif content:
+                logger.info(f"Session {self.session_id}: Skipped plain-text rich content ({len(content)} chars)")
             return
 
         # Other tool calls — log but don't forward to client

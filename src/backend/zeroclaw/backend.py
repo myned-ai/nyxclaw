@@ -261,7 +261,7 @@ class ZeroClawBackend(BaseAgent):
         on_interrupted: Callable[[], Awaitable[None]] | None = None,
         on_error: Callable[[Any], Awaitable[None]] | None = None,
         on_cancel_sync: Callable[[], None] | None = None,
-        on_tool_call: Callable[[str, dict], Awaitable[None]] | None = None,
+        on_tool_call: Callable[[str, dict, str | None], Awaitable[None]] | None = None,
     ) -> None:
         self._on_audio_delta = on_audio_delta
         self._on_transcript_delta = on_transcript_delta
@@ -778,7 +778,7 @@ class ZeroClawBackend(BaseAgent):
                         rc_content = str(message.get("content", ""))
                         if rc_content:
                             logger.info(f"Rich content received ({len(rc_content)} chars)")
-                            await self._on_tool_call("rich_content", {"content": rc_content})
+                            await self._on_tool_call("rich_content", {"content": rc_content}, item_id)
                     continue
 
                 if message_type == "tool_call":
@@ -788,7 +788,7 @@ class ZeroClawBackend(BaseAgent):
                     # Rich-content tools bypass TTS — forward directly to client
                     if tool_name == "send_rich_content" and self._on_tool_call:
                         logger.info(f"Rich content tool call: {tool_name}")
-                        await self._on_tool_call(tool_name, tool_args)
+                        await self._on_tool_call(tool_name, tool_args, item_id)
                         continue
 
                     # All other tools: speak a filler phrase while they execute
