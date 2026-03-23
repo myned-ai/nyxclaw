@@ -28,7 +28,9 @@ import orjson
 
 from core.logger import get_logger
 from core.settings import get_settings
-from ..base_agent import BaseAgent, ConversationState
+import random
+
+from ..base_agent import TOOL_FILLERS, BaseAgent, ConversationState
 from .settings import get_openclaw_settings
 
 logger = get_logger(__name__)
@@ -901,6 +903,7 @@ class OpenClawBackend(BaseAgent):
         - ``event: done`` — final response with full_response text
         """
         current_event: str | None = None
+        spoke_filler = False
 
         async for line in response.aiter_lines():
             if self._response_cancelled:
@@ -958,7 +961,24 @@ class OpenClawBackend(BaseAgent):
 
             elif current_event == "tool_call":
                 tool_name = data.get("name", "unknown")
-                logger.info(f"Tool call: {tool_name}")
+
+                # Speak a filler phrase on the first tool call so the avatar
+                # isn't silent during execution.  Only one filler per turn.
+                if not spoke_filler and not self._response_cancelled:
+                    spoke_filler = True
+                    filler = random.choice(TOOL_FILLERS)
+                    logger.info(f"Tool call: {tool_name} — filler: {filler!r}")
+                    if self._tts_available:
+                        sanitized = self._sanitize_for_tts(filler)
+                        if sanitized:
+                            if turn_metrics["tts_first_sentence_at"] is None:
+                                turn_metrics["tts_first_sentence_at"] = time.perf_counter()
+                            await tts_queue.put((filler, sanitized))
+                    elif self._on_transcript_delta:
+                        await self._on_transcript_delta(filler, "assistant", item_id, None)
+                else:
+                    logger.info(f"Tool call: {tool_name}")
+
                 if self._on_tool_call:
                     await self._on_tool_call(
                         "tool_call",

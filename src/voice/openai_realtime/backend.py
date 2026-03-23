@@ -546,7 +546,10 @@ class OpenAIRealtimeBackend(BaseAgent):
                 if content and not self._response_cancelled:
                     yield content
 
-    async def _iter_tokens_avatar_sse(self) -> AsyncGenerator[str, None]:
+    async def _iter_tokens_avatar_sse(
+        self,
+        tts_queue: asyncio.Queue[tuple[str, str, bool] | None] | None = None,
+    ) -> AsyncGenerator[str, None]:
         """Yield speech text from OpenClaw avatar SSE endpoint.
 
         Uses /v1/chat/completions/avatar which returns custom SSE event types:
@@ -554,6 +557,9 @@ class OpenAIRealtimeBackend(BaseAgent):
 
         Speech chunks are already sentence-split by the server, so we yield
         them directly for TTS without buffering.
+
+        When *tts_queue* is provided, filler phrases for tool calls are pushed
+        directly onto the TTS queue so the avatar speaks while tools execute.
         """
         if not self._http_client:
             return
@@ -569,6 +575,8 @@ class OpenAIRealtimeBackend(BaseAgent):
 
         endpoint = rt.avatar_endpoint
         current_event: str | None = None
+        spoke_filler = False
+        has_content = False
 
         async with self._http_client.stream("POST", endpoint, json=payload) as response:
             if response.status_code != 200:
@@ -604,6 +612,7 @@ class OpenAIRealtimeBackend(BaseAgent):
                 if current_event == "speech_chunk":
                     content = data.get("content", "")
                     if content and not self._response_cancelled:
+                        has_content = True
                         yield content
 
                 elif current_event == "rich_content":
@@ -614,7 +623,22 @@ class OpenAIRealtimeBackend(BaseAgent):
 
                 elif current_event == "tool_call":
                     tool_name = data.get("name", "unknown")
-                    logger.info(f"Tool call: {tool_name}")
+
+                    # Speak a filler phrase on the first tool call so the avatar
+                    # isn't silent during execution.  Only one filler per turn.
+                    if not spoke_filler and not self._response_cancelled:
+                        spoke_filler = True
+                        filler = random.choice(TOOL_FILLERS)
+                        logger.info(f"Tool call: {tool_name} — filler: {filler!r}")
+                        if tts_queue is not None:
+                            sanitized = self._sanitize_for_tts(filler)
+                            if sanitized:
+                                await tts_queue.put((filler, sanitized, True))
+                        elif not self._response_cancelled:
+                            yield filler
+                    else:
+                        logger.info(f"Tool call: {tool_name}")
+
                     if self._on_tool_call:
                         await self._on_tool_call(
                             "tool_call",
@@ -726,8 +750,9 @@ class OpenAIRealtimeBackend(BaseAgent):
                 tool_name = message.get("name", "unknown")
                 tool_args = message.get("args", {})
 
-                # All tools: speak a filler phrase while they execute
-                if not spoke_filler and not has_content and not self._response_cancelled:
+                # Speak a filler phrase on the first tool call so the avatar
+                # isn't silent during execution.  Only one filler per turn.
+                if not spoke_filler and not self._response_cancelled:
                     spoke_filler = True
                     filler = random.choice(TOOL_FILLERS)
                     logger.info(f"Tool call: {tool_name} — filler: {filler!r}")
@@ -791,7 +816,7 @@ class OpenAIRealtimeBackend(BaseAgent):
             if agent_type == "zeroclaw":
                 token_stream = self._iter_tokens_ws(tts_queue=tts_queue)
             elif use_avatar:
-                token_stream = self._iter_tokens_avatar_sse()
+                token_stream = self._iter_tokens_avatar_sse(tts_queue=tts_queue)
             else:
                 token_stream = self._iter_tokens_sse()
 

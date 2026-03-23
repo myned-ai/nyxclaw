@@ -791,8 +791,9 @@ class ZeroClawBackend(BaseAgent):
                         await self._on_tool_call(tool_name, tool_args, item_id)
                         continue
 
-                    # All other tools: speak a filler phrase while they execute
-                    if not spoke_filler and not full_response and not self._response_cancelled:
+                    # Speak a filler phrase on the first tool call so the avatar
+                    # isn't silent during execution.  Only one filler per turn.
+                    if not spoke_filler and not self._response_cancelled:
                         spoke_filler = True
                         filler = random.choice(TOOL_FILLERS)
                         logger.info(f"Tool call: {tool_name} — filler: {filler!r}")
