@@ -30,7 +30,7 @@ from auth.setup_code_service import ensure_setup_code
 from auth.store import get_auth_store
 from routers import chat_router
 from services import get_wav2arkit_service
-from services.tunnel_service import ensure_tunnel
+from services.tunnel_service import ensure_tunnel, load_or_generate_device_id
 
 logger = get_logger(__name__)
 
@@ -143,6 +143,23 @@ async def lifespan(app: FastAPI):
     logger.info(f"Debug: {settings.debug}")
     logger.info(f"Auth: {'Enabled' if settings.auth_enabled else 'Disabled'}")
     logger.info("=" * 60)
+
+    # Load device ID and use as default user_id for backend session continuity
+    device_id = load_or_generate_device_id(settings.device_id_path)
+    if settings.agent_type == "openclaw":
+        from backend.openclaw.settings import get_openclaw_settings
+
+        oc = get_openclaw_settings()
+        if not oc.user_id:
+            oc.user_id = device_id
+            logger.info(f"User ID (from device): {device_id}")
+    elif settings.agent_type == "zeroclaw":
+        from backend.zeroclaw.settings import get_zeroclaw_settings
+
+        zc = get_zeroclaw_settings()
+        if not zc.user_id:
+            zc.user_id = device_id
+            logger.info(f"User ID (from device): {device_id}")
 
     # Provision Cloudflare Tunnel in background (DNS may not be ready at startup)
     async def _provision_tunnel_background() -> None:

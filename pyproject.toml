@@ -126,3 +126,8 @@ not-iterable = "ignore"                # websockets async iteration
 possibly-missing-attribute = "ignore"  # Optional types with None checks
 not-subscriptable = "ignore"           # ONNX tensor subscripting
 invalid-parameter-default = "ignore"   # Optional params with None defaults
+
+# ==================== Pytest Configuration ====================
+[tool.pytest.ini_options]
+asyncio_mode = "strict"
+pythonpath = ["src"]

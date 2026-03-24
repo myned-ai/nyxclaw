@@ -11,6 +11,7 @@ from fastapi import WebSocket
 from core.logger import get_logger
 from core.settings import Settings
 from services import Wav2ArkitService, create_agent_instance
+from services.conversation_store import get_conversation_store
 
 logger = get_logger(__name__)
 
@@ -244,6 +245,8 @@ class ChatSession:
                 elif self.current_turn_id:
                     msg["previousItemId"] = self.current_turn_id
                 await self.send_json(msg)
+                # Persist rich content attached to the last assistant message
+                await asyncio.to_thread(get_conversation_store().append, "assistant", "", rich_content=content, item_id=item_id)
             elif content:
                 logger.info(f"Session {self.session_id}: Skipped plain-text rich content ({len(content)} chars)")
             return
@@ -474,6 +477,8 @@ class ChatSession:
             if item_id:
                 msg["itemId"] = item_id
             await self.send_json(msg)
+            # Persist to conversation log
+            await asyncio.to_thread(get_conversation_store().append, "assistant", transcript, item_id=item_id)
         else:
             logger.warning(f"Session {self.session_id}: transcript_done SKIPPED — empty transcript")
 
@@ -582,6 +587,8 @@ class ChatSession:
                 "timestamp": int(time.time() * 1000),
             }
         )
+        # Persist to conversation log
+        await asyncio.to_thread(get_conversation_store().append, "user", transcript)
 
     async def _calculate_truncated_text(self) -> str:
         """Helper to calculate truncated text based on audio duration."""

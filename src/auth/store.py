@@ -76,6 +76,10 @@ class AuthStore:
                 return False
             return record.token_hash == hash_token(token)
 
+    def list_device_ids(self) -> list[str]:
+        with self._lock:
+            return list(self._device_tokens.keys())
+
     # ── Bootstrap token operations ────────────────────────────────────
 
     def get_bootstrap(self) -> BootstrapRecord | None:

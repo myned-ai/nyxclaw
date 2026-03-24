@@ -518,9 +518,14 @@ class ZeroClawBackend(BaseAgent):
         path = f"{parsed.path.rstrip('/')}/ws/avatar" if parsed.path else "/ws/avatar"
         query = parsed.query
 
+        params: dict[str, str] = {}
         if zc.auth_token:
-            token_query = urlencode({"token": zc.auth_token})
-            query = f"{query}&{token_query}" if query else token_query
+            params["token"] = zc.auth_token
+        if zc.user_id:
+            params["user_id"] = zc.user_id
+        if params:
+            extra_query = urlencode(params)
+            query = f"{query}&{extra_query}" if query else extra_query
 
         return urlunparse((ws_scheme, parsed.netloc, path, "", query, ""))
 
