@@ -43,18 +43,42 @@ class ConversationStore:
         rich_content: str | None = None,
         item_id: str | None = None,
     ) -> None:
-        """Append a conversation entry."""
-        entry = {
-            "ts": time.time(),
-            "role": role,
-            "text": text,
-        }
-        if rich_content:
-            entry["rich_content"] = rich_content
-        if item_id:
-            entry["item_id"] = item_id
+        """Append a conversation entry.
 
+        If an assistant transcript arrives after a rich_content entry with the
+        same item_id, the text is merged into the existing entry so the JSONL
+        keeps them in natural order (text first, rich_content attached).
+        """
         with self._write_lock:
+            # Try to merge assistant text into a preceding rich_content-only entry
+            if role == "assistant" and text and item_id and self._path.exists():
+                try:
+                    lines = self._path.read_text().splitlines()
+                    if lines:
+                        last = json.loads(lines[-1])
+                        if (
+                            last.get("item_id") == item_id
+                            and last.get("role") == "assistant"
+                            and not last.get("text")
+                            and last.get("rich_content")
+                        ):
+                            last["text"] = text
+                            lines[-1] = json.dumps(last, ensure_ascii=False)
+                            self._path.write_text("\n".join(lines) + "\n")
+                            return
+                except (json.JSONDecodeError, OSError):
+                    pass  # fall through to normal append
+
+            entry: dict = {
+                "ts": time.time(),
+                "role": role,
+                "text": text,
+            }
+            if rich_content:
+                entry["rich_content"] = rich_content
+            if item_id:
+                entry["item_id"] = item_id
+
             with open(self._path, "a") as f:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 

@@ -827,7 +827,7 @@ class ZeroClawBackend(BaseAgent):
                     if turn_metrics["oc_first_token_at"] is None:
                         turn_metrics["oc_first_token_at"] = time.perf_counter()
 
-                    full_response += content
+                    full_response += (" " if full_response else "") + content
                     self._state.transcript_buffer = full_response
 
                     # When TTS is active, transcript deltas are emitted by the

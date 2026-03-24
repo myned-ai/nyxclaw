@@ -20,6 +20,7 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 from contextlib import asynccontextmanager
 
+import httpx
 import uvicorn
 from fastapi import FastAPI, Response, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -119,6 +120,64 @@ async def _preload_local_voice_stack(agent_type: str) -> None:
                 logger.warning(f"Startup preload: TTS warm failed (ZeroClaw): {exc}")
 
 
+async def _warmup_openai_connections() -> None:
+    """Warm OpenAI API connections (DNS + TLS) for TTS and Realtime."""
+    try:
+        from voice.openai_realtime.settings import get_openai_realtime_settings
+
+        rt = get_openai_realtime_settings()
+        if not rt.openai_api_key:
+            logger.debug("Skipping OpenAI warmup: no API key configured")
+            return
+
+        from openai import AsyncOpenAI
+
+        client = AsyncOpenAI(api_key=rt.openai_api_key)
+        try:
+            async with client.audio.speech.with_streaming_response.create(
+                model=rt.openai_tts_model,
+                voice=rt.openai_voice,
+                input=".",
+                response_format="pcm",
+            ) as response:
+                async for _ in response.iter_bytes():
+                    break  # consume just enough to complete the handshake
+            logger.info("Startup warmup: OpenAI TTS connection ready")
+        except Exception as exc:
+            logger.warning(f"Startup warmup: OpenAI TTS probe failed: {exc}")
+        finally:
+            await client.close()
+    except Exception as exc:
+        logger.warning(f"Startup warmup: OpenAI warmup failed: {exc}")
+
+
+async def _warmup_backend_connection(agent_type: str) -> None:
+    """Probe the LLM backend to warm DNS + TCP."""
+    try:
+        if agent_type == "openclaw":
+            from backend.openclaw.settings import get_openclaw_settings
+
+            oc = get_openclaw_settings()
+            if not oc.auth_token:
+                return
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                await client.get(f"{oc.base_url.rstrip('/')}/health")
+            logger.info("Startup warmup: OpenClaw backend reachable")
+
+        elif agent_type == "zeroclaw":
+            from backend.zeroclaw.settings import get_zeroclaw_settings
+
+            zc = get_zeroclaw_settings()
+            base = zc.base_url.rstrip("/")
+            probe_url = base.replace("ws://", "http://").replace("wss://", "https://")
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                await client.get(f"{probe_url}/health")
+            logger.info("Startup warmup: ZeroClaw backend reachable")
+
+    except Exception as exc:
+        logger.warning(f"Startup warmup: {agent_type} backend probe failed: {exc}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
@@ -190,6 +249,18 @@ async def lifespan(app: FastAPI):
     # Warm local ONNX STT/TTS resources once at startup to reduce first-turn latency
     if settings.voice_mode == "local":
         await _preload_local_voice_stack(settings.agent_type)
+
+    # Background warmup: external connections (DNS + TLS) for OpenAI and backend
+    async def _background_warmup() -> None:
+        tasks: list[asyncio.Task] = []
+        if settings.voice_mode == "openai":
+            tasks.append(asyncio.create_task(_warmup_openai_connections()))
+        tasks.append(asyncio.create_task(_warmup_backend_connection(settings.agent_type)))
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        logger.info("Background warmup complete")
+
+    asyncio.create_task(_background_warmup())
 
     yield
 

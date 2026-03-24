@@ -38,7 +38,7 @@ def _verify_bearer(
 
 @chat_router.get("/conversations")
 async def get_conversations(
-    limit: int = 50,
+    limit: int = 20,
     before: float | None = None,
     settings: Settings = Depends(get_settings),
     auth_store: AuthStore = Depends(get_auth_store),
