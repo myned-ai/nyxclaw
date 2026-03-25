@@ -518,6 +518,11 @@ class ChatSession:
             if actual_audio_ms > self.virtual_cursor_text_ms:
                 self.virtual_cursor_text_ms = actual_audio_ms
 
+            # Ensure sentence-level chunks get a space separator so
+            # the subtitle display doesn't glue sentences together.
+            if self.current_turn_text and not text.startswith((" ", "\n")):
+                text = " " + text
+
             words = text.split()
             if len(words) > 2:
                 leading_ws = text[: len(text) - len(text.lstrip())]

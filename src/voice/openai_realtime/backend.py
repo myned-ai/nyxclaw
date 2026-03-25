@@ -399,9 +399,11 @@ class OpenAIRealtimeBackend(BaseAgent):
 
         if event_type == "conversation.item.input_audio_transcription.completed":
             transcript = event.transcript.strip() if event.transcript else ""
-            if transcript:
+            if transcript and not self._is_prompt_hallucination(transcript):
                 logger.info(f"User said: {transcript!r}")
                 await self._on_transcript_ready(transcript)
+            elif transcript:
+                logger.debug(f"Filtered prompt hallucination: {transcript!r}")
 
         elif event_type == "input_audio_buffer.speech_started":
             if self._state.is_responding:
@@ -413,6 +415,29 @@ class OpenAIRealtimeBackend(BaseAgent):
             logger.error(f"OpenAI Realtime error: {error_msg}")
             if self._on_error:
                 await self._on_error({"error": error_msg})
+
+    def _is_prompt_hallucination(self, transcript: str) -> bool:
+        """Check if transcript is just hallucinated prompt words (no real speech).
+
+        gpt-4o-transcribe can echo vocabulary hint words on silence/breathing.
+        Filter transcripts that contain ONLY prompt words with no other content.
+        """
+        prompt = self._rt.openai_transcription_prompt
+        if not prompt:
+            return False
+
+        # Build set of prompt words (case-insensitive)
+        prompt_words = {w.strip().lower() for w in prompt.replace(",", " ").split() if w.strip()}
+        if not prompt_words:
+            return False
+
+        # Strip punctuation from transcript and check if all words are prompt words
+        transcript_words = {
+            w.strip(".,!?;:\"'()-").lower()
+            for w in transcript.split()
+            if w.strip(".,!?;:\"'()-")
+        }
+        return len(transcript_words) > 0 and transcript_words.issubset(prompt_words)
 
     async def _on_transcript_ready(self, transcript: str) -> None:
         """User finished speaking — send transcript to LLM."""
@@ -825,16 +850,20 @@ class OpenAIRealtimeBackend(BaseAgent):
                 if self._response_cancelled:
                     break
 
-                # Avatar SSE yields pre-split sentences — enqueue directly
-                if use_avatar:
+                # Avatar SSE / ZeroClaw WS yield pre-split sentences — add space separator
+                # Standard SSE yields raw tokens that already include whitespace
+                is_sentence_level = use_avatar or agent_type == "zeroclaw"
+                if is_sentence_level:
                     full_response += (" " if full_response else "") + content
-                    self._state.transcript_buffer = full_response
+                else:
+                    full_response += content
+                self._state.transcript_buffer = full_response
+
+                if use_avatar:
                     sanitized = self._sanitize_for_tts(content)
                     if sanitized:
                         await tts_queue.put((content, sanitized, False))
                 else:
-                    full_response += content
-                    self._state.transcript_buffer = full_response
                     sentence_buffer += content
                     sentences, sentence_buffer = self._extract_sentences(sentence_buffer)
                     for sent in sentences:
