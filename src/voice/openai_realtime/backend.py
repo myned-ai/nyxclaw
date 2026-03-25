@@ -365,6 +365,7 @@ class OpenAIRealtimeBackend(BaseAgent):
                                 "transcription": {
                                     "model": self._rt.openai_transcription_model,
                                     "language": self._rt.openai_transcription_language,
+                                    **({"prompt": self._rt.openai_transcription_prompt} if self._rt.openai_transcription_prompt else {}),
                                 },
                                 "turn_detection": {
                                     "type": self._rt.openai_vad_type,

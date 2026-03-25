@@ -31,6 +31,7 @@ class OpenAIRealtimeSettings(BaseSettings):
     openai_vad_type: str = "semantic_vad"  # "semantic_vad" or "server_vad"
     openai_transcription_model: str = "gpt-4o-transcribe"
     openai_transcription_language: str = "en"
+    openai_transcription_prompt: str = ""  # Vocabulary hint for transcription (e.g. "Nyx, NyxClaw, ZeroClaw")
 
     # ── TTS API ────────────────────────────────────────────────────
     openai_tts_model: str = "tts-1"
