@@ -23,10 +23,7 @@ _RICH_PATTERNS = re.compile(
     r"https?://"        # URLs
     r"|^\|.+\|$"        # Markdown table rows
     r"|^```"            # Code blocks
-    r"|^#{1,6}\s"       # Markdown headers
     r"|!\[.*\]\(.*\)"   # Images
-    r"|^\d+\.\s\*\*"    # Numbered bold lists (e.g. "1. **Title**")
-    r"|^\*\*[^*]+\*\*"  # Bold text at start of line
     r"|\[.*\]\(.*\)",   # Markdown links
     re.MULTILINE,
 )
@@ -333,7 +330,12 @@ class ChatSession:
         # slightly after the initial inference_task completed or before
         # _handle_response_start had a chance to create it.
         if self.inference_task is None or self.inference_task.done():
-            logger.info(f"Session {self.session_id}: inference_task gone — restarting workers")
+            elapsed_since_start = time.time() - self.actual_audio_start_time if self.actual_audio_start_time > 0 else 0
+            logger.debug(
+                f"Session {self.session_id}: inference_task gone — restarting workers "
+                f"(elapsed={elapsed_since_start:.1f}s, frames_emitted={self.total_frames_emitted}, "
+                f"audio_recv={self.total_audio_received:.2f}s, speech_ended={self.speech_ended})"
+            )
             self.speech_ended = False
             self.inference_task = asyncio.create_task(self._inference_worker())
         if self.frame_emit_task is None or self.frame_emit_task.done():
@@ -736,6 +738,7 @@ class ChatSession:
         try:
             logger.info(f"Session {self.session_id}: Inference worker started")
             loop = asyncio.get_running_loop()
+            inference_chunks_processed = 0
 
             while True:
                 if self.is_interrupted or self._cancel_playback:
@@ -749,6 +752,10 @@ class ChatSession:
                     )
                 except asyncio.TimeoutError:
                     if self.speech_ended and self.audio_chunk_queue.empty():
+                        logger.debug(
+                            f"Session {self.session_id}: Inference worker exiting "
+                            f"(speech_ended=True, chunks_processed={inference_chunks_processed})"
+                        )
                         break
                     continue
 
@@ -775,16 +782,23 @@ class ChatSession:
                     await asyncio.sleep(0.01)
                     continue
 
+                inference_chunks_processed += 1
                 if frames:
                     for frame in frames:
                         if self.is_interrupted or self._cancel_playback:
                             break
                         await self.frame_queue.put(frame)
+                    if inference_chunks_processed % 5 == 0:
+                        logger.debug(
+                            f"Session {self.session_id}: Inference chunk #{inference_chunks_processed} "
+                            f"→ {len(frames)} frames, frame_queue={self.frame_queue.qsize()}, "
+                            f"audio_chunk_queue={self.audio_chunk_queue.qsize()}"
+                        )
                 else:
                     logger.warning("Inference returned no frames")
 
         except asyncio.CancelledError:
-            pass
+            logger.info(f"Session {self.session_id}: Inference worker cancelled (chunks_processed={inference_chunks_processed})")
         except Exception as e:
             logger.error(f"Session {self.session_id} inference worker fatal error: {e}", exc_info=True)
 
@@ -796,19 +810,13 @@ class ChatSession:
                     await asyncio.sleep(0.01)
                     continue
 
-                # Pacing logic: reference actual_audio_start_time (when first TTS byte
-                # arrived) so frames are sent at real-time rate from audio start.
-                # Using speech_start_time (LLM start) causes a burst because by the
-                # time inference completes, 1–2 s of "credit" has accumulated, sending
-                # all frames at once and flooding the client buffer.
-                # +15 frames (~500ms) gives the client enough headroom for smooth
-                # playback while capping the pre-buffered audio so interruption is
-                # responsive (client discards ≤500ms on interrupt, not 1–2s).
-                if self.actual_audio_start_time > 0:
-                    elapsed_time = time.time() - self.actual_audio_start_time
-                    target_frames = int(elapsed_time * self.settings.blendshape_fps) + 15
-                else:
-                    target_frames = 0
+                # Pacing logic: pace frame emission based on cumulative audio
+                # duration received, not wall-clock time.  Wall-clock pacing
+                # causes frame bursts after silence gaps (fillers, tool calls)
+                # because elapsed time keeps growing while no audio flows.
+                # Audio-clock naturally pauses during gaps and resumes smoothly.
+                # +15 frames (~500ms) lookahead for client-side buffering.
+                target_frames = int(self.total_audio_received * self.settings.blendshape_fps) + 15
 
                 if self.total_frames_emitted >= target_frames:
                     await asyncio.sleep(0.005)
@@ -822,6 +830,11 @@ class ChatSession:
                 except asyncio.TimeoutError:
                     inference_done = self.inference_task is None or self.inference_task.done()
                     if self.speech_ended and self.frame_queue.empty() and inference_done:
+                        logger.debug(
+                            f"Session {self.session_id}: _emit_frames exiting "
+                            f"(frames_emitted={self.total_frames_emitted}, "
+                            f"speech_ended={self.speech_ended}, inference_done={inference_done})"
+                        )
                         break
                     continue
 
@@ -832,8 +845,12 @@ class ChatSession:
                 if self.blendshape_frame_idx % 30 == 0:
                     audio_b64 = frame_data.get("audio", "")
                     audio_size = len(audio_b64)
+                    elapsed = time.time() - self.actual_audio_start_time if self.actual_audio_start_time > 0 else 0
                     logger.debug(
-                        f"Session {self.session_id}: Sending sync_frame {self.blendshape_frame_idx} (Active). Audio payload: {audio_size} chars"
+                        f"Session {self.session_id}: sync_frame #{self.blendshape_frame_idx} "
+                        f"(elapsed={elapsed:.1f}s, target={target_frames}, emitted={self.total_frames_emitted}, "
+                        f"audio_recv={self.total_audio_received:.2f}s, frame_q={self.frame_queue.qsize()}, "
+                        f"audio={audio_size}ch)"
                     )
 
                 await self.send_json(

@@ -30,6 +30,8 @@ _SENTENCE_BOUNDARY = re.compile(r"(?<=[.!?])\s+|\n+")
 # TTS first-chunk when no sentence boundary has appeared yet.
 _CLAUSE_BOUNDARY = re.compile(r"(?<=[,;:\u2014])\s+")
 
+_EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b")
+_URL_RE = re.compile(r"https?://\S+")
 _UNSUPPORTED_TTS_CHARS = re.compile(
     r"["
     r"\U0001F1E6-\U0001F1FF"
@@ -479,7 +481,9 @@ class ZeroClawBackend(BaseAgent):
             turn_metrics["tts_done_at"] = time.perf_counter()
 
     def _sanitize_for_tts(self, text: str) -> str:
-        cleaned = _UNSUPPORTED_TTS_CHARS.sub("", text)
+        cleaned = _EMAIL_RE.sub("", text)
+        cleaned = _URL_RE.sub("", cleaned)
+        cleaned = _UNSUPPORTED_TTS_CHARS.sub("", cleaned)
         return " ".join(cleaned.split())
 
     def _extract_sentences(self, buffer: str, first_chunk: bool = False) -> tuple[list[str], str]:

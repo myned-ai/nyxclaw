@@ -28,9 +28,7 @@ import orjson
 
 from core.logger import get_logger
 from core.settings import get_settings
-import random
-
-from ..base_agent import TOOL_FILLERS, BaseAgent, ConversationState
+from ..base_agent import BaseAgent, ConversationState
 from .settings import get_openclaw_settings
 
 logger = get_logger(__name__)
@@ -41,6 +39,8 @@ _SENTENCE_BOUNDARY = re.compile(r"(?<=[.!?])\s+|\n+")
 # Clause-level split (comma, semicolon, colon, dash) — used for faster
 # TTS first-chunk when no sentence boundary has appeared yet.
 _CLAUSE_BOUNDARY = re.compile(r"(?<=[,;:\u2014])\s+")
+_EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b")
+_URL_RE = re.compile(r"https?://\S+")
 _UNSUPPORTED_TTS_CHARS = re.compile(
     r"["
     r"\U0001F1E6-\U0001F1FF"
@@ -903,7 +903,6 @@ class OpenClawBackend(BaseAgent):
         - ``event: done`` — final response with full_response text
         """
         current_event: str | None = None
-        spoke_filler = False
 
         async for line in response.aiter_lines():
             if self._response_cancelled:
@@ -961,23 +960,7 @@ class OpenClawBackend(BaseAgent):
 
             elif current_event == "tool_call":
                 tool_name = data.get("name", "unknown")
-
-                # Speak a filler phrase on the first tool call so the avatar
-                # isn't silent during execution.  Only one filler per turn.
-                if not spoke_filler and not self._response_cancelled:
-                    spoke_filler = True
-                    filler = random.choice(TOOL_FILLERS)
-                    logger.info(f"Tool call: {tool_name} — filler: {filler!r}")
-                    if self._tts_available:
-                        sanitized = self._sanitize_for_tts(filler)
-                        if sanitized:
-                            if turn_metrics["tts_first_sentence_at"] is None:
-                                turn_metrics["tts_first_sentence_at"] = time.perf_counter()
-                            await tts_queue.put((filler, sanitized))
-                    elif self._on_transcript_delta:
-                        await self._on_transcript_delta(filler, "assistant", item_id, None)
-                else:
-                    logger.info(f"Tool call: {tool_name}")
+                logger.info(f"Tool call: {tool_name}")
 
                 if self._on_tool_call:
                     await self._on_tool_call(
@@ -1078,7 +1061,9 @@ class OpenClawBackend(BaseAgent):
     # ================================================================
 
     def _sanitize_for_tts(self, text: str) -> str:
-        cleaned = _UNSUPPORTED_TTS_CHARS.sub("", text)
+        cleaned = _EMAIL_RE.sub("", text)
+        cleaned = _URL_RE.sub("", cleaned)
+        cleaned = _UNSUPPORTED_TTS_CHARS.sub("", cleaned)
         return " ".join(cleaned.split())
 
     def _extract_sentences(self, buffer: str) -> tuple[list[str], str]:

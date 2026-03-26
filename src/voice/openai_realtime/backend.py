@@ -16,7 +16,6 @@ Pipeline: Client audio → OpenAI Realtime (VAD+STT) → transcript
 import asyncio
 import base64
 import json
-import random
 import re
 import time
 from collections.abc import AsyncGenerator, Awaitable, Callable
@@ -27,7 +26,7 @@ import httpx
 import orjson
 import websockets
 
-from backend.base_agent import TOOL_FILLERS, BaseAgent, ConversationState
+from backend.base_agent import BaseAgent, ConversationState
 from core.logger import get_logger
 from core.settings import get_settings
 
@@ -37,6 +36,8 @@ logger = get_logger(__name__)
 
 _SENTENCE_BOUNDARY = re.compile(r"(?<=[.!?])\s+|\n+")
 _CLAUSE_BOUNDARY = re.compile(r"(?<=[,;:\u2014])\s+")
+_EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b")
+_URL_RE = re.compile(r"https?://\S+")
 _UNSUPPORTED_TTS_CHARS = re.compile(
     r"["
     r"\U0001F1E6-\U0001F1FF"
@@ -407,8 +408,15 @@ class OpenAIRealtimeBackend(BaseAgent):
 
         elif event_type == "input_audio_buffer.speech_started":
             if self._state.is_responding:
-                logger.info("Barge-in: user speech detected during response")
+                total_audio_ms = int(getattr(self, '_total_audio_sent', 0) * 1000)
+                logger.warning(
+                    f"Barge-in: speech_started while responding "
+                    f"(audio_sent={total_audio_ms}ms, "
+                    f"responding_for={int((time.perf_counter() - self._state.response_start_time) * 1000) if hasattr(self._state, 'response_start_time') else '?'}ms)"
+                )
                 self.cancel_response()
+            else:
+                logger.debug("speech_started while idle (no-op)")
 
         elif event_type == "error":
             error_msg = str(event.error) if hasattr(event, "error") else str(event)
@@ -441,6 +449,8 @@ class OpenAIRealtimeBackend(BaseAgent):
 
     async def _on_transcript_ready(self, transcript: str) -> None:
         """User finished speaking — send transcript to LLM."""
+        self._turn_t0 = time.perf_counter()
+        logger.debug(f"[TIMELINE] T+0ms: transcript_ready {transcript!r}")
         if self._state.is_responding:
             self.cancel_response()
 
@@ -601,7 +611,6 @@ class OpenAIRealtimeBackend(BaseAgent):
 
         endpoint = rt.avatar_endpoint
         current_event: str | None = None
-        spoke_filler = False
         has_content = False
 
         async with self._http_client.stream("POST", endpoint, json=payload) as response:
@@ -649,21 +658,7 @@ class OpenAIRealtimeBackend(BaseAgent):
 
                 elif current_event == "tool_call":
                     tool_name = data.get("name", "unknown")
-
-                    # Speak a filler phrase on the first tool call so the avatar
-                    # isn't silent during execution.  Only one filler per turn.
-                    if not spoke_filler and not self._response_cancelled:
-                        spoke_filler = True
-                        filler = random.choice(TOOL_FILLERS)
-                        logger.info(f"Tool call: {tool_name} — filler: {filler!r}")
-                        if tts_queue is not None:
-                            sanitized = self._sanitize_for_tts(filler)
-                            if sanitized:
-                                await tts_queue.put((filler, sanitized, True))
-                        elif not self._response_cancelled:
-                            yield filler
-                    else:
-                        logger.info(f"Tool call: {tool_name}")
+                    logger.info(f"Tool call: {tool_name}")
 
                     if self._on_tool_call:
                         await self._on_tool_call(
@@ -712,10 +707,12 @@ class OpenAIRealtimeBackend(BaseAgent):
             return
 
         websocket = await self._ensure_zc_ws()
+        t0 = getattr(self, '_turn_t0', time.perf_counter())
+        logger.debug(f"[TIMELINE] T+{(time.perf_counter()-t0)*1000:.0f}ms: ZeroClaw WS send")
         await websocket.send(json.dumps({"type": "message", "content": user_content}))
 
         has_content = False
-        spoke_filler = False
+        first_event_logged = False
 
         while True:
             if self._response_cancelled:
@@ -757,6 +754,10 @@ class OpenAIRealtimeBackend(BaseAgent):
 
             msg_type = message.get("type")
 
+            if not first_event_logged:
+                first_event_logged = True
+                logger.debug(f"[TIMELINE] T+{(time.perf_counter()-t0)*1000:.0f}ms: ZeroClaw first event ({msg_type})")
+
             if msg_type == "error":
                 error_msg = message.get("message", "Unknown ZeroClaw error")
                 if self._on_error:
@@ -776,23 +777,13 @@ class OpenAIRealtimeBackend(BaseAgent):
                 tool_name = message.get("name", "unknown")
                 tool_args = message.get("args", {})
 
-                # Speak a filler phrase on the first tool call so the avatar
-                # isn't silent during execution.  Only one filler per turn.
-                if not spoke_filler and not self._response_cancelled:
-                    spoke_filler = True
-                    filler = random.choice(TOOL_FILLERS)
-                    logger.info(f"Tool call: {tool_name} — filler: {filler!r}")
-                    if tts_queue is not None:
-                        sanitized = self._sanitize_for_tts(filler)
-                        if sanitized:
-                            await tts_queue.put((filler, sanitized, True))
-                else:
-                    logger.info(f"Tool call: {tool_name}")
-
+                logger.info(f"Tool call: {tool_name}")
                 continue
 
             if msg_type == "speech_chunk":
                 content = str(message.get("content", ""))
+                if content and not has_content:
+                    logger.debug(f"[TIMELINE] T+{(time.perf_counter()-t0)*1000:.0f}ms: first speech_chunk ({len(content)} chars)")
                 if content:
                     has_content = True
                     yield content
@@ -822,6 +813,8 @@ class OpenAIRealtimeBackend(BaseAgent):
         self._state.session_id = session_id
         self._state.item_id = item_id
         self._state.is_responding = True
+        self._state.response_start_time = time.perf_counter()
+        self._total_audio_sent = 0.0
         self._state.transcript_buffer = ""
         self._state.audio_done = False
 
@@ -1001,14 +994,12 @@ class OpenAIRealtimeBackend(BaseAgent):
                 if not is_filler and self._on_transcript_delta and not self._response_cancelled:
                     await self._on_transcript_delta(original, "assistant", item_id, None)
 
-                logger.debug(f"TTS synthesizing: {sanitized!r}")
+                t0 = getattr(self, '_turn_t0', time.perf_counter())
+                tts_start = time.perf_counter()
+                logger.debug(f"[TIMELINE] T+{(tts_start-t0)*1000:.0f}ms: TTS request ({sanitized[:40]!r})")
+                tts_first_chunk = False
 
                 try:
-                    # Re-chunk OpenAI's variable-size HTTP streaming chunks
-                    # into fixed ~100ms (4800 bytes) pieces to match Piper TTS
-                    # delivery cadence.  Without this, OpenAI sends large
-                    # bursty chunks (8-16KB) that cause wav2arkit frame bursts
-                    # and blendshape/audio desync.
                     delivery_bytes = 24000 // 10 * 2  # 4800 bytes = 100ms @ 24kHz PCM16
                     rechunk_buf = bytearray()
 
@@ -1022,12 +1013,16 @@ class OpenAIRealtimeBackend(BaseAgent):
                         async for chunk in response.iter_bytes():
                             if self._response_cancelled:
                                 break
+                            if not tts_first_chunk:
+                                tts_first_chunk = True
+                                logger.debug(f"[TIMELINE] T+{(time.perf_counter()-t0)*1000:.0f}ms: TTS first audio chunk (TTS TTFT={(time.perf_counter()-tts_start)*1000:.0f}ms)")
                             rechunk_buf.extend(chunk)
                             while len(rechunk_buf) >= delivery_bytes:
                                 if self._response_cancelled:
                                     break
                                 if self._on_audio_delta:
                                     await self._on_audio_delta(bytes(rechunk_buf[:delivery_bytes]))
+                                    self._total_audio_sent += delivery_bytes / (24000 * 2)
                                 del rechunk_buf[:delivery_bytes]
 
                     # Flush any remaining audio in the re-chunk buffer
@@ -1051,7 +1046,9 @@ class OpenAIRealtimeBackend(BaseAgent):
     # ================================================================
 
     def _sanitize_for_tts(self, text: str) -> str:
-        cleaned = _UNSUPPORTED_TTS_CHARS.sub("", text)
+        cleaned = _EMAIL_RE.sub("", text)
+        cleaned = _URL_RE.sub("", cleaned)
+        cleaned = _UNSUPPORTED_TTS_CHARS.sub("", cleaned)
         return " ".join(cleaned.split())
 
     def _extract_sentences(self, buffer: str) -> tuple[list[str], str]:
