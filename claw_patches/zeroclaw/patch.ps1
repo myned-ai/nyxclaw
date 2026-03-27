@@ -6,7 +6,7 @@
     installation. Creates backups of modified files.
 
     What it does:
-      1. Replaces: traits.rs, openai.rs, agent.rs (patched copies)
+      1. Replaces: traits.rs, openai.rs, agent.rs, prompt.rs (patched copies)
       2. Adds: nyxclaw.rs (new avatar channel)
       3. Injects: response_format: None into loop_.rs, anthropic.rs,
          reliable.rs (6 locations)
@@ -94,6 +94,7 @@ Write-Host ""
 Patch-File -SrcRelativePath "src/providers/traits.rs" -DestRelativePath "src/providers/traits.rs"
 Patch-File -SrcRelativePath "src/providers/openai.rs" -DestRelativePath "src/providers/openai.rs"
 Patch-File -SrcRelativePath "src/agent/agent.rs" -DestRelativePath "src/agent/agent.rs"
+Patch-File -SrcRelativePath "src/agent/prompt.rs" -DestRelativePath "src/agent/prompt.rs"
 Patch-File -SrcRelativePath "src/channels/nyxclaw.rs" -DestRelativePath "src/channels/nyxclaw.rs"
 
 Write-Host ""

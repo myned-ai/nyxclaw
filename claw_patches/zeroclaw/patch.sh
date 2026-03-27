@@ -9,7 +9,7 @@
 #   ./patch.sh /path/to/zeroclaw-v0.5.0
 #
 # What it does:
-#   1. Replaces: traits.rs, openai.rs, agent.rs (patched copies)
+#   1. Replaces: traits.rs, openai.rs, agent.rs, prompt.rs (patched copies)
 #   2. Adds: nyxclaw.rs (new avatar channel)
 #   3. Injects: response_format: None into loop_.rs, anthropic.rs,
 #      reliable.rs (6 locations)
@@ -96,6 +96,7 @@ echo ""
 patch_file "src/providers/traits.rs" "src/providers/traits.rs"
 patch_file "src/providers/openai.rs" "src/providers/openai.rs"
 patch_file "src/agent/agent.rs" "src/agent/agent.rs"
+patch_file "src/agent/prompt.rs" "src/agent/prompt.rs"
 patch_file "src/channels/nyxclaw.rs" "src/channels/nyxclaw.rs"
 
 echo ""

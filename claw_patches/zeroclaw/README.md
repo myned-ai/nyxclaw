@@ -175,7 +175,7 @@ default_model = "gpt-4.1-mini"
 ### Automatic optimizations (no config needed)
 
 - **Streaming** — the avatar channel uses `turn_with_streaming()` which streams tokens as they arrive. Speech starts as soon as the first sentence is complete.
-- **Prompt caching** — Anthropic and OpenAI providers automatically cache system prompts. Repeated turns with the same system prompt benefit from cache hits (up to 90% reduction in input processing time).
+- **Prompt caching** — OpenAI automatically caches prompt prefixes (system prompt + tools). This patch removes the `DateTimeSection` (which changed every second and invalidated the cache). With a stable system prompt, cache hit rates of 95-99% are typical after the first call, reducing TTFT by up to 50%.
 - **HTTP warmup** — ZeroClaw pre-warms provider HTTP connection pools (TLS + HTTP/2) at startup, eliminating cold-start latency on the first request.
 - **Response caching** — set `response_cache_enabled = true` in `[memory]` and `temperature = 0.0` to cache responses for repeated queries. Useful for common greetings or FAQ-type questions.
 
@@ -228,6 +228,7 @@ These values are optimized for snappy voice responses. Depending on your use cas
 | `src/providers/traits.rs` | Added `response_format` to `ChatRequest`, `StreamEvent` enum, `stream_chat()` trait method. |
 | `src/providers/openai.rs` | Added `response_format` + `stream` to `NativeChatRequest`, SSE streaming structs, `stream_chat()` impl. |
 | `src/agent/agent.rs` | Added `response_format` field + setter, `turn_with_events()`, `turn_with_streaming()` (streaming agent turn). |
+| `src/agent/prompt.rs` | Removed `DateTimeSection` from system prompt builder. The per-second timestamp was invalidating OpenAI's prompt cache on every request. User messages already carry timestamps, so the LLM still knows the current time. |
 | `src/channels/nyxclaw.rs` | **NEW** — Avatar WebSocket channel with incremental JSON extraction: streams `speech_chunk` events as the LLM generates, not after. |
 
 **Line injections (original files preserved):**

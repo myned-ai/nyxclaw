@@ -183,6 +183,9 @@ class ChatSession:
         if not self.agent.is_connected:
             await self.agent.connect()
 
+        # Warmup: greet the user and prime the LLM prompt cache
+        self.agent.send_text_message("Hi")
+
     async def stop(self) -> None:
         """Cleanup resources."""
         self.is_active = False
