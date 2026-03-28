@@ -1003,12 +1003,17 @@ class OpenAIRealtimeBackend(BaseAgent):
                     delivery_bytes = 24000 // 10 * 2  # 4800 bytes = 100ms @ 24kHz PCM16
                     rechunk_buf = bytearray()
 
+                    tts_kwargs: dict[str, Any] = {
+                        "model": self._rt.openai_tts_model,
+                        "voice": self._rt.openai_voice,
+                        "input": sanitized,
+                        "response_format": "pcm",
+                        "speed": self._rt.openai_tts_speed,
+                    }
+                    if self._rt.openai_tts_instructions:
+                        tts_kwargs["instructions"] = self._rt.openai_tts_instructions
                     async with self._openai.audio.speech.with_streaming_response.create(
-                        model=self._rt.openai_tts_model,
-                        voice=self._rt.openai_voice,
-                        input=sanitized,
-                        response_format="pcm",
-                        speed=self._rt.openai_tts_speed,
+                        **tts_kwargs,
                     ) as response:
                         async for chunk in response.iter_bytes():
                             if self._response_cancelled:

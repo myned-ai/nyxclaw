@@ -37,6 +37,7 @@ class OpenAIRealtimeSettings(BaseSettings):
     openai_tts_model: str = "tts-1"
     openai_voice: str = "alloy"
     openai_tts_speed: float = 1.0  # 0.25 to 4.0
+    openai_tts_instructions: str = ""  # gpt-4o-mini-tts only: voice style instructions
 
     # ── LLM Backend (OpenClaw HTTP SSE / ZeroClaw WebSocket) ───────
     base_url: str = "http://127.0.0.1:19001"

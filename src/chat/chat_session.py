@@ -183,7 +183,9 @@ class ChatSession:
         if not self.agent.is_connected:
             await self.agent.connect()
 
-        # Warmup: greet the user and prime the LLM prompt cache
+        # Warmup: greet the user and prime the LLM prompt cache.
+        # Brief delay so the avatar doesn't speak before the UI is ready.
+        await asyncio.sleep(0.5)
         self.agent.send_text_message("Hi")
 
     async def stop(self) -> None:
