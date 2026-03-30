@@ -255,7 +255,8 @@ async fn handle_avatar_socket(socket: WebSocket, state: AppState, session_id: Op
                         let user_msg = crate::providers::ChatMessage::user(&content);
                         let _ = backend.append(&session_key, &user_msg);
                     }
-                    process_avatar_message(&state, &mut agent, &mut sender, &content, &session_key)
+                    let token = tokio_util::sync::CancellationToken::new();
+                    process_avatar_message(&state, &mut agent, &mut sender, &content, &session_key, token)
                         .await;
                 }
             }
@@ -293,14 +294,68 @@ async fn handle_avatar_socket(socket: WebSocket, state: AppState, session_id: Op
                     let _ = backend.append(&session_key, &user_msg);
                 }
 
-                process_avatar_message(&state, &mut agent, &mut sender, &content, &session_key)
-                    .await;
+                // Run the turn with a cancellation token. Use select! to read
+                // incoming messages concurrently — a new "message" or "cancel"
+                // cancels the running turn so the user isn't stuck waiting.
+                let cancel_token = tokio_util::sync::CancellationToken::new();
+
+                let queued_message = {
+                    let turn_fut = process_avatar_message(
+                        &state, &mut agent, &mut sender, &content, &session_key,
+                        cancel_token.clone(),
+                    );
+                    tokio::pin!(turn_fut);
+
+                    let mut queued: Option<String> = None;
+
+                    loop {
+                        tokio::select! {
+                            () = &mut turn_fut => {
+                                break;
+                            }
+                            incoming = receiver.next() => {
+                                match incoming {
+                                    Some(Ok(Message::Text(text))) => {
+                                        if let Ok(p) = serde_json::from_str::<serde_json::Value>(&text) {
+                                            let t = p["type"].as_str().unwrap_or("");
+                                            if t == "cancel" {
+                                                debug!("Cancel received during turn — cancelling agent");
+                                                cancel_token.cancel();
+                                            } else if t == "message" {
+                                                let new_content = p["content"].as_str().unwrap_or("").to_string();
+                                                if !new_content.is_empty() {
+                                                    debug!("New message during turn — cancelling and queuing");
+                                                    cancel_token.cancel();
+                                                    queued = Some(new_content);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                    queued
+                }; // turn_fut dropped here — releases agent + sender borrows
+
+                // If a new message was queued during cancellation, process it
+                if let Some(new_content) = queued_message {
+                    if let Some(ref backend) = state.session_backend {
+                        let user_msg = crate::providers::ChatMessage::user(&new_content);
+                        let _ = backend.append(&session_key, &user_msg);
+                    }
+                    let new_token = tokio_util::sync::CancellationToken::new();
+                    process_avatar_message(
+                        &state, &mut agent, &mut sender, &new_content, &session_key,
+                        new_token,
+                    ).await;
+                }
             }
             "cancel" => {
-                // Cancel is a no-op at the connection level; actual cancellation
-                // would need a CancellationToken threaded through turn_with_events.
-                // For now we acknowledge the intent.
-                debug!("Avatar client requested cancel");
+                // Cancel outside of a turn — no-op
+                debug!("Avatar client requested cancel (no turn active)");
             }
             _ => continue,
         }
@@ -529,6 +584,34 @@ impl AvatarJsonExtractor {
     }
 }
 
+/// Generate a spoken filler phrase based on tool name and arguments.
+fn tool_call_filler(obj: &serde_json::Map<String, serde_json::Value>) -> &'static str {
+    let name = obj.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    let args_str = obj
+        .get("args")
+        .map(|v| v.to_string().to_lowercase())
+        .unwrap_or_default();
+
+    match name {
+        n if n.starts_with("composio") || n.contains("composio") => {
+            if args_str.contains("calendar") || args_str.contains("schedule") || args_str.contains("event") {
+                "I'm checking your calendar."
+            } else if args_str.contains("email") || args_str.contains("gmail") || args_str.contains("mail") {
+                "I'm going through your emails."
+            } else {
+                "I'm working on that."
+            }
+        }
+        "web_search" | "search" => "I'm searching the web.",
+        "web_fetch" | "fetch" | "browse" => "I'm pulling up that page.",
+        "shell" | "bash" | "exec" => "I'm running that now.",
+        "file_read" | "read" => "I'm reading that.",
+        "file_write" | "write" => "I'm writing that down.",
+        "memory_recall" | "recall" => "I'm thinking back.",
+        _ => "Still working on it.",
+    }
+}
+
 /// Route a single streaming event from the agent turn to the WebSocket client.
 ///
 /// Handles `tool_call`/`tool_result` (forwarded), `content_delta` (fed into
@@ -544,7 +627,20 @@ async fn dispatch_stream_event(
     let Some(t) = obj.get("type").and_then(|v| v.as_str()) else { return };
 
     match t {
-        "tool_call" | "tool_result" => {
+        "tool_call" => {
+            // Emit a spoken filler so the avatar speaks during tool execution.
+            // Throttle is handled by nyxclaw (2s gap between fillers).
+            let filler = tool_call_filler(obj);
+            let chunk = serde_json::json!({
+                "type": "speech_chunk",
+                "content": filler,
+                "filler": true,
+            });
+            let _ = sender.send(Message::Text(chunk.to_string().into())).await;
+            // Forward the raw tool_call event
+            let _ = sender.send(Message::Text(event.to_string().into())).await;
+        }
+        "tool_result" => {
             let _ = sender.send(Message::Text(event.to_string().into())).await;
         }
         "content_delta" => {
@@ -591,6 +687,7 @@ async fn process_avatar_message(
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
     content: &str,
     session_key: &str,
+    cancel_token: tokio_util::sync::CancellationToken,
 ) {
     let provider_label = state
         .config
@@ -598,6 +695,9 @@ async fn process_avatar_message(
         .default_provider
         .clone()
         .unwrap_or_else(|| "unknown".to_string());
+
+    let turn_start = std::time::Instant::now();
+    tracing::info!("[TIMELINE] T+0ms: avatar message received ({} chars)", content.len());
 
     // Broadcast agent_start event
     let _ = state.event_tx.send(serde_json::json!({
@@ -613,21 +713,38 @@ async fn process_avatar_message(
     // Incremental JSON extractor and sentence buffer
     let mut extractor = AvatarJsonExtractor::new();
     let mut sentence_buf = String::new();
+    let mut first_event_logged = false;
+    let mut first_speech_logged = false;
 
     // Run turn_with_streaming and event forwarding concurrently via select loop.
     let turn_handle = {
         let final_response: Option<Result<String, anyhow::Error>>;
 
-        let turn_fut = agent.turn_with_streaming(content, event_tx);
+        let turn_fut = agent.turn_with_streaming(content, event_tx, Some(cancel_token.clone()));
         tokio::pin!(turn_fut);
 
         loop {
             tokio::select! {
                 result = &mut turn_fut => {
+                    tracing::info!("[TIMELINE] T+{}ms: turn_with_streaming finished", turn_start.elapsed().as_millis());
                     final_response = Some(result);
                     break;
                 }
                 Some(event) = event_rx.recv() => {
+                    if !first_event_logged {
+                        first_event_logged = true;
+                        let etype = event.get("type").and_then(|v| v.as_str()).unwrap_or("?");
+                        tracing::info!("[TIMELINE] T+{}ms: first agent event ({})", turn_start.elapsed().as_millis(), etype);
+                    }
+                    // Log first speech_chunk specifically
+                    if !first_speech_logged {
+                        if let Some(t) = event.get("type").and_then(|v| v.as_str()) {
+                            if t == "content_delta" || t == "speech_chunk" {
+                                first_speech_logged = true;
+                                tracing::info!("[TIMELINE] T+{}ms: first content/speech from LLM", turn_start.elapsed().as_millis());
+                            }
+                        }
+                    }
                     dispatch_stream_event(
                         &event, &mut extractor, &mut sentence_buf, sender,
                     ).await;
@@ -723,19 +840,30 @@ async fn process_avatar_message(
             }));
         }
         Err(e) => {
-            let sanitized = crate::providers::sanitize_api_error(&e.to_string());
-            let err = serde_json::json!({
-                "type": "error",
-                "message": sanitized,
-            });
-            let _ = sender.send(Message::Text(err.to_string().into())).await;
+            if crate::agent::loop_::is_tool_loop_cancelled(&e) {
+                tracing::info!("[TIMELINE] T+{}ms: turn cancelled by user", turn_start.elapsed().as_millis());
+                // Send done with empty response — the next turn will handle the user's message
+                let done = serde_json::json!({
+                    "type": "done",
+                    "full_response": "",
+                    "cancelled": true,
+                });
+                let _ = sender.send(Message::Text(done.to_string().into())).await;
+            } else {
+                let sanitized = crate::providers::sanitize_api_error(&e.to_string());
+                let err = serde_json::json!({
+                    "type": "error",
+                    "message": sanitized,
+                });
+                let _ = sender.send(Message::Text(err.to_string().into())).await;
 
-            // Broadcast error event
-            let _ = state.event_tx.send(serde_json::json!({
-                "type": "error",
-                "component": "ws_avatar",
-                "message": sanitized,
-            }));
+                // Broadcast error event
+                let _ = state.event_tx.send(serde_json::json!({
+                    "type": "error",
+                    "component": "ws_avatar",
+                    "message": sanitized,
+                }));
+            }
         }
     }
 }

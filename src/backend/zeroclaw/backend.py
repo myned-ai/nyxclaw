@@ -7,7 +7,6 @@ the same local STT/TTS flow used by the OpenClaw sample agent.
 
 import asyncio
 import json
-import random
 import re
 import time
 from collections.abc import Awaitable, Callable
@@ -20,7 +19,7 @@ import websockets
 from core.logger import get_logger
 from core.settings import get_settings
 
-from ..base_agent import TOOL_FILLERS, BaseAgent, ConversationState
+from ..base_agent import BaseAgent, ConversationState
 from .settings import get_zeroclaw_settings
 
 logger = get_logger(__name__)
@@ -96,6 +95,8 @@ class ZeroClawBackend(BaseAgent):
         self._zc_ws: websockets.WebSocketClientProtocol | None = None
         self._zc_ws_clean: bool = True
 
+        self._last_filler_at: float = 0.0
+        self._filler_history: dict[str, float] = {}
         self._metric_input_source: str = "unknown"
         self._metric_input_finalized_at: float | None = None
         self._metric_stt_first_audio_sent_at: float | None = None
@@ -109,6 +110,18 @@ class ZeroClawBackend(BaseAgent):
         self._metric_tts_done_at: float | None = None
         self._metric_tts_chunks_emitted: int = 0
         self._metric_tts_bytes_emitted: int = 0
+
+    def _should_speak_filler(self, content: str) -> bool:
+        """Consolidated filler throttle: 2s between any filler, 5s between same-content."""
+        now = time.perf_counter()
+        if (now - self._last_filler_at) < 2.0:
+            return False
+        last_same = self._filler_history.get(content, 0.0)
+        if (now - last_same) < 5.0:
+            return False
+        self._last_filler_at = now
+        self._filler_history[content] = now
+        return True
 
     def _append_message(self, role: str, content: str) -> None:
         self._messages.append({"role": role, "content": content})
@@ -697,13 +710,13 @@ class ZeroClawBackend(BaseAgent):
         self._state.audio_done = False
         self._bargein_speech_frames = 0
         self._bargein_grace_until = time.perf_counter() + 0.5
+        self._filler_history.clear()
 
         if self._on_response_start:
             await self._on_response_start(session_id)
 
         full_response = ""
         sentence_buffer = ""
-        spoke_filler = False
         tts_queue: asyncio.Queue[tuple[str, str, bool] | None] = asyncio.Queue()
         tts_task: asyncio.Task[None] | None = None
 
@@ -798,59 +811,54 @@ class ZeroClawBackend(BaseAgent):
                     if tool_name == "send_rich_content" and self._on_tool_call:
                         logger.info(f"Rich content tool call: {tool_name}")
                         await self._on_tool_call(tool_name, tool_args, item_id)
-                        continue
-
-                    # Speak a filler phrase on the first tool call so the avatar
-                    # isn't silent during execution.  Only one filler per turn.
-                    if not spoke_filler and not self._response_cancelled:
-                        spoke_filler = True
-                        filler = random.choice(TOOL_FILLERS)
-                        logger.info(f"Tool call: {tool_name} — filler: {filler!r}")
-                        if self._tts_available:
-                            sanitized = self._sanitize_for_tts(filler)
-                            if sanitized:
-                                if turn_metrics["tts_first_sentence_at"] is None:
-                                    turn_metrics["tts_first_sentence_at"] = time.perf_counter()
-                                await tts_queue.put((filler, sanitized, True))
-                        elif self._on_transcript_delta:
-                            await self._on_transcript_delta(filler, "assistant", item_id, None)
+                    else:
+                        logger.info(f"Tool call: {tool_name}")
                     continue
 
                 if message_type == "speech_chunk":
                     content = str(message.get("content", ""))
+                    is_filler = bool(message.get("filler", False))
                 elif message_type == "done":
                     done_text = str(message.get("full_response", ""))
                     if done_text and not full_response:
                         content = done_text
                     else:
                         content = ""
+                    is_filler = False
                 else:
                     continue
 
                 if content and not self._response_cancelled:
-                    if turn_metrics["oc_first_token_at"] is None:
-                        turn_metrics["oc_first_token_at"] = time.perf_counter()
+                    if is_filler:
+                        # Filler: TTS only, don't add to transcript or history.
+                        if self._tts_available and self._should_speak_filler(content):
+                            sanitized = self._sanitize_for_tts(content)
+                            if sanitized:
+                                await tts_queue.put((content, sanitized, True))
+                    else:
+                        if turn_metrics["oc_first_token_at"] is None:
+                            turn_metrics["oc_first_token_at"] = time.perf_counter()
 
-                    full_response += (" " if full_response else "") + content
-                    self._state.transcript_buffer = full_response
+                        full_response += (" " if full_response else "") + content
+                        self._state.transcript_buffer = full_response
 
-                    # When TTS is active, transcript deltas are emitted by the
-                    # TTS worker in sync with audio.  Only emit from LLM stream
-                    # when TTS is unavailable (text-only mode).
-                    if not self._tts_available and self._on_transcript_delta and not self._response_cancelled:
-                        await self._on_transcript_delta(content, "assistant", item_id, None)
+                        # When TTS is active, transcript deltas are emitted by the
+                        # TTS worker in sync with audio.  Only emit from LLM stream
+                        # when TTS is unavailable (text-only mode).
+                        if not self._tts_available and self._on_transcript_delta and not self._response_cancelled:
+                            await self._on_transcript_delta(content, "assistant", item_id, None)
 
-                    if self._tts_available:
-                        sentence_buffer += content
-                        is_first = turn_metrics["tts_first_sentence_at"] is None
-                        sentences, sentence_buffer = self._extract_sentences(sentence_buffer, first_chunk=is_first)
-                        for sent in sentences:
-                            sanitized = self._sanitize_for_tts(sent)
-                            if not sanitized:
-                                continue
-                            if turn_metrics["tts_first_sentence_at"] is None:
-                                turn_metrics["tts_first_sentence_at"] = time.perf_counter()
-                            await tts_queue.put((sent, sanitized, False))
+                        if self._tts_available:
+                            sentence_buffer += content
+                            is_first = turn_metrics["tts_first_sentence_at"] is None
+                            sentences, sentence_buffer = self._extract_sentences(sentence_buffer, first_chunk=is_first)
+                            for sent in sentences:
+                                sanitized = self._sanitize_for_tts(sent)
+                                if not sanitized:
+                                    continue
+                                if turn_metrics["tts_first_sentence_at"] is None:
+                                    turn_metrics["tts_first_sentence_at"] = time.perf_counter()
+                                await tts_queue.put((sent, sanitized, False))
 
                 if message_type == "done":
                     break

@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import collections
 import concurrent.futures
 import time
 from pathlib import Path
@@ -18,6 +19,11 @@ logger = get_logger(__name__)
 # Patterns that indicate content worth showing in the chat UI.
 # Plain text explanations / apologies from the LLM should stay in speech only.
 import re
+
+# Baseline text speed for transcript offset estimation (~14 chars/sec).
+# Used only for startOffset/endOffset hints to the client's subtitle controller;
+# actual transcript delivery is gated by the frame delivery clock.
+_TRANSCRIPT_CHARS_PER_SEC = 14.0
 
 _RICH_PATTERNS = re.compile(
     r"https?://"        # URLs
@@ -83,7 +89,7 @@ class ChatSession:
 
         # Audio and frame processing state
         self.audio_buffer: bytearray = bytearray()
-        self.frame_queue: asyncio.Queue = asyncio.Queue(maxsize=120)
+        self.frame_queue: asyncio.Queue = asyncio.Queue(maxsize=450)
         self.audio_chunk_queue: asyncio.Queue = asyncio.Queue(maxsize=15)
 
         # Tracking state
@@ -107,14 +113,13 @@ class ChatSession:
         # Track accumulated text for accurate interruption cutting
         self.current_turn_text: str = ""
 
-        # Where we are in the text stream (time-wise)
-        self.virtual_cursor_text_ms = 0.0
-
-        # Calibration constant for transcript timing (configurable via settings)
-        self.chars_per_second = self.agent.transcript_speed
-        logger.info(
-            f"Session {self.session_id}: Using agent-specific transcript speed: {self.chars_per_second} chars/sec"
+        # Pending transcripts: emitted from _emit_frames when the delivery
+        # clock catches up to the audio position at which the transcript was
+        # produced.  Each entry: (audio_position_s, text, role, item_id, previous_item_id)
+        self._pending_transcripts: collections.deque[tuple[float, str, str, str | None, str | None]] = (
+            collections.deque()
         )
+        self._total_audio_delivered: float = 0.0
 
         # Background tasks
         self.frame_emit_task: asyncio.Task | None = None
@@ -292,7 +297,15 @@ class ChatSession:
         self._interrupt_sent = False
         self.first_audio_received = False
         self.current_turn_text = ""
-        self.virtual_cursor_text_ms = 0.0
+        self._pending_transcripts.clear()
+        self._total_audio_delivered = 0.0
+
+        # Cancel any still-running workers from the previous turn to prevent
+        # residual frames leaking into the new turn.
+        await self._cancel_and_wait_task(self.inference_task)
+        await self._cancel_and_wait_task(self.frame_emit_task)
+        self.inference_task = None
+        self.frame_emit_task = None
 
         # Clear queues
         self.audio_buffer.clear()
@@ -301,6 +314,13 @@ class ChatSession:
 
         if self.wav2arkit_service.is_available:
             self.wav2arkit_service.reset_context()
+
+        # ── TURN_AUDIT: Log full state at turn boundary for headSec debugging ──
+        logger.info(
+            f"TURN_AUDIT start turnId={self.current_turn_id} "
+            f"audio_recv=0.000s frames_emitted=0 buf=0B "
+            f"audio_q=0 frame_q=0 interrupted=False"
+        )
 
         # Send start event BEFORE starting tasks to ensure client is ready to receive frames
         logger.debug(
@@ -384,14 +404,12 @@ class ChatSession:
         self.total_audio_received += chunk_duration
 
         # Extract ALL complete 500ms chunks from the buffer (not just one).
-        # TTS sentences produce large chunks (800-3400ms each); extracting
-        # only one chunk per call left most audio trapped in the buffer
-        # until _handle_response_end flushed it as one massive bulk chunk,
-        # causing wav2arkit to stall and frames to burst.
         chunk_bytes_size = int(self.settings.audio_chunk_duration * self.output_sample_rate * 2)
+        chunks_extracted = 0
         while len(self.audio_buffer) >= chunk_bytes_size:
             chunk_bytes = bytes(self.audio_buffer[:chunk_bytes_size])
             self.audio_buffer = bytearray(self.audio_buffer[chunk_bytes_size:])
+            chunks_extracted += 1
 
             if self.is_interrupted or self._cancel_playback:
                 return
@@ -403,21 +421,11 @@ class ChatSession:
         if self.is_interrupted or self._cancel_playback:
             return
 
-        # Wait for audio to stabilize
-        last_audio = self.total_audio_received
-        stable_count = 0
-        max_wait_iterations = 60
-        iterations = 0
-        while stable_count < 15 and iterations < max_wait_iterations:
-            await asyncio.sleep(0.05)
-            iterations += 1
-            if self.is_interrupted or self._cancel_playback:
-                return
-            if self.total_audio_received == last_audio:
-                stable_count += 1
-            else:
-                stable_count = 0
-                last_audio = self.total_audio_received
+        # One event-loop tick to let any in-flight _handle_audio_delta complete.
+        # By the time the backend calls on_response_end, the TTS worker has
+        # already awaited every on_audio_delta call — but the event loop may
+        # not have fully processed the last one yet.
+        await asyncio.sleep(0.05)
 
         if self.is_interrupted or self._cancel_playback:
             return
@@ -459,6 +467,22 @@ class ChatSession:
 
         if self.is_interrupted or self._cancel_playback:
             return
+
+        # ── TURN_AUDIT: Log full state at turn end for headSec debugging ──
+        turn_duration = time.time() - self.speech_start_time if self.speech_start_time > 0 else 0
+        logger.info(
+            f"TURN_AUDIT end turnId={self.current_turn_id} "
+            f"audio_recv={self.total_audio_received:.3f}s "
+            f"frames_emitted={self.total_frames_emitted} "
+            f"duration={turn_duration:.2f}s "
+            f"audio_delivered={self.total_frames_emitted / self.settings.blendshape_fps:.3f}s "
+            f"buf={len(self.audio_buffer)}B"
+        )
+
+        # Flush any remaining pending transcripts (last sentence may not
+        # have been released by _emit_frames if the final frames were
+        # emitted just before speech_ended triggered the exit).
+        await self._flush_all_pending_transcripts()
 
         await self.send_json(
             {
@@ -504,57 +528,57 @@ class ChatSession:
         previous_item_id: str | None = None,
     ) -> None:
         if self.is_interrupted or self._cancel_playback:
-            logger.debug(
-                f"Session {self.session_id}: transcript_delta DROPPED "
-                f"(interrupted={self.is_interrupted}, cancel={self._cancel_playback}) text={text!r}"
-            )
             return
-        logger.debug(f"Session {self.session_id}: transcript_delta received: {text!r} role={role}")
-        # LLM APIs vary in chunk granularity — some send word-level tokens,
-        # others send entire sentences.  Split multi-word chunks into
-        # word-level deltas so the frontend SubtitleController gets
-        # manageable display units and doesn't overflow the subtitle area.
-        if role == "assistant":
-            # Anchor virtual cursor to actual audio position once per
-            # sentence so that within-sentence words use the heuristic.
-            # Only advance forward — never backward.  The filler text
-            # (spoken before tool results arrive) can push the cursor
-            # ahead of the actual audio; resetting it backward would
-            # create overlapping startOffset values that break clients.
-            actual_audio_ms = self.total_audio_received * 1000
-            if actual_audio_ms > self.virtual_cursor_text_ms:
-                self.virtual_cursor_text_ms = actual_audio_ms
 
-            # Ensure sentence-level chunks get a space separator so
-            # the subtitle display doesn't glue sentences together.
-            if self.current_turn_text and not text.startswith((" ", "\n")):
-                text = " " + text
+        if role != "assistant":
+            # User transcripts send immediately — no pipeline delay
+            await self._send_transcript_delta(text, role, item_id, previous_item_id)
+            return
 
-            words = text.split()
-            if len(words) > 2:
-                leading_ws = text[: len(text) - len(text.lstrip())]
-                for i, word in enumerate(words):
-                    prefix = leading_ws if i == 0 else " "
-                    await self._emit_transcript_delta(prefix + word, role, item_id, previous_item_id)
-                return
+        # Assistant transcripts: queue for delivery-clock-synced emission.
+        # Record the audio position so _emit_frames can release this
+        # transcript when the corresponding audio reaches the client.
+        audio_pos = self.total_audio_received
 
-        await self._emit_transcript_delta(text, role, item_id, previous_item_id)
+        # Ensure sentence-level chunks get a space separator
+        if self.current_turn_text and not text.startswith((" ", "\n")):
+            text = " " + text
 
-    async def _emit_transcript_delta(
+        self.current_turn_text += text
+        self._pending_transcripts.append((audio_pos, text, role, item_id, previous_item_id))
+        logger.debug(
+            f"Session {self.session_id}: transcript queued text={text[:40]!r} "
+            f"audio_pos={audio_pos:.3f}s pending={len(self._pending_transcripts)}"
+        )
+
+    async def _flush_pending_transcripts(self) -> None:
+        """Send all pending transcripts that the delivery clock has reached."""
+        while self._pending_transcripts:
+            audio_pos, text, role, item_id, prev_id = self._pending_transcripts[0]
+            if audio_pos > self._total_audio_delivered:
+                break
+            self._pending_transcripts.popleft()
+            await self._send_transcript_delta(text, role, item_id, prev_id)
+
+    async def _flush_all_pending_transcripts(self) -> None:
+        """Send ALL remaining pending transcripts (end-of-turn safety flush)."""
+        for _audio_pos, text, role, item_id, prev_id in self._pending_transcripts:
+            await self._send_transcript_delta(text, role, item_id, prev_id)
+        self._pending_transcripts.clear()
+
+    async def _send_transcript_delta(
         self,
         text: str,
         role: str,
         item_id: str | None,
         previous_item_id: str | None,
     ) -> None:
+        # Calculate offsets from delivery clock position
         if role == "assistant":
-            self.current_turn_text += text
-
-            char_duration_ms = (len(text) / self.chars_per_second) * 1000
-            start_offset = self.virtual_cursor_text_ms
+            start_offset = self._total_audio_delivered * 1000
+            # Estimate end offset from text length (used by client for word display timing)
+            char_duration_ms = (len(text) / _TRANSCRIPT_CHARS_PER_SEC) * 1000
             end_offset = start_offset + char_duration_ms
-
-            self.virtual_cursor_text_ms += char_duration_ms
         else:
             start_offset = 0
             end_offset = 0
@@ -563,7 +587,7 @@ class ChatSession:
         session_id = (
             self.current_turn_session_id if role == "assistant" and self.current_turn_session_id else self.session_id
         )
-        msg = {
+        msg: dict[str, Any] = {
             "type": "transcript_delta",
             "text": text,
             "role": role,
@@ -573,17 +597,32 @@ class ChatSession:
             "startOffset": int(start_offset),
             "endOffset": int(end_offset),
         }
-
         if item_id:
             msg["itemId"] = item_id
         if previous_item_id:
             msg["previousItemId"] = previous_item_id
-        logger.debug(
-            f"Session {self.session_id}: transcript_delta SEND text={text!r} "
-            f"startOffset={int(start_offset)} endOffset={int(end_offset)} "
-            f"total_audio_received={self.total_audio_received:.3f}s "
-            f"virtual_cursor={self.virtual_cursor_text_ms:.0f}ms"
-        )
+
+        # Word-level splitting for subtitle display.
+        # Each word gets an incrementing startOffset so the client's
+        # SubtitleController can display words progressively.
+        words = text.split()
+        if len(words) > 2:
+            leading_ws = text[: len(text) - len(text.lstrip())]
+            word_cursor = start_offset
+            for i, word in enumerate(words):
+                prefix = leading_ws if i == 0 else " "
+                word_text = prefix + word
+                word_duration = (len(word_text) / _TRANSCRIPT_CHARS_PER_SEC) * 1000
+                word_msg = {
+                    **msg,
+                    "text": word_text,
+                    "startOffset": int(word_cursor),
+                    "endOffset": int(word_cursor + word_duration),
+                }
+                await self.send_json(word_msg)
+                word_cursor += word_duration
+            return
+
         await self.send_json(msg)
 
     async def _handle_user_transcript(self, transcript: str, role: str = "user") -> None:
@@ -606,7 +645,7 @@ class ChatSession:
         """Helper to calculate truncated text based on audio duration."""
         try:
             seconds_spoken = self.total_frames_emitted / self.settings.blendshape_fps
-            estimated_chars = int(seconds_spoken * self.chars_per_second)
+            estimated_chars = int(seconds_spoken * _TRANSCRIPT_CHARS_PER_SEC)
 
             final_text = self.current_turn_text
             if len(final_text) > estimated_chars:
@@ -648,6 +687,7 @@ class ChatSession:
 
         # 2. Clear Local Buffers
         self.audio_buffer.clear()
+        self._pending_transcripts.clear()
 
         # 3. Drain Queues
         await self._drain_queue(self.audio_chunk_queue)
@@ -664,7 +704,29 @@ class ChatSession:
         self.speech_ended = True
         self.current_turn_id = None
 
-        # 6. Calc Truncation & Send
+        # ── TURN_AUDIT: Log state at interruption ──
+        logger.info(
+            f"TURN_AUDIT interrupt turnId={interrupted_turn_id} "
+            f"audio_recv={self.total_audio_received:.3f}s "
+            f"frames_emitted={self.total_frames_emitted} "
+            f"audio_delivered={self.total_frames_emitted / self.settings.blendshape_fps:.3f}s"
+        )
+
+        # 6. Send audio_end so the client resets its audio player
+        try:
+            await self.send_json(
+                {
+                    "type": "audio_end",
+                    "sessionId": self.current_turn_session_id or self.session_id,
+                    "turnId": interrupted_turn_id,
+                    "interrupted": True,
+                    "timestamp": int(time.time() * 1000),
+                }
+            )
+        except Exception as e:
+            logger.error(f"Session {self.session_id}: Failed to send audio_end on interrupt: {e}")
+
+        # 7. Calc Truncation & Send
         final_text = await self._calculate_truncated_text()
 
         try:
@@ -809,22 +871,26 @@ class ChatSession:
 
     async def _emit_frames(self) -> None:
         """Emit synchronized frames."""
+        last_emit_time = 0.0
         try:
             while True:
                 if self.is_interrupted or self._cancel_playback:
                     await asyncio.sleep(0.01)
                     continue
 
-                # Pacing logic: pace frame emission based on cumulative audio
-                # duration received, not wall-clock time.  Wall-clock pacing
-                # causes frame bursts after silence gaps (fillers, tool calls)
-                # because elapsed time keeps growing while no audio flows.
-                # Audio-clock naturally pauses during gaps and resumes smoothly.
-                # +15 frames (~500ms) lookahead for client-side buffering.
-                target_frames = int(self.total_audio_received * self.settings.blendshape_fps) + 15
+                fps = self.settings.blendshape_fps
+                frame_interval = 1.0 / fps  # ~33ms at 30fps
 
+                # Gate 1 (audio-clock): never emit more frames than audio received.
+                target_frames = int(self.total_audio_received * fps) + 15
                 if self.total_frames_emitted >= target_frames:
                     await asyncio.sleep(0.005)
+                    continue
+
+                # Gate 2 (wall-clock): never emit faster than real-time playback.
+                now = time.time()
+                if last_emit_time > 0 and (now - last_emit_time) < frame_interval:
+                    await asyncio.sleep(frame_interval - (now - last_emit_time))
                     continue
 
                 try:
@@ -872,6 +938,11 @@ class ChatSession:
 
                 self.blendshape_frame_idx += 1
                 self.total_frames_emitted += 1
+                self._total_audio_delivered = self.total_frames_emitted / self.settings.blendshape_fps
+                last_emit_time = time.time()
+
+                # Release any pending transcripts whose audio has now been delivered
+                await self._flush_pending_transcripts()
 
         except asyncio.CancelledError:
             if not self.is_interrupted:

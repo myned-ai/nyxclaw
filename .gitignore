@@ -62,6 +62,7 @@ venv.bak/
 .settings/
 
 # Testing
+tests/
 .pytest_cache/
 .coverage
 .coverage.*
@@ -96,6 +97,10 @@ pretrained_models/
 
 # HuggingFace model cache (baked into Docker image, not committed)
 .hf_cache/
+
+# Captured audio from tests
+captured_audio/
+debug_input_*.pcm
 
 # Temporary files
 *.tmp

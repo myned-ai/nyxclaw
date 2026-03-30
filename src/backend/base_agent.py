@@ -10,16 +10,6 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
-TOOL_FILLERS = [
-    "On it.",
-    "One sec.",
-    "Working on it.",
-    "Let me handle that.",
-    "Give me a moment.",
-    "Hang on.",
-    "Let me take care of that.",
-]
-
 
 @dataclass
 class ConversationState:

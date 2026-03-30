@@ -86,6 +86,10 @@ class OpenAIRealtimeBackend(BaseAgent):
         self._active_stream_task: asyncio.Task[None] | None = None
         self._tts_cancelled = asyncio.Event()
         self._cancel_event = asyncio.Event()
+        self._active_tts_queue: asyncio.Queue | None = None
+        self._last_filler_at: float = 0.0
+        self._filler_history: dict[str, float] = {}  # filler content → last spoken time
+        self._cached_filler_audio: dict[str, bytes] = {}  # phrase → pre-synthesized PCM
 
         # ── OpenAI clients ──────────────────────────────────────────
         self._openai: Any = None  # AsyncOpenAI
@@ -190,6 +194,9 @@ class OpenAIRealtimeBackend(BaseAgent):
         from openai import AsyncOpenAI
 
         self._openai = AsyncOpenAI(api_key=rt.openai_api_key)
+
+        # 1b. Pre-synthesize filler phrases for instant playback
+        asyncio.create_task(self._presynthesise_fillers())
 
         # 2. LLM client — transport depends on agent_type
         if agent_type == "zeroclaw":
@@ -371,6 +378,7 @@ class OpenAIRealtimeBackend(BaseAgent):
                                 "turn_detection": {
                                     "type": self._rt.openai_vad_type,
                                     "create_response": False,
+                                    "eagerness": "low",
                                 },
                             },
                         },
@@ -457,9 +465,20 @@ class OpenAIRealtimeBackend(BaseAgent):
         # Wait for previous stream task to finish
         if self._active_stream_task and not self._active_stream_task.done():
             try:
-                await asyncio.wait_for(self._active_stream_task, timeout=0.5)
+                await asyncio.wait_for(self._active_stream_task, timeout=2.0)
             except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
                 pass
+
+        # Send cancel to ZeroClaw AFTER the old stream task is done
+        # (avoids concurrent recv/send on the same WebSocket)
+        if self._settings.agent_type == "zeroclaw" and self._zc_ws is not None:
+            try:
+                await self._zc_ws.send(json.dumps({"type": "cancel"}))
+                logger.debug("Sent cancel to ZeroClaw")
+            except Exception as exc:
+                logger.debug(f"Failed to send cancel to ZeroClaw: {exc}")
+            # Drain stale messages from previous turn
+            await self._drain_ws_until_done(self._zc_ws, timeout=1.0)
 
         self._append_message("user", transcript)
 
@@ -469,7 +488,136 @@ class OpenAIRealtimeBackend(BaseAgent):
         self._response_cancelled = False
         self._tts_cancelled.clear()
         self._cancel_event.clear()
+
+        # Fire nano intent classifier in parallel — if it's an action request,
+        # TTS a filler phrase immediately while ZeroClaw processes.
+        asyncio.create_task(self._classify_and_filler(transcript))
+
         self._active_stream_task = asyncio.create_task(self._stream_and_speak())
+
+    _FILLER_TOOL = {
+        "type": "function",
+        "function": {
+            "name": "filler",
+            "description": (
+                "Call this ONLY when the user wants you to DO something that requires a tool "
+                "(check calendar, send email, search web, fetch page, look something up). "
+                "Do NOT call for chitchat, greetings, opinions, jokes, follow-ups like "
+                "'yes', 'go ahead', 'tell me more', or general conversation."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "phrase": {
+                        "type": "string",
+                        "enum": [
+                            "On it.",
+                            "Let me have a look.",
+                            "I'm looking into it.",
+                            "Let me check.",
+                            "Sure, one moment.",
+                            "I'll look into that.",
+                        ],
+                        "description": "Pick the most natural acknowledgment.",
+                    }
+                },
+                "required": ["phrase"],
+            },
+        },
+    }
+
+    _FILLER_PHRASES = [
+        "On it.",
+        "Let me have a look.",
+        "I'm looking into it.",
+        "Let me check.",
+        "Sure, one moment.",
+        "I'll look into that.",
+    ]
+
+    async def _presynthesise_fillers(self) -> None:
+        """Pre-synthesize filler phrases at startup for instant playback."""
+        rt = self._rt
+        for phrase in self._FILLER_PHRASES:
+            try:
+                tts_kwargs: dict[str, Any] = {
+                    "model": rt.openai_tts_model,
+                    "voice": rt.openai_voice,
+                    "input": phrase,
+                    "response_format": "pcm",
+                    "speed": rt.openai_tts_speed,
+                }
+                if rt.openai_tts_instructions:
+                    tts_kwargs["instructions"] = rt.openai_tts_instructions
+                response = await self._openai.audio.speech.create(**tts_kwargs)
+                self._cached_filler_audio[phrase] = response.content
+            except Exception as exc:
+                logger.warning(f"Failed to pre-synthesize filler {phrase!r}: {exc}")
+        logger.info(f"Pre-synthesized {len(self._cached_filler_audio)} filler phrases ({sum(len(v) for v in self._cached_filler_audio.values()) // 1024}KB)")
+
+    def _should_speak_filler(self, content: str) -> bool:
+        """Consolidated filler throttle. Single source of truth for both nano and ZeroClaw fillers.
+
+        Rules:
+        - 2s minimum between any filler
+        - 5s minimum between same-content filler
+        """
+        now = time.perf_counter()
+        if (now - self._last_filler_at) < 2.0:
+            return False
+        last_same = self._filler_history.get(content, 0.0)
+        if (now - last_same) < 5.0:
+            return False
+        self._last_filler_at = now
+        self._filler_history[content] = now
+        return True
+
+    # Short messages that are clearly chitchat — skip the nano classifier
+    _CHITCHAT_SKIP = {"hi", "hey", "hello", "yo", "sup", "thanks", "thank you",
+                      "bye", "goodbye", "ok", "okay", "yes", "no", "yeah", "nah",
+                      "sure", "go ahead", "tell me more", "what", "huh"}
+
+    async def _classify_and_filler(self, transcript: str) -> None:
+        """Fast nano LLM call: if action intent, queue a filler phrase for TTS."""
+        if transcript.strip().lower().rstrip(".,!?") in self._CHITCHAT_SKIP:
+            return
+        t0 = time.perf_counter()
+        try:
+            response = await self._openai.chat.completions.create(
+                model="gpt-4.1-nano",
+                max_tokens=30,
+                temperature=0.5,
+                messages=[
+                    {"role": "user", "content": transcript},
+                ],
+                tools=[self._FILLER_TOOL],
+                tool_choice="auto",
+            )
+            classify_ms = int((time.perf_counter() - t0) * 1000)
+            msg = response.choices[0].message
+            if not msg.tool_calls or self._response_cancelled:
+                logger.debug(f"[TIMELINE] Nano classifier: chitchat ({classify_ms}ms)")
+                return
+
+            import json as _json
+            args = _json.loads(msg.tool_calls[0].function.arguments)
+            filler = args.get("phrase", "").strip()
+            if not filler:
+                return
+
+            if not self._should_speak_filler(filler):
+                logger.debug("[TIMELINE] Nano classifier: suppressed by throttle")
+                return
+
+            logger.info(f"[TIMELINE] Nano classifier: action ({classify_ms}ms) filler={filler!r}")
+
+            # Route through TTS queue — use filler as sanitized too so it
+            # matches the pre-cached audio key in _cached_filler_audio.
+            q = self._active_tts_queue
+            if q is not None:
+                await q.put((filler, filler, True))
+        except Exception as exc:
+            logger.debug(f"Nano classifier error (non-fatal): {exc}")
 
     # ================================================================
     # Text input
@@ -491,6 +639,26 @@ class OpenAIRealtimeBackend(BaseAgent):
         self._response_cancelled = False
         self._tts_cancelled.clear()
         self._cancel_event.clear()
+        asyncio.create_task(self._wait_and_start_stream())
+
+    async def _wait_and_start_stream(self) -> None:
+        """Wait for previous stream to finish, send cancel to ZeroClaw, drain stale messages, then start new stream."""
+        if self._active_stream_task and not self._active_stream_task.done():
+            try:
+                await asyncio.wait_for(self._active_stream_task, timeout=2.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                pass
+
+        # Send cancel to ZeroClaw after old stream is done, then drain stale messages
+        if self._settings.agent_type == "zeroclaw" and self._zc_ws is not None:
+            try:
+                await self._zc_ws.send(json.dumps({"type": "cancel"}))
+                logger.debug("Sent cancel to ZeroClaw (text input)")
+            except Exception:
+                pass
+            # Drain stale messages from previous turn
+            await self._drain_ws_until_done(self._zc_ws, timeout=1.0)
+
         self._active_stream_task = asyncio.create_task(self._stream_and_speak())
 
     # ================================================================
@@ -527,6 +695,8 @@ class OpenAIRealtimeBackend(BaseAgent):
 
         # For OpenClaw SSE, force-cancel the stream task.
         # For ZeroClaw WS, the cancel_event breaks the recv loop cleanly.
+        # The cancel message to ZeroClaw is sent inside _iter_tokens_ws
+        # after the recv loop exits (to avoid concurrent recv/send).
         if self._settings.agent_type != "zeroclaw":
             if self._active_stream_task and not self._active_stream_task.done():
                 self._active_stream_task.cancel()
@@ -782,6 +952,13 @@ class OpenAIRealtimeBackend(BaseAgent):
 
             if msg_type == "speech_chunk":
                 content = str(message.get("content", ""))
+                is_filler = bool(message.get("filler", False))
+                if is_filler:
+                    # Filler: TTS only, don't add to transcript/history.
+                    if content and tts_queue is not None and self._should_speak_filler(content):
+                        logger.info(f"ZeroClaw tool filler: {content!r}")
+                        await tts_queue.put((content, content, True))
+                    continue
                 if content and not has_content:
                     logger.debug(f"[TIMELINE] T+{(time.perf_counter()-t0)*1000:.0f}ms: first speech_chunk ({len(content)} chars)")
                 if content:
@@ -817,6 +994,7 @@ class OpenAIRealtimeBackend(BaseAgent):
         self._total_audio_sent = 0.0
         self._state.transcript_buffer = ""
         self._state.audio_done = False
+        self._filler_history.clear()
 
         if self._on_response_start:
             await self._on_response_start(session_id)
@@ -827,6 +1005,7 @@ class OpenAIRealtimeBackend(BaseAgent):
         # TTS sentence queue (None = sentinel for "done")
         # Tuple: (original_text, sanitized_text, is_filler)
         tts_queue: asyncio.Queue[tuple[str, str, bool] | None] = asyncio.Queue()
+        self._active_tts_queue = tts_queue
         tts_task = asyncio.create_task(self._tts_worker(tts_queue, item_id))
 
         try:
@@ -989,13 +1168,39 @@ class OpenAIRealtimeBackend(BaseAgent):
                 if sentence_count > 0 and self._on_audio_delta and not self._response_cancelled:
                     await self._on_audio_delta(silence_pad)
 
-                # Skip filler — it's spoken but not part of the real transcript,
-                # and its offsets would corrupt the virtual cursor for real content.
-                if not is_filler and self._on_transcript_delta and not self._response_cancelled:
-                    await self._on_transcript_delta(original, "assistant", item_id, None)
-
                 t0 = getattr(self, '_turn_t0', time.perf_counter())
                 tts_start = time.perf_counter()
+                transcript_emitted = False
+
+                # Check for pre-cached filler audio first
+                cached_pcm = self._cached_filler_audio.get(sanitized)
+                if cached_pcm is not None:
+                    logger.debug(f"[TIMELINE] T+{(tts_start-t0)*1000:.0f}ms: TTS cached filler ({sanitized[:40]!r}, {len(cached_pcm)}B)")
+                    delivery_bytes = 24000 // 10 * 2
+                    offset = 0
+                    while offset < len(cached_pcm) and not self._response_cancelled:
+                        # Emit transcript on first audio chunk so it syncs with audio
+                        if not transcript_emitted:
+                            transcript_emitted = True
+                            if self._on_transcript_delta and not self._response_cancelled:
+                                logger.debug(
+                                    f"TRANSCRIPT_AUDIT emit "
+                                    f"is_filler={is_filler} total_audio_sent={self._total_audio_sent:.3f}s "
+                                    f"source=cached_filler"
+                                )
+                                await self._on_transcript_delta(original, "assistant", item_id, None)
+                        end = min(offset + delivery_bytes, len(cached_pcm))
+                        chunk = cached_pcm[offset:end]
+                        # Pad last chunk with silence to align to delivery boundary
+                        if len(chunk) < delivery_bytes:
+                            chunk = chunk + bytes(delivery_bytes - len(chunk))
+                        if self._on_audio_delta:
+                            await self._on_audio_delta(chunk)
+                            self._total_audio_sent += (end - offset) / (24000 * 2)
+                        offset = end
+                    sentence_count += 1
+                    continue
+
                 logger.debug(f"[TIMELINE] T+{(tts_start-t0)*1000:.0f}ms: TTS request ({sanitized[:40]!r})")
                 tts_first_chunk = False
 
@@ -1021,6 +1226,15 @@ class OpenAIRealtimeBackend(BaseAgent):
                             if not tts_first_chunk:
                                 tts_first_chunk = True
                                 logger.debug(f"[TIMELINE] T+{(time.perf_counter()-t0)*1000:.0f}ms: TTS first audio chunk (TTS TTFT={(time.perf_counter()-tts_start)*1000:.0f}ms)")
+                                # Emit transcript on first audio chunk so it syncs with audio
+                                if not transcript_emitted and self._on_transcript_delta and not self._response_cancelled:
+                                    transcript_emitted = True
+                                    logger.debug(
+                                        f"TRANSCRIPT_AUDIT emit "
+                                        f"is_filler={is_filler} total_audio_sent={self._total_audio_sent:.3f}s "
+                                        f"source=streaming_tts sentence={sentence_count}"
+                                    )
+                                    await self._on_transcript_delta(original, "assistant", item_id, None)
                             rechunk_buf.extend(chunk)
                             while len(rechunk_buf) >= delivery_bytes:
                                 if self._response_cancelled:
@@ -1030,8 +1244,13 @@ class OpenAIRealtimeBackend(BaseAgent):
                                     self._total_audio_sent += delivery_bytes / (24000 * 2)
                                 del rechunk_buf[:delivery_bytes]
 
-                    # Flush any remaining audio in the re-chunk buffer
+                    # Flush any remaining audio in the re-chunk buffer,
+                    # padded with silence to align to delivery_bytes boundary.
+                    # This prevents mixed audio chunks when the next TTS segment starts.
                     if rechunk_buf and not self._response_cancelled and self._on_audio_delta:
+                        pad_needed = delivery_bytes - len(rechunk_buf)
+                        if pad_needed > 0:
+                            rechunk_buf.extend(bytes(pad_needed))
                         await self._on_audio_delta(bytes(rechunk_buf))
                 except Exception as exc:
                     logger.error(f"OpenAI TTS error: {exc}")
