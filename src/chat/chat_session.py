@@ -109,6 +109,7 @@ class ChatSession:
         self._last_first_audio_at: float = 0.0
         self._last_input_source: str = "unknown"
         self._interrupt_sent: bool = False
+        self._audio_start_sent: bool = False
 
         # Track accumulated text for accurate interruption cutting
         self.current_turn_text: str = ""
@@ -322,21 +323,12 @@ class ChatSession:
             f"audio_q=0 frame_q=0 interrupted=False"
         )
 
-        # Send start event BEFORE starting tasks to ensure client is ready to receive frames
-        logger.debug(
-            f"Session {self.session_id}: Sending audio_start with turnId={self.current_turn_id}, sessionId={self.current_turn_session_id}"
-        )
+        # avatar_state=Responding sent immediately (UI feedback: avatar
+        # stops listening posture).  audio_start is deferred to _emit_frames
+        # and sent just before the first sync_frame, so the client's audio
+        # player starts exactly when data is available — no dry-run gap.
+        self._audio_start_sent = False
         await self.send_json({"type": "avatar_state", "state": "Responding"})
-        await self.send_json(
-            {
-                "type": "audio_start",
-                "sessionId": self.current_turn_session_id,
-                "turnId": self.current_turn_id,
-                "sampleRate": self.output_sample_rate,
-                "format": "audio/pcm16",
-                "timestamp": int(time.time() * 1000),
-            }
-        )
 
         # Start background tasks
         if self.frame_emit_task is None or self.frame_emit_task.done():
@@ -484,14 +476,18 @@ class ChatSession:
         # emitted just before speech_ended triggered the exit).
         await self._flush_all_pending_transcripts()
 
-        await self.send_json(
-            {
-                "type": "audio_end",
-                "sessionId": self.current_turn_session_id or self.session_id,
-                "turnId": self.current_turn_id,
-                "timestamp": int(time.time() * 1000),
-            }
-        )
+        # Only send audio_end if audio_start was sent (audio was actually played).
+        # If the response was empty or interrupted before the first frame,
+        # the client never started its audio player — no end signal needed.
+        if self._audio_start_sent:
+            await self.send_json(
+                {
+                    "type": "audio_end",
+                    "sessionId": self.current_turn_session_id or self.session_id,
+                    "turnId": self.current_turn_id,
+                    "timestamp": int(time.time() * 1000),
+                }
+            )
 
         if transcript:
             logger.debug(
@@ -712,19 +708,21 @@ class ChatSession:
             f"audio_delivered={self.total_frames_emitted / self.settings.blendshape_fps:.3f}s"
         )
 
-        # 6. Send audio_end so the client resets its audio player
-        try:
-            await self.send_json(
-                {
-                    "type": "audio_end",
-                    "sessionId": self.current_turn_session_id or self.session_id,
-                    "turnId": interrupted_turn_id,
-                    "interrupted": True,
-                    "timestamp": int(time.time() * 1000),
-                }
-            )
-        except Exception as e:
-            logger.error(f"Session {self.session_id}: Failed to send audio_end on interrupt: {e}")
+        # 6. Send audio_end so the client resets its audio player.
+        #    Only if audio_start was sent (audio was actually playing).
+        if self._audio_start_sent:
+            try:
+                await self.send_json(
+                    {
+                        "type": "audio_end",
+                        "sessionId": self.current_turn_session_id or self.session_id,
+                        "turnId": interrupted_turn_id,
+                        "interrupted": True,
+                        "timestamp": int(time.time() * 1000),
+                    }
+                )
+            except Exception as e:
+                logger.error(f"Session {self.session_id}: Failed to send audio_end on interrupt: {e}")
 
         # 7. Calc Truncation & Send
         final_text = await self._calculate_truncated_text()
@@ -871,7 +869,7 @@ class ChatSession:
 
     async def _emit_frames(self) -> None:
         """Emit synchronized frames."""
-        last_emit_time = 0.0
+        emit_start_time = 0.0  # wall-clock time when first frame was emitted
         try:
             while True:
                 if self.is_interrupted or self._cancel_playback:
@@ -887,11 +885,17 @@ class ChatSession:
                     await asyncio.sleep(0.005)
                     continue
 
-                # Gate 2 (wall-clock): never emit faster than real-time playback.
-                now = time.time()
-                if last_emit_time > 0 and (now - last_emit_time) < frame_interval:
-                    await asyncio.sleep(frame_interval - (now - last_emit_time))
-                    continue
+                # Gate 2 (wall-clock): target-based pacing.
+                # Each frame has a fixed target time relative to the first emit:
+                #   frame N should emit at emit_start_time + N / fps.
+                # This prevents per-frame processing overhead from accumulating
+                # as drift (~1.4ms/frame = 4% slower than real-time).
+                if emit_start_time > 0:
+                    target_time = emit_start_time + self.total_frames_emitted * frame_interval
+                    now = time.time()
+                    sleep_for = target_time - now
+                    if sleep_for > 0.001:
+                        await asyncio.sleep(sleep_for)
 
                 try:
                     frame_data = await asyncio.wait_for(
@@ -912,6 +916,25 @@ class ChatSession:
                 if self.is_interrupted or self._cancel_playback:
                     await asyncio.sleep(0.01)
                     continue
+
+                # Send audio_start just before the first sync_frame so
+                # the client starts its audio player when data is ready.
+                if not self._audio_start_sent:
+                    logger.debug(
+                        f"Session {self.session_id}: Sending audio_start with first frame "
+                        f"(turnId={self.current_turn_id}, sessionId={self.current_turn_session_id})"
+                    )
+                    await self.send_json(
+                        {
+                            "type": "audio_start",
+                            "sessionId": self.current_turn_session_id,
+                            "turnId": self.current_turn_id,
+                            "sampleRate": self.output_sample_rate,
+                            "format": "audio/pcm16",
+                            "timestamp": int(time.time() * 1000),
+                        }
+                    )
+                    self._audio_start_sent = True
 
                 if self.blendshape_frame_idx % 30 == 0:
                     audio_b64 = frame_data.get("audio", "")
@@ -939,7 +962,8 @@ class ChatSession:
                 self.blendshape_frame_idx += 1
                 self.total_frames_emitted += 1
                 self._total_audio_delivered = self.total_frames_emitted / self.settings.blendshape_fps
-                last_emit_time = time.time()
+                if emit_start_time == 0:
+                    emit_start_time = time.time()
 
                 # Release any pending transcripts whose audio has now been delivered
                 await self._flush_pending_transcripts()

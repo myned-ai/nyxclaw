@@ -527,12 +527,24 @@ class OpenAIRealtimeBackend(BaseAgent):
     }
 
     _FILLER_PHRASES = [
+        # Nano classifier fillers
         "On it.",
         "Let me have a look.",
         "I'm looking into it.",
         "Let me check.",
         "Sure, one moment.",
         "I'll look into that.",
+        # ZeroClaw tool_call fillers (from nyxclaw.rs tool_call_filler)
+        "I'm checking your calendar.",
+        "I'm going through your emails.",
+        "I'm working on that.",
+        "I'm searching the web.",
+        "I'm pulling up that page.",
+        "I'm running that now.",
+        "I'm reading that.",
+        "I'm writing that down.",
+        "I'm thinking back.",
+        "Still working on it.",
     ]
 
     async def _presynthesise_fillers(self) -> None:
@@ -1147,10 +1159,26 @@ class OpenAIRealtimeBackend(BaseAgent):
         # 200ms silence at 24kHz PCM16 mono — breath pause between sentences
         pause_samples = int(24000 * 0.20)
         silence_pad = bytes(pause_samples * 2)
+        # 500ms silence chunk for "thinking" gaps during tool execution.
+        # Injected via on_audio_delta so the full pipeline (buffer → wav2arkit
+        # → frame_queue → emit) stays fed at 30fps with zero blendshape weights.
+        # Capped at 10 rounds (5 seconds) to avoid unbounded accumulation.
+        thinking_silence = bytes(int(0.5 * 24000) * 2)  # 24000 bytes = 500ms
+        max_silence_rounds = 10
+        silence_rounds = 0
 
         try:
             while True:
-                item = await queue.get()
+                try:
+                    item = await asyncio.wait_for(queue.get(), timeout=0.5)
+                    silence_rounds = 0  # reset on any real item
+                except asyncio.TimeoutError:
+                    if self._response_cancelled:
+                        break
+                    if sentence_count > 0 and self._on_audio_delta and silence_rounds < max_silence_rounds:
+                        await self._on_audio_delta(thinking_silence)
+                        silence_rounds += 1
+                    continue
                 if item is None:
                     break
                 if self._response_cancelled:

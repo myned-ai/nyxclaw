@@ -445,10 +445,24 @@ class ZeroClawBackend(BaseAgent):
         # 200ms silence at output sample rate — natural breath pause between sentences
         pause_samples = int(self._tts.sample_rate * 0.20)
         silence_pad = bytes(pause_samples * 2)
+        # 500ms silence chunk for "thinking" gaps during tool execution.
+        # Capped at 10 rounds (5 seconds) to avoid unbounded accumulation.
+        thinking_silence = bytes(int(0.5 * self._tts.sample_rate) * 2)
+        max_silence_rounds = 10
+        silence_rounds = 0
 
         try:
             while True:
-                item = await queue.get()
+                try:
+                    item = await asyncio.wait_for(queue.get(), timeout=0.5)
+                    silence_rounds = 0
+                except asyncio.TimeoutError:
+                    if self._response_cancelled:
+                        break
+                    if sentence_count > 0 and self._on_audio_delta and silence_rounds < max_silence_rounds:
+                        await self._on_audio_delta(thinking_silence)
+                        silence_rounds += 1
+                    continue
                 if item is None:
                     break
                 if self._response_cancelled:
