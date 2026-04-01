@@ -13,6 +13,7 @@ When connected via `/ws/avatar`, ZeroClaw forces the LLM to respond with structu
 - `speech` — sent to nyxclaw as `speech_chunk` events → avatar speaks it
 - `content` — sent to nyxclaw as `rich_content` event → app renders cards/links/tables
 - Tool calls/results stream in real-time during agent execution
+- Tool call fillers — avatar speaks contextual phrases (e.g. "Let me search for that") while tools execute
 - Cancel support for barge-in interruption
 
 The existing `/ws/chat` endpoint is unchanged — CLI and web dashboard clients work as before.
@@ -203,10 +204,18 @@ These values are optimized for snappy voice responses. Depending on your use cas
 {"type": "tool_call", "name": "web_fetch", "args": {"url": "..."}}
 {"type": "tool_result", "name": "web_fetch", "output": "...", "success": true, "duration_ms": 1200}
 {"type": "speech_chunk", "content": "Here's the Wikipedia page for Rome, take a look."}
+{"type": "speech_chunk", "content": "Let me look that up for you.", "filler": true}
 {"type": "rich_content", "content": "**Rome - Wikipedia**\nhttps://en.wikipedia.org/wiki/Rome\n\n..."}
 {"type": "done", "full_response": "Here's the Wikipedia page for Rome, take a look."}
 {"type": "error", "message": "..."}
 ```
+
+**`speech_chunk` fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `content` | `string` | Text for the avatar to speak |
+| `filler` | `bool` (optional) | If `true`, this is a contextual filler phrase generated during tool execution (e.g. "Let me search for that"). nyxclaw uses this to apply throttling (2s gap between fillers, 5s same-content cooldown). Omitted or `false` for normal speech. |
 
 ### Key differences from `/ws/chat`
 
@@ -229,7 +238,7 @@ These values are optimized for snappy voice responses. Depending on your use cas
 | `src/providers/openai.rs` | Added `response_format` + `stream` to `NativeChatRequest`, SSE streaming structs, `stream_chat()` impl. |
 | `src/agent/agent.rs` | Added `response_format` field + setter, `turn_with_events()`, `turn_with_streaming()` (streaming agent turn). |
 | `src/agent/prompt.rs` | Removed `DateTimeSection` from system prompt builder. The per-second timestamp was invalidating OpenAI's prompt cache on every request. User messages already carry timestamps, so the LLM still knows the current time. |
-| `src/channels/nyxclaw.rs` | **NEW** — Avatar WebSocket channel with incremental JSON extraction: streams `speech_chunk` events as the LLM generates, not after. |
+| `src/channels/nyxclaw.rs` | **NEW** — Avatar WebSocket channel with incremental JSON extraction, cancel support, and tool call fillers. Streams `speech_chunk` events as the LLM generates, not after. Emits contextual filler phrases (`filler: true`) during tool execution. |
 
 **Line injections (original files preserved):**
 

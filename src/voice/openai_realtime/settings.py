@@ -29,6 +29,7 @@ class OpenAIRealtimeSettings(BaseSettings):
     # ── Realtime API (VAD + STT) ───────────────────────────────────
     openai_realtime_model: str = "gpt-realtime"
     openai_vad_type: str = "semantic_vad"  # "semantic_vad" or "server_vad"
+    openai_vad_eagerness: str = "medium"  # "low", "medium", "high" (semantic_vad only)
     openai_transcription_model: str = "gpt-4o-transcribe"
     openai_transcription_language: str = "en"
     openai_transcription_prompt: str = ""  # Vocabulary hint for transcription (e.g. "Nyx, NyxClaw, ZeroClaw")

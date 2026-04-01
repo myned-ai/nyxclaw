@@ -274,14 +274,14 @@ class ChatSession:
         """Handle AI response start."""
         now = time.perf_counter()
         self._last_response_start_at = now
-        logger.info(
+        logger.debug(
             f"Session {self.session_id}: Response start received, creating turn for session {session_id} "
             f"(inference_task={'alive' if self.inference_task and not self.inference_task.done() else 'gone'}, "
             f"speech_ended={self.speech_ended})"
         )
         if self._last_user_transcript_finalized_at > 0:
             user_to_model_ms = (now - self._last_user_transcript_finalized_at) * 1000
-            logger.info(
+            logger.debug(
                 f"Session {self.session_id}: Latency user_final->model_start = {user_to_model_ms:.1f}ms "
                 f"(source={self._last_input_source})"
             )
@@ -317,7 +317,7 @@ class ChatSession:
             self.wav2arkit_service.reset_context()
 
         # ── TURN_AUDIT: Log full state at turn boundary for headSec debugging ──
-        logger.info(
+        logger.debug(
             f"TURN_AUDIT start turnId={self.current_turn_id} "
             f"audio_recv=0.000s frames_emitted=0 buf=0B "
             f"audio_q=0 frame_q=0 interrupted=False"
@@ -366,15 +366,14 @@ class ChatSession:
 
             if self._last_response_start_at > 0:
                 model_to_first_audio_ms = (first_audio_now - self._last_response_start_at) * 1000
-                logger.info(
-                    f"Session {self.session_id}: Latency model_start->first_audio = {model_to_first_audio_ms:.1f}ms"
+                logger.debug(
+                    f"SPEED_TEST first_audio_chunk model_to_audio={model_to_first_audio_ms:.0f}ms"
                 )
 
             if self._last_user_transcript_finalized_at > 0:
                 user_to_first_audio_ms = (first_audio_now - self._last_user_transcript_finalized_at) * 1000
-                logger.info(
-                    f"Session {self.session_id}: Latency user_final->first_audio (E2E) = {user_to_first_audio_ms:.1f}ms "
-                    f"(source={self._last_input_source})"
+                logger.debug(
+                    f"SPEED_TEST e2e_to_first_audio={user_to_first_audio_ms:.0f}ms source={self._last_input_source}"
                 )
 
         if not self.wav2arkit_service.is_available:
@@ -453,16 +452,23 @@ class ChatSession:
             try:
                 remaining_frames = self.frame_queue.qsize()
                 timeout = max(5.0, remaining_frames / self.settings.blendshape_fps + 2.0)
+                logger.debug(
+                    f"SPEED_TEST waiting_for_emit remaining_frames={remaining_frames} "
+                    f"timeout={timeout:.1f}s emitted_so_far={self.total_frames_emitted}"
+                )
                 await asyncio.wait_for(self.frame_emit_task, timeout=timeout)
             except (asyncio.TimeoutError, asyncio.CancelledError):
-                pass
+                logger.debug(
+                    f"SPEED_TEST emit_timeout frames_emitted={self.total_frames_emitted} "
+                    f"frame_q={self.frame_queue.qsize()} timeout={timeout:.1f}s"
+                )
 
         if self.is_interrupted or self._cancel_playback:
             return
 
         # ── TURN_AUDIT: Log full state at turn end for headSec debugging ──
         turn_duration = time.time() - self.speech_start_time if self.speech_start_time > 0 else 0
-        logger.info(
+        logger.debug(
             f"TURN_AUDIT end turnId={self.current_turn_id} "
             f"audio_recv={self.total_audio_received:.3f}s "
             f"frames_emitted={self.total_frames_emitted} "
@@ -701,7 +707,7 @@ class ChatSession:
         self.current_turn_id = None
 
         # ── TURN_AUDIT: Log state at interruption ──
-        logger.info(
+        logger.debug(
             f"TURN_AUDIT interrupt turnId={interrupted_turn_id} "
             f"audio_recv={self.total_audio_received:.3f}s "
             f"frames_emitted={self.total_frames_emitted} "

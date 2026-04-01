@@ -387,7 +387,7 @@ class ZeroClawBackend(BaseAgent):
             self._metric_stt_finalized_at = time.perf_counter()
             self._metric_input_finalized_at = self._metric_stt_finalized_at
 
-            logger.info(f"User said: {transcript!r}")
+            logger.debug(f"User said: {transcript!r}")
 
             self._append_message("user", transcript)
 
@@ -487,7 +487,7 @@ class ZeroClawBackend(BaseAgent):
                 if not is_filler and self._on_transcript_delta and not self._response_cancelled:
                     await self._on_transcript_delta(original, "assistant", item_id, None)
 
-                logger.debug(f"TTS synthesizing: {sanitized!r}")
+                logger.debug(f"SPEED_TEST tts_synthesize text={sanitized!r}")
                 async for chunk in self._tts.synthesize(sanitized, cancelled=self._tts_cancelled):
                     if self._response_cancelled:
                         break
@@ -498,7 +498,8 @@ class ZeroClawBackend(BaseAgent):
                     if self._on_audio_delta:
                         await self._on_audio_delta(chunk)
 
-                sentence_count += 1
+                if not is_filler:
+                    sentence_count += 1
 
         except asyncio.CancelledError:
             pass
@@ -511,6 +512,9 @@ class ZeroClawBackend(BaseAgent):
         cleaned = _EMAIL_RE.sub("", text)
         cleaned = _URL_RE.sub("", cleaned)
         cleaned = _UNSUPPORTED_TTS_CHARS.sub("", cleaned)
+        # Ensure space after sentence-ending punctuation so Piper TTS
+        # treats them as pauses, not literal "dot"/"exclamation mark".
+        cleaned = re.sub(r"([.!?])([A-Za-z])", r"\1 \2", cleaned)
         return " ".join(cleaned.split())
 
     def _extract_sentences(self, buffer: str, first_chunk: bool = False) -> tuple[list[str], str]:

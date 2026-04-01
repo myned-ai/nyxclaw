@@ -55,6 +55,20 @@ _UNSUPPORTED_TTS_CHARS = re.compile(
 )
 
 
+def _tool_call_filler(tool_name: str, args_str: str = "") -> str:
+    """Generate a spoken filler phrase based on tool name and arguments."""
+    args_lower = args_str.lower()
+    if "calendar" in args_lower or "schedule" in args_lower or "event" in args_lower:
+        return "I'm checking your calendar."
+    if "email" in args_lower or "gmail" in args_lower or "mail" in args_lower:
+        return "I'm going through your emails."
+    if tool_name in ("web_search", "search"):
+        return "I'm searching the web."
+    if tool_name in ("web_fetch", "fetch", "browse"):
+        return "I'm pulling up that page."
+    return "I'm working on that."
+
+
 class OpenClawBackend(BaseAgent):
     """
     OpenClaw agent with optional server-side STT and TTS.
@@ -108,6 +122,10 @@ class OpenClawBackend(BaseAgent):
         self._bargein_speech_frames: int = 0
         self._bargein_grace_until: float = 0.0
 
+        # ── Filler throttle ─────────────────────────────────────────
+        self._last_filler_at: float = 0.0
+        self._filler_history: dict[str, float] = {}
+
         # ── Per-turn latency metrics ────────────────────────────────
         self._metric_input_source: str = "unknown"
         self._metric_input_finalized_at: float | None = None
@@ -122,6 +140,18 @@ class OpenClawBackend(BaseAgent):
         self._metric_tts_done_at: float | None = None
         self._metric_tts_chunks_emitted: int = 0
         self._metric_tts_bytes_emitted: int = 0
+
+    def _should_speak_filler(self, content: str) -> bool:
+        """Consolidated filler throttle: 2s between any filler, 5s between same-content."""
+        now = time.perf_counter()
+        if (now - self._last_filler_at) < 2.0:
+            return False
+        last_same = self._filler_history.get(content, 0.0)
+        if (now - last_same) < 5.0:
+            return False
+        self._last_filler_at = now
+        self._filler_history[content] = now
+        return True
 
     def _append_message(self, role: str, content: str) -> None:
         self._messages.append({"role": role, "content": content})
@@ -602,7 +632,7 @@ class OpenClawBackend(BaseAgent):
             self._metric_stt_finalized_at = time.perf_counter()
             self._metric_input_finalized_at = self._metric_stt_finalized_at
 
-            logger.info(f"User said: {transcript!r}")
+            logger.debug(f"User said: {transcript!r}")
 
             self._append_message("user", transcript)
 
@@ -671,6 +701,7 @@ class OpenClawBackend(BaseAgent):
         self._state.audio_done = False
         self._bargein_speech_frames = 0
         self._bargein_grace_until = time.perf_counter() + 0.5
+        self._filler_history.clear()
         logger.info(f"Starting response stream for session {session_id}")
 
         if self._on_response_start:
@@ -680,7 +711,7 @@ class OpenClawBackend(BaseAgent):
         sentence_buffer = ""
 
         # TTS sentence queue (None = sentinel for "done")
-        tts_queue: asyncio.Queue[tuple[str, str] | None] = asyncio.Queue()
+        tts_queue: asyncio.Queue[tuple[str, str, bool] | None] = asyncio.Queue()
         tts_task: asyncio.Task[None] | None = None
 
         turn_metrics: dict[str, Any] = {
@@ -746,7 +777,7 @@ class OpenClawBackend(BaseAgent):
                         if sanitized:
                             if turn_metrics["tts_first_sentence_at"] is None:
                                 turn_metrics["tts_first_sentence_at"] = time.perf_counter()
-                            await tts_queue.put((remaining, sanitized))
+                            await tts_queue.put((remaining, sanitized, False))
                     await tts_queue.put(None)  # signal TTS worker to stop
                     # Wait for ALL TTS audio to finish before signalling end
                     if tts_task:
@@ -836,7 +867,7 @@ class OpenClawBackend(BaseAgent):
         full_response: str,
         sentence_buffer: str,
         turn_metrics: dict[str, Any],
-        tts_queue: asyncio.Queue[tuple[str, str] | None],
+        tts_queue: asyncio.Queue[tuple[str, str, bool] | None],
         item_id: str,
     ) -> tuple[str, str]:
         """Parse standard OpenAI-compatible SSE stream (data-only lines)."""
@@ -880,7 +911,7 @@ class OpenClawBackend(BaseAgent):
                         continue
                     if turn_metrics["tts_first_sentence_at"] is None:
                         turn_metrics["tts_first_sentence_at"] = time.perf_counter()
-                    await tts_queue.put((sent, sanitized))
+                    await tts_queue.put((sent, sanitized, False))
 
         return full_response, sentence_buffer
 
@@ -890,7 +921,7 @@ class OpenClawBackend(BaseAgent):
         full_response: str,
         sentence_buffer: str,
         turn_metrics: dict[str, Any],
-        tts_queue: asyncio.Queue[tuple[str, str] | None],
+        tts_queue: asyncio.Queue[tuple[str, str, bool] | None],
         item_id: str,
     ) -> tuple[str, str]:
         """Parse avatar SSE stream with custom event types.
@@ -940,8 +971,9 @@ class OpenClawBackend(BaseAgent):
                 full_response += (" " if full_response else "") + content
                 self._state.transcript_buffer = full_response
 
-                # Stream transcript delta (full sentence at once)
-                if self._on_transcript_delta and not self._response_cancelled:
+                # When TTS is active, transcript delta emitted from TTS worker
+                # (synced with audio delivery). Text-only fallback emits here.
+                if not self._tts_available and self._on_transcript_delta and not self._response_cancelled:
                     await self._on_transcript_delta(content, "assistant", item_id, None)
 
                 # Send directly to TTS (already sentence-split by the server)
@@ -950,7 +982,7 @@ class OpenClawBackend(BaseAgent):
                     if sanitized:
                         if turn_metrics["tts_first_sentence_at"] is None:
                             turn_metrics["tts_first_sentence_at"] = time.perf_counter()
-                        await tts_queue.put((content, sanitized))
+                        await tts_queue.put((content, sanitized, False))
 
             elif current_event == "rich_content":
                 rc_content = data.get("content", "")
@@ -960,6 +992,7 @@ class OpenClawBackend(BaseAgent):
 
             elif current_event == "tool_call":
                 tool_name = data.get("name", "unknown")
+                tool_args = str(data.get("args", data.get("arguments", "")))
                 logger.info(f"Tool call: {tool_name}")
 
                 if self._on_tool_call:
@@ -971,6 +1004,14 @@ class OpenClawBackend(BaseAgent):
                         },
                         item_id,
                     )
+
+                # Speak a filler phrase so the avatar isn't silent during tool execution
+                if self._tts_available and not self._response_cancelled:
+                    filler = _tool_call_filler(tool_name, tool_args)
+                    if self._should_speak_filler(filler):
+                        sanitized = self._sanitize_for_tts(filler)
+                        if sanitized:
+                            await tts_queue.put((filler, sanitized, True))
 
             elif current_event == "tool_result":
                 tool_name = data.get("name", "unknown")
@@ -1006,7 +1047,7 @@ class OpenClawBackend(BaseAgent):
 
     async def _tts_worker(
         self,
-        queue: asyncio.Queue[tuple[str, str] | None],
+        queue: asyncio.Queue[tuple[str, str, bool] | None],
         turn_metrics: dict[str, Any],
         item_id: str,
     ) -> None:
@@ -1021,20 +1062,43 @@ class OpenClawBackend(BaseAgent):
         # 200ms silence at output sample rate — natural breath pause between sentences
         pause_samples = int(self._tts.sample_rate * 0.20)
         silence_pad = bytes(pause_samples * 2)
+        # 500ms silence chunk for "thinking" gaps during tool execution.
+        # Capped at 10 rounds (5 seconds) to avoid unbounded accumulation.
+        thinking_silence = bytes(int(0.5 * self._tts.sample_rate) * 2)
+        max_silence_rounds = 10
+        silence_rounds = 0
 
         try:
             while True:
-                item = await queue.get()
+                try:
+                    item = await asyncio.wait_for(queue.get(), timeout=0.5)
+                    silence_rounds = 0
+                except asyncio.TimeoutError:
+                    if self._response_cancelled:
+                        break
+                    if sentence_count > 0 and self._on_audio_delta and silence_rounds < max_silence_rounds:
+                        await self._on_audio_delta(thinking_silence)
+                        silence_rounds += 1
+                    continue
                 if item is None:
                     break
                 if self._response_cancelled:
                     break
 
-                _original, sanitized = item
+                original, sanitized, is_filler = item
+
+                # Skip filler if real content already arrived
+                if is_filler and not queue.empty():
+                    logger.debug("Filler skipped — real content already queued")
+                    continue
 
                 # Breath pause between sentences (not before the first)
                 if sentence_count > 0 and self._on_audio_delta and not self._response_cancelled:
                     await self._on_audio_delta(silence_pad)
+
+                # Skip transcript for fillers — spoken but not part of the real response
+                if not is_filler and self._on_transcript_delta and not self._response_cancelled:
+                    await self._on_transcript_delta(original, "assistant", item_id, None)
 
                 logger.debug(f"TTS synthesizing: {sanitized!r}")
                 async for chunk in self._tts.synthesize(sanitized, cancelled=self._tts_cancelled):
@@ -1047,7 +1111,8 @@ class OpenClawBackend(BaseAgent):
                     if self._on_audio_delta:
                         await self._on_audio_delta(chunk)
 
-                sentence_count += 1
+                if not is_filler:
+                    sentence_count += 1
 
         except asyncio.CancelledError:
             pass
@@ -1064,6 +1129,9 @@ class OpenClawBackend(BaseAgent):
         cleaned = _EMAIL_RE.sub("", text)
         cleaned = _URL_RE.sub("", cleaned)
         cleaned = _UNSUPPORTED_TTS_CHARS.sub("", cleaned)
+        # Ensure space after sentence-ending punctuation so Piper TTS
+        # treats them as pauses, not literal "dot"/"exclamation mark".
+        cleaned = re.sub(r"([.!?])([A-Za-z])", r"\1 \2", cleaned)
         return " ".join(cleaned.split())
 
     def _extract_sentences(self, buffer: str) -> tuple[list[str], str]:

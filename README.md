@@ -7,6 +7,15 @@
 
 NyxClaw is a real-time WebSocket server that bridges our **Any Claw** companion mobile avatar app (based on [Myned](https://myned.ai)'s Nyx) and Claw-based AI backends ([OpenClaw](https://github.com/openclaw/openclaw), [ZeroClaw](https://github.com/zeroclaw-labs/zeroclaw)). It runs the [**Wav2Arkit ONNX**](https://huggingface.co/myned-ai/wav2arkit_cpu) model on every audio chunk, generating 52 ARKit facial blendshapes at 30 FPS for real-time lip-sync on CPU.
 
+Key features:
+
+- **Real-time lip-sync** — Wav2Arkit ONNX produces 52 ARKit blendshapes at 30 FPS on CPU
+- **Tool call fillers** — avatar speaks contextual phrases ("Let me search for that") while the AI executes tools, so the user isn't staring at silence
+- **Thinking silence** — continuous silent frames keep the avatar animated during processing gaps (up to 5 seconds), preventing frozen-avatar moments
+- **Synchronized transcripts** — text appears in sync with audio playback via delivery-clock tracking, not estimated timing
+- **Barge-in** — 4 consecutive VAD speech frames (~128 ms) trigger immediate cancellation of LLM + TTS + playback
+- **Rich content** — structured `{speech, content}` output separates what the avatar says from what the app displays (URLs, tables, code)
+
 Two voice pipelines are supported:
 
 | | **OpenAI Voice** (`VOICE_MODE=openai`) | **Local Voice** (`VOICE_MODE=local`) |
@@ -92,7 +101,7 @@ All settings are configured via environment variables or `.env` file. See [.env.
 
 ## Claw Patches
 
-Backend-specific patches that add the avatar endpoint with structured `{speech, content}` output. When the LLM's response includes content better seen than heard (URLs, tables, structured data), the patch splits the response:
+Backend-specific patches that add the avatar endpoint with structured `{speech, content}` output and tool call events. When the LLM's response includes content better seen than heard (URLs, tables, structured data), the patch splits the response:
 
 - **`speech`** → avatar speaks a short phrase ("Here's the Wikipedia page, take a look.")
 - **`content`** → forwarded as a `rich_content` message (markdown) to the client

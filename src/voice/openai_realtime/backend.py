@@ -90,6 +90,7 @@ class OpenAIRealtimeBackend(BaseAgent):
         self._last_filler_at: float = 0.0
         self._filler_history: dict[str, float] = {}  # filler content → last spoken time
         self._cached_filler_audio: dict[str, bytes] = {}  # phrase → pre-synthesized PCM
+        self._stt_speech_started_at: float = 0.0
 
         # ── OpenAI clients ──────────────────────────────────────────
         self._openai: Any = None  # AsyncOpenAI
@@ -378,7 +379,7 @@ class OpenAIRealtimeBackend(BaseAgent):
                                 "turn_detection": {
                                     "type": self._rt.openai_vad_type,
                                     "create_response": False,
-                                    "eagerness": "low",
+                                    "eagerness": self._rt.openai_vad_eagerness,
                                 },
                             },
                         },
@@ -409,12 +410,16 @@ class OpenAIRealtimeBackend(BaseAgent):
         if event_type == "conversation.item.input_audio_transcription.completed":
             transcript = event.transcript.strip() if event.transcript else ""
             if transcript and not self._is_prompt_hallucination(transcript):
-                logger.info(f"User said: {transcript!r}")
+                stt_ms = ""
+                if self._stt_speech_started_at > 0:
+                    stt_ms = f" stt={int((time.perf_counter() - self._stt_speech_started_at) * 1000)}ms"
+                logger.debug(f"SPEED_TEST stt_done{stt_ms} text={transcript!r}")
                 await self._on_transcript_ready(transcript)
             elif transcript:
                 logger.debug(f"Filtered prompt hallucination: {transcript!r}")
 
         elif event_type == "input_audio_buffer.speech_started":
+            self._stt_speech_started_at = time.perf_counter()
             if self._state.is_responding:
                 total_audio_ms = int(getattr(self, '_total_audio_sent', 0) * 1000)
                 logger.warning(
@@ -424,7 +429,7 @@ class OpenAIRealtimeBackend(BaseAgent):
                 )
                 self.cancel_response()
             else:
-                logger.debug("speech_started while idle (no-op)")
+                logger.debug("SPEED_TEST speech_started")
 
         elif event_type == "error":
             error_msg = str(event.error) if hasattr(event, "error") else str(event)
@@ -458,27 +463,34 @@ class OpenAIRealtimeBackend(BaseAgent):
     async def _on_transcript_ready(self, transcript: str) -> None:
         """User finished speaking — send transcript to LLM."""
         self._turn_t0 = time.perf_counter()
-        logger.debug(f"[TIMELINE] T+0ms: transcript_ready {transcript!r}")
+        logger.debug("SPEED_TEST transcript_ready")
         if self._state.is_responding:
             self.cancel_response()
 
-        # Wait for previous stream task to finish
+        # Fire nano classifier IMMEDIATELY — before cancel/drain so it
+        # runs in parallel with the ~500ms cleanup. This saves ~500ms
+        # on tool-call turns where the filler would otherwise wait.
+        asyncio.create_task(self._classify_and_filler(transcript))
+
+        # Wait for previous stream task to finish.
+        # Skip if the previous turn already completed — avoids ~500ms
+        # of unnecessary cancel/drain on idle turns.
         if self._active_stream_task and not self._active_stream_task.done():
             try:
                 await asyncio.wait_for(self._active_stream_task, timeout=2.0)
             except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
                 pass
 
-        # Send cancel to ZeroClaw AFTER the old stream task is done
-        # (avoids concurrent recv/send on the same WebSocket)
-        if self._settings.agent_type == "zeroclaw" and self._zc_ws is not None:
-            try:
-                await self._zc_ws.send(json.dumps({"type": "cancel"}))
-                logger.debug("Sent cancel to ZeroClaw")
-            except Exception as exc:
-                logger.debug(f"Failed to send cancel to ZeroClaw: {exc}")
-            # Drain stale messages from previous turn
-            await self._drain_ws_until_done(self._zc_ws, timeout=1.0)
+            # Send cancel to ZeroClaw AFTER the old stream task is done
+            # (avoids concurrent recv/send on the same WebSocket)
+            if self._settings.agent_type == "zeroclaw" and self._zc_ws is not None:
+                try:
+                    await self._zc_ws.send(json.dumps({"type": "cancel"}))
+                    logger.debug("Sent cancel to ZeroClaw")
+                except Exception as exc:
+                    logger.debug(f"Failed to send cancel to ZeroClaw: {exc}")
+                # Drain stale messages from previous turn
+                await self._drain_ws_until_done(self._zc_ws, timeout=1.0)
 
         self._append_message("user", transcript)
 
@@ -488,10 +500,6 @@ class OpenAIRealtimeBackend(BaseAgent):
         self._response_cancelled = False
         self._tts_cancelled.clear()
         self._cancel_event.clear()
-
-        # Fire nano intent classifier in parallel — if it's an action request,
-        # TTS a filler phrase immediately while ZeroClaw processes.
-        asyncio.create_task(self._classify_and_filler(transcript))
 
         self._active_stream_task = asyncio.create_task(self._stream_and_speak())
 
@@ -608,7 +616,7 @@ class OpenAIRealtimeBackend(BaseAgent):
             classify_ms = int((time.perf_counter() - t0) * 1000)
             msg = response.choices[0].message
             if not msg.tool_calls or self._response_cancelled:
-                logger.debug(f"[TIMELINE] Nano classifier: chitchat ({classify_ms}ms)")
+                logger.debug(f"SPEED_TEST nano_classifier result=chitchat latency={classify_ms}ms")
                 return
 
             import json as _json
@@ -621,7 +629,7 @@ class OpenAIRealtimeBackend(BaseAgent):
                 logger.debug("[TIMELINE] Nano classifier: suppressed by throttle")
                 return
 
-            logger.info(f"[TIMELINE] Nano classifier: action ({classify_ms}ms) filler={filler!r}")
+            logger.debug(f"SPEED_TEST nano_classifier result=action latency={classify_ms}ms filler={filler!r}")
 
             # Route through TTS queue — use filler as sanitized too so it
             # matches the pre-cached audio key in _cached_filler_audio.
@@ -890,7 +898,7 @@ class OpenAIRealtimeBackend(BaseAgent):
 
         websocket = await self._ensure_zc_ws()
         t0 = getattr(self, '_turn_t0', time.perf_counter())
-        logger.debug(f"[TIMELINE] T+{(time.perf_counter()-t0)*1000:.0f}ms: ZeroClaw WS send")
+        logger.debug(f"SPEED_TEST zeroclaw_send T+{(time.perf_counter()-t0)*1000:.0f}ms")
         await websocket.send(json.dumps({"type": "message", "content": user_content}))
 
         has_content = False
@@ -938,7 +946,7 @@ class OpenAIRealtimeBackend(BaseAgent):
 
             if not first_event_logged:
                 first_event_logged = True
-                logger.debug(f"[TIMELINE] T+{(time.perf_counter()-t0)*1000:.0f}ms: ZeroClaw first event ({msg_type})")
+                logger.debug(f"SPEED_TEST zeroclaw_first_event T+{(time.perf_counter()-t0)*1000:.0f}ms type={msg_type}")
 
             if msg_type == "error":
                 error_msg = message.get("message", "Unknown ZeroClaw error")
@@ -968,11 +976,11 @@ class OpenAIRealtimeBackend(BaseAgent):
                 if is_filler:
                     # Filler: TTS only, don't add to transcript/history.
                     if content and tts_queue is not None and self._should_speak_filler(content):
-                        logger.info(f"ZeroClaw tool filler: {content!r}")
+                        logger.debug(f"SPEED_TEST zeroclaw_filler T+{(time.perf_counter()-t0)*1000:.0f}ms text={content!r}")
                         await tts_queue.put((content, content, True))
                     continue
                 if content and not has_content:
-                    logger.debug(f"[TIMELINE] T+{(time.perf_counter()-t0)*1000:.0f}ms: first speech_chunk ({len(content)} chars)")
+                    logger.debug(f"SPEED_TEST zeroclaw_first_speech T+{(time.perf_counter()-t0)*1000:.0f}ms chars={len(content)}")
                 if content:
                     has_content = True
                     yield content
@@ -1144,6 +1152,7 @@ class OpenAIRealtimeBackend(BaseAgent):
             self._state.is_responding = False
             self._state.audio_done = True
             self._active_stream_task = None
+            self._active_tts_queue = None
 
     # ================================================================
     # TTS worker (OpenAI TTS API)
@@ -1203,7 +1212,7 @@ class OpenAIRealtimeBackend(BaseAgent):
                 # Check for pre-cached filler audio first
                 cached_pcm = self._cached_filler_audio.get(sanitized)
                 if cached_pcm is not None:
-                    logger.debug(f"[TIMELINE] T+{(tts_start-t0)*1000:.0f}ms: TTS cached filler ({sanitized[:40]!r}, {len(cached_pcm)}B)")
+                    logger.debug(f"SPEED_TEST tts_cached_filler T+{(tts_start-t0)*1000:.0f}ms text={sanitized[:40]!r} bytes={len(cached_pcm)}")
                     delivery_bytes = 24000 // 10 * 2
                     offset = 0
                     while offset < len(cached_pcm) and not self._response_cancelled:
@@ -1226,10 +1235,11 @@ class OpenAIRealtimeBackend(BaseAgent):
                             await self._on_audio_delta(chunk)
                             self._total_audio_sent += (end - offset) / (24000 * 2)
                         offset = end
-                    sentence_count += 1
+                    if not is_filler:
+                        sentence_count += 1
                     continue
 
-                logger.debug(f"[TIMELINE] T+{(tts_start-t0)*1000:.0f}ms: TTS request ({sanitized[:40]!r})")
+                logger.debug(f"SPEED_TEST tts_request T+{(tts_start-t0)*1000:.0f}ms text={sanitized[:40]!r}")
                 tts_first_chunk = False
 
                 try:
@@ -1253,7 +1263,7 @@ class OpenAIRealtimeBackend(BaseAgent):
                                 break
                             if not tts_first_chunk:
                                 tts_first_chunk = True
-                                logger.debug(f"[TIMELINE] T+{(time.perf_counter()-t0)*1000:.0f}ms: TTS first audio chunk (TTS TTFT={(time.perf_counter()-tts_start)*1000:.0f}ms)")
+                                logger.debug(f"SPEED_TEST tts_first_audio T+{(time.perf_counter()-t0)*1000:.0f}ms ttft={int((time.perf_counter()-tts_start)*1000)}ms")
                                 # Emit transcript on first audio chunk so it syncs with audio
                                 if not transcript_emitted and self._on_transcript_delta and not self._response_cancelled:
                                     transcript_emitted = True
@@ -1286,7 +1296,8 @@ class OpenAIRealtimeBackend(BaseAgent):
                         break
                     continue
 
-                sentence_count += 1
+                if not is_filler:
+                    sentence_count += 1
 
         except asyncio.CancelledError:
             pass
