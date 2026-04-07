@@ -821,6 +821,19 @@ class ZeroClawBackend(BaseAgent):
                             await self._on_tool_call("rich_content", {"content": rc_content}, item_id)
                     continue
 
+                if message_type == "tool_result":
+                    # Forward tool results — nyxclaw extracts thumbnail hints from output
+                    if self._on_tool_call:
+                        await self._on_tool_call(
+                            "tool_result",
+                            {
+                                "name": message.get("name", "unknown"),
+                                "output": str(message.get("output", "")),
+                            },
+                            item_id,
+                        )
+                    continue
+
                 if message_type == "tool_call":
                     tool_name = message.get("name", "unknown")
                     tool_args = message.get("args", {})

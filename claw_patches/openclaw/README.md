@@ -175,6 +175,49 @@ Replace `openai/gpt-4.1` with your actual model. Merge these into your existing 
 
 These values are optimized for snappy voice responses. Depending on your use case you may want different tradeoffs — for example, raising `maxTokens` if your agent gives detailed answers, enabling `thinkingDefault: "minimal"` if response quality matters more than speed, or increasing `temperature` for more creative output. Experiment and find what works best for your setup.
 
+## Rich Content Thumbnails
+
+nyxclaw automatically enriches `rich_content` URLs with link card metadata (title, description, thumbnail) by scraping OpenGraph tags from each page. This works for most sites, but pages behind Cloudflare or bot protection will block the scrape and fall back to a favicon.
+
+### Current limitation
+
+OpenClaw's agent event system does not include tool output in `tool_result` SSE events. This means nyxclaw cannot receive thumbnail hints from tools via the current patch. Rich content thumbnails rely entirely on OGP scraping + favicon fallback.
+
+### How to enable thumbnail hints (requires OpenClaw source change)
+
+If you need provider-quality thumbnails (e.g., from Brave Search), you need to:
+
+1. **Extend OpenClaw's agent event emitter** to include `output` in tool events with `phase: "end"`:
+   ```typescript
+   // In OpenClaw's agent runner, when emitting tool completion:
+   emit({ stream: "tool", data: { phase: "end", name, toolCallId, isError, output: toolOutput } });
+   ```
+
+2. **Update the avatar patch** (`avatar-http.ts`) to forward the output:
+   ```typescript
+   } else if (data.phase === "end") {
+     writeAvatarEvent(res, "tool_result", {
+       name: data.name,
+       tool_call_id: data.toolCallId,
+       success: !data.isError,
+       duration_ms: durationMs,
+       output: (data as any).output ?? "",  // Forward tool output
+     });
+   }
+   ```
+
+3. **Append thumbnail hints** in your search tool's output (same format as ZeroClaw — see ZeroClaw README for details):
+   ```
+   ---THUMBNAIL_HINTS---
+   https://example.com/article	https://cdn.example.com/thumb.jpg
+   ```
+
+nyxclaw already handles `tool_result` events with `output` from both backends — once OpenClaw sends the output, thumbnails will work automatically.
+
+### Without this change
+
+Everything works — nyxclaw fetches OGP metadata for each URL and falls back to favicons for blocked sites. No thumbnails from the search provider are available, but the cards still render with titles and descriptions from OGP.
+
 ## SSE Protocol Reference
 
 ### Request (POST)

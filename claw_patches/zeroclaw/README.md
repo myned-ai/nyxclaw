@@ -186,6 +186,74 @@ Your `playground/AGENTS.md`, `IDENTITY.md`, and `SOUL.md` files are injected int
 
 These values are optimized for snappy voice responses. Depending on your use case you may want different tradeoffs — for example, raising `max_history_messages` for longer conversations, enabling `reasoning_enabled` for complex tasks, or increasing `max_tool_iterations` if your agent uses many tools. Experiment and find what works best for your setup.
 
+## Rich Content Thumbnails
+
+nyxclaw automatically enriches `rich_content` URLs with link card metadata (title, description, thumbnail) by scraping OpenGraph tags from each page. This works for most sites, but pages behind Cloudflare or bot protection will block the scrape and fall back to a low-quality favicon.
+
+To provide high-quality thumbnails for all sites, tools can include **thumbnail hints** in their output. nyxclaw picks these up from `tool_result` events and uses them as fallbacks when OGP scraping fails.
+
+### How it works
+
+1. Your tool appends a `---THUMBNAIL_HINTS---` footer to its text output
+2. ZeroClaw sends the output in the `tool_result` event (this already happens — no channel changes needed)
+3. nyxclaw parses the footer, stores URL-to-thumbnail mappings for the current turn
+4. When `rich_content` arrives with those URLs, nyxclaw uses the hints for any card where OGP scraping failed
+
+### Thumbnail hints format
+
+Append this to your tool's output text:
+
+```
+---THUMBNAIL_HINTS---
+https://example.com/article	https://cdn.example.com/thumb1.jpg
+https://other.com/page	https://cdn.example.com/thumb2.jpg
+```
+
+- Sentinel line `---THUMBNAIL_HINTS---` marks the start
+- One mapping per line, tab-separated: `page_url<TAB>thumbnail_url`
+- Only include URLs that have thumbnails — missing URLs are fine
+- The LLM sees this footer but ignores it (no conversational value)
+
+### Per-provider examples
+
+Each search provider returns thumbnails differently. Here's how to extract them:
+
+**Brave Search API** (already implemented in our deployment):
+```rust
+// result.thumbnail.src contains the pre-crawled thumbnail
+if let Some(thumb) = result.get("thumbnail").and_then(|t| t.get("src")).and_then(|s| s.as_str()) {
+    thumbnail_hints.push((url.to_string(), thumb.to_string()));
+}
+```
+
+**Serper API** (Google Search):
+```python
+# result["imageUrl"] or result["thumbnailUrl"]
+thumb = result.get("imageUrl") or result.get("thumbnailUrl")
+```
+
+**Tavily API**:
+```python
+# result["image"] contains the thumbnail
+thumb = result.get("image")
+```
+
+**Custom tool / web_fetch**:
+```python
+# If your tool fetches a page and finds og:image, pass it through
+thumb = extract_og_image(html)  # your own extraction
+```
+
+### Thumbnail cascade
+
+nyxclaw applies thumbnails in this order (per URL):
+
+1. **OGP scrape** — fetches `og:image` from the actual page (~70% success rate)
+2. **Provider thumbnail hint** — used when OGP scraping failed or returned only a favicon
+3. **Favicon fallback** — Google favicons API (always works, low quality)
+
+If your tool doesn't provide hints, everything still works — nyxclaw falls back to OGP + favicon automatically.
+
 ## WebSocket Protocol: `/ws/avatar`
 
 ### Client → Server

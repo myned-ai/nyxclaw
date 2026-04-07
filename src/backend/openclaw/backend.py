@@ -1023,6 +1023,7 @@ class OpenClawBackend(BaseAgent):
                         "tool_result",
                         {
                             "name": tool_name,
+                            "output": data.get("output", ""),
                             "success": success,
                             "duration_ms": duration_ms,
                         },

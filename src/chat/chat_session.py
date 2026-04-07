@@ -13,6 +13,7 @@ from core.logger import get_logger
 from core.settings import Settings
 from services import Wav2ArkitService, create_agent_instance
 from services.conversation_store import get_conversation_store
+from utils.ogp import extract_thumbnail_hints, extract_urls, fetch_ogp_batch
 
 logger = get_logger(__name__)
 
@@ -26,11 +27,11 @@ import re
 _TRANSCRIPT_CHARS_PER_SEC = 14.0
 
 _RICH_PATTERNS = re.compile(
-    r"https?://"        # URLs
-    r"|^\|.+\|$"        # Markdown table rows
-    r"|^```"            # Code blocks
-    r"|!\[.*\]\(.*\)"   # Images
-    r"|\[.*\]\(.*\)",   # Markdown links
+    r"https?://"  # URLs
+    r"|^\|.+\|$"  # Markdown table rows
+    r"|^```"  # Code blocks
+    r"|!\[.*\]\(.*\)"  # Images
+    r"|\[.*\]\(.*\)",  # Markdown links
     re.MULTILINE,
 )
 
@@ -125,6 +126,13 @@ class ChatSession:
         # Background tasks
         self.frame_emit_task: asyncio.Task | None = None
         self.inference_task: asyncio.Task | None = None
+        self._ogp_tasks: set[asyncio.Task] = set()
+
+        # Per-turn thumbnail hints from tool_result events (URL → thumbnail URL)
+        self._turn_thumbnail_hints: dict[str, str] = {}
+
+        # Warmup turn — skip conversation store persistence
+        self._is_warmup_turn: bool = False
 
         # Thread safety and re-entry prevention during interruptions
         self._interruption_lock = asyncio.Lock()
@@ -191,7 +199,9 @@ class ChatSession:
 
         # Warmup: greet the user and prime the LLM prompt cache.
         # Brief delay so the avatar doesn't speak before the UI is ready.
+        # Marked as warmup so it's not persisted to conversation history.
         await asyncio.sleep(0.5)
+        self._is_warmup_turn = True
         self.agent.send_text_message("Hi")
 
     async def stop(self) -> None:
@@ -201,6 +211,9 @@ class ChatSession:
 
         await self._cancel_and_wait_task(self.inference_task)
         await self._cancel_and_wait_task(self.frame_emit_task)
+        for task in self._ogp_tasks:
+            await self._cancel_and_wait_task(task)
+        self._ogp_tasks.clear()
 
         # Shutdown executor
         self._inference_executor.shutdown(wait=False)
@@ -229,20 +242,39 @@ class ChatSession:
             message_str = orjson.dumps(message).decode("utf-8")
             await self.websocket.send_text(message_str)
         except Exception as e:
+            msg_type = message.get("type", "unknown")
             # Silence expected errors on disconnect
             if "Unexpected ASGI message" in str(e) or "websocket.close" in str(e):
                 logger.debug(f"Socket closed while sending to {self.session_id}: {e}")
+            elif msg_type == "sync_frame":
+                frame_idx = message.get("frameIndex", "?")
+                logger.warning(f"Session {self.session_id}: sync_frame #{frame_idx} send failed: {e}")
             else:
-                logger.error(f"Error sending to client {self.session_id}: {e}")
+                logger.error(f"Error sending {msg_type} to client {self.session_id}: {e}")
 
     async def _handle_tool_call(self, name: str, arguments: dict, item_id: str | None = None) -> None:
         """Handle an agent event — forward rich content or tool calls to client."""
 
-        # Rich content from avatar channel (structured output: {speech, content})
-        if name == "rich_content":
+        # Accumulate thumbnail hints from tool_result events (arrives before rich_content)
+        if name == "tool_result":
+            output = arguments.get("output", "")
+            if output:
+                hints = extract_thumbnail_hints(output)
+                if hints:
+                    self._turn_thumbnail_hints.update(hints)
+                    logger.info(
+                        f"Session {self.session_id}: Accumulated {len(hints)} thumbnail hints "
+                        f"from {arguments.get('name', 'unknown')}"
+                    )
+            return
+
+        # Rich content from avatar channel (structured output) or send_rich_content tool
+        if name in ("rich_content", "send_rich_content"):
             content = arguments.get("content", "")
             if content and _has_rich_elements(content):
                 logger.info(f"Session {self.session_id}: Forwarding rich content ({len(content)} chars)")
+
+                # Build base message immediately
                 msg: dict = {
                     "type": "rich_content",
                     "content": content,
@@ -252,15 +284,76 @@ class ChatSession:
                     msg["previousItemId"] = item_id
                 elif self.current_turn_id:
                     msg["previousItemId"] = self.current_turn_id
+
+                # Send base message immediately so the client always gets it
                 await self.send_json(msg)
+
+                # Enrich with link cards in background — sends a follow-up
+                # rich_content_update message when OGP metadata resolves
+                urls = extract_urls(content)
+                if urls:
+                    hints = dict(self._turn_thumbnail_hints) if self._turn_thumbnail_hints else None
+                    task = asyncio.create_task(self._enrich_and_send_rich_content(msg, urls, hints))
+                    self._ogp_tasks.add(task)
+                    task.add_done_callback(self._ogp_tasks.discard)
+
                 # Persist rich content attached to the last assistant message
-                await asyncio.to_thread(get_conversation_store().append, "assistant", "", rich_content=content, item_id=item_id)
+                await asyncio.to_thread(
+                    get_conversation_store().append, "assistant", "", rich_content=content, item_id=item_id
+                )
             elif content:
                 logger.info(f"Session {self.session_id}: Skipped plain-text rich content ({len(content)} chars)")
             return
 
         # Other tool calls — log but don't forward to client
         logger.info(f"Session {self.session_id}: Tool call '{name}' (not forwarded)")
+
+    async def _enrich_and_send_rich_content(
+        self, msg: dict, urls: list[str], thumbnail_hints: dict[str, str] | None = None
+    ) -> None:
+        """Background task: fetch OGP metadata, send cards as a follow-up update."""
+        try:
+            metadata_list = await fetch_ogp_batch(urls)
+
+            # Build cards: OGP results + hint-only cards for URLs where OGP failed
+            ogp_urls = {m.url for m in metadata_list}
+            cards = []
+            for m in metadata_list:
+                card = m.to_card()
+                # Apply provider thumbnail hint when OGP yielded no image or only favicon
+                if thumbnail_hints and m.url in thumbnail_hints:
+                    existing = card.get("thumbnail", "")
+                    if not existing or "google.com/s2/favicons" in existing:
+                        card["thumbnail"] = thumbnail_hints[m.url]
+                cards.append(card)
+
+            # Create cards from thumbnail hints for URLs where OGP failed entirely
+            if thumbnail_hints:
+                for url in urls[:5]:
+                    if url not in ogp_urls and url in thumbnail_hints:
+                        cards.append(
+                            {
+                                "type": "link_card",
+                                "url": url,
+                                "thumbnail": thumbnail_hints[url],
+                            }
+                        )
+
+            if cards:
+                update: dict = {
+                    "type": "rich_content_update",
+                    "cards": cards,
+                    "timestamp": int(time.time() * 1000),
+                }
+                if msg.get("previousItemId"):
+                    update["previousItemId"] = msg["previousItemId"]
+                logger.info(f"Session {self.session_id}: Sending rich_content_update ({len(cards)} cards)")
+                await self.send_json(update)
+                logger.info(f"Session {self.session_id}: rich_content_update sent successfully")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(f"Session {self.session_id}: OGP enrichment failed")
 
     async def _drain_queue(self, queue: asyncio.Queue) -> None:
         """Helper to flush an asyncio queue."""
@@ -287,6 +380,8 @@ class ChatSession:
             )
         self.current_turn_session_id = session_id  # Store turn-level session ID
         self.current_turn_id = f"turn_{int(time.time() * 1000)}_{session_id[:8]}"
+        self._turn_thumbnail_hints.clear()
+        self._is_warmup_turn = False
         self.speech_start_time = time.time()
         self.actual_audio_start_time = 0
         self.total_frames_emitted = 0
@@ -366,9 +461,7 @@ class ChatSession:
 
             if self._last_response_start_at > 0:
                 model_to_first_audio_ms = (first_audio_now - self._last_response_start_at) * 1000
-                logger.debug(
-                    f"SPEED_TEST first_audio_chunk model_to_audio={model_to_first_audio_ms:.0f}ms"
-                )
+                logger.debug(f"SPEED_TEST first_audio_chunk model_to_audio={model_to_first_audio_ms:.0f}ms")
 
             if self._last_user_transcript_finalized_at > 0:
                 user_to_first_audio_ms = (first_audio_now - self._last_user_transcript_finalized_at) * 1000
@@ -510,8 +603,9 @@ class ChatSession:
             if item_id:
                 msg["itemId"] = item_id
             await self.send_json(msg)
-            # Persist to conversation log
-            await asyncio.to_thread(get_conversation_store().append, "assistant", transcript, item_id=item_id)
+            # Persist to conversation log (skip warmup turns)
+            if not self._is_warmup_turn:
+                await asyncio.to_thread(get_conversation_store().append, "assistant", transcript, item_id=item_id)
         else:
             logger.warning(f"Session {self.session_id}: transcript_done SKIPPED — empty transcript")
 
@@ -640,8 +734,9 @@ class ChatSession:
                 "timestamp": int(time.time() * 1000),
             }
         )
-        # Persist to conversation log
-        await asyncio.to_thread(get_conversation_store().append, "user", transcript)
+        # Persist to conversation log (skip warmup turns)
+        if not self._is_warmup_turn:
+            await asyncio.to_thread(get_conversation_store().append, "user", transcript)
 
     async def _calculate_truncated_text(self) -> str:
         """Helper to calculate truncated text based on audio duration."""
@@ -869,7 +964,9 @@ class ChatSession:
                     logger.warning("Inference returned no frames")
 
         except asyncio.CancelledError:
-            logger.info(f"Session {self.session_id}: Inference worker cancelled (chunks_processed={inference_chunks_processed})")
+            logger.info(
+                f"Session {self.session_id}: Inference worker cancelled (chunks_processed={inference_chunks_processed})"
+            )
         except Exception as e:
             logger.error(f"Session {self.session_id} inference worker fatal error: {e}", exc_info=True)
 
@@ -1018,7 +1115,9 @@ class ChatSession:
                 if audio_b64:
                     # Reject oversized audio chunks (max ~750KB PCM = ~15s at 24kHz)
                     if len(audio_b64) > 1_000_000:
-                        logger.warning(f"Session {self.session_id}: Audio chunk too large ({len(audio_b64)} bytes), dropping")
+                        logger.warning(
+                            f"Session {self.session_id}: Audio chunk too large ({len(audio_b64)} bytes), dropping"
+                        )
                         return
                     audio_bytes = base64.b64decode(audio_b64)
 

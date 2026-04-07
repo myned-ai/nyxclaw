@@ -865,7 +865,12 @@ class OpenAIRealtimeBackend(BaseAgent):
                     if self._on_tool_call:
                         await self._on_tool_call(
                             "tool_result",
-                            {"name": tool_name, "success": success, "duration_ms": duration_ms},
+                            {
+                                "name": tool_name,
+                                "output": data.get("output", ""),
+                                "success": success,
+                                "duration_ms": duration_ms,
+                            },
                             self._state.item_id,
                         )
 
@@ -961,6 +966,18 @@ class OpenAIRealtimeBackend(BaseAgent):
                     if rc_content:
                         logger.info(f"Rich content received ({len(rc_content)} chars)")
                         await self._on_tool_call("rich_content", {"content": rc_content}, self._state.item_id)
+                continue
+
+            if msg_type == "tool_result":
+                if self._on_tool_call:
+                    await self._on_tool_call(
+                        "tool_result",
+                        {
+                            "name": message.get("name", "unknown"),
+                            "output": str(message.get("output", "")),
+                        },
+                        self._state.item_id,
+                    )
                 continue
 
             if msg_type == "tool_call":
