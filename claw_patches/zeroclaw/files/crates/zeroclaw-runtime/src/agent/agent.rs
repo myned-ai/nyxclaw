@@ -2048,6 +2048,184 @@ mod tests {
         }
     }
 
+    /// Captures the response_format and full message list from each
+    /// `chat` and `stream_chat` call. Used to verify that the
+    /// `set_response_format` and `set_prompt_builder` setters actually
+    /// flow through to the provider's ChatRequest on the next turn.
+    struct RequestCaptureProvider {
+        /// Set to the request.response_format value of the most recent
+        /// `chat`/`stream_chat` call (None if the field was None).
+        captured_response_format: Arc<Mutex<Option<serde_json::Value>>>,
+        /// Set to the messages slice (cloned) of the most recent
+        /// `chat`/`stream_chat` call.
+        captured_messages: Arc<Mutex<Vec<ChatMessage>>>,
+    }
+
+    #[async_trait]
+    impl Provider for RequestCaptureProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            Ok("ok".into())
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<zeroclaw_providers::ChatResponse> {
+            *self.captured_response_format.lock() = request.response_format.cloned();
+            *self.captured_messages.lock() = request.messages.to_vec();
+            Ok(zeroclaw_providers::ChatResponse {
+                text: Some("done".into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+
+        fn supports_streaming(&self) -> bool {
+            // Force the agent down the non-streaming `chat` path so the
+            // tests don't need to mock a streaming response.
+            false
+        }
+    }
+
+    fn build_capture_agent(
+        captured_format: Arc<Mutex<Option<serde_json::Value>>>,
+        captured_messages: Arc<Mutex<Vec<ChatMessage>>>,
+    ) -> Agent {
+        let provider = Box::new(RequestCaptureProvider {
+            captured_response_format: captured_format,
+            captured_messages,
+        });
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        Agent::builder()
+            .provider(provider)
+            .tools(vec![])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config")
+    }
+
+    #[tokio::test]
+    async fn set_response_format_threads_to_provider_chat_request() {
+        // Pin the contract: agent.set_response_format(Some(schema)) must
+        // result in that exact schema landing on ChatRequest.response_format
+        // for the next provider call. Without this, the avatar handler's
+        // "force structured output" guarantee silently breaks.
+        let captured_format = Arc::new(Mutex::new(None));
+        let captured_messages = Arc::new(Mutex::new(vec![]));
+        let mut agent =
+            build_capture_agent(captured_format.clone(), captured_messages.clone());
+
+        let schema = serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {"name": "test", "strict": true}
+        });
+        agent.set_response_format(Some(schema.clone()));
+
+        let _ = agent.turn("hi").await.expect("turn should succeed");
+
+        assert_eq!(
+            *captured_format.lock(),
+            Some(schema),
+            "schema set via setter must reach the provider verbatim"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_response_format_none_propagates_as_none() {
+        // The clear-out path: setting the format then unsetting it must
+        // result in a None on the next turn (not a stale Some).
+        let captured_format = Arc::new(Mutex::new(None));
+        let captured_messages = Arc::new(Mutex::new(vec![]));
+        let mut agent =
+            build_capture_agent(captured_format.clone(), captured_messages.clone());
+
+        agent.set_response_format(Some(serde_json::json!({"type": "json_object"})));
+        agent.set_response_format(None);
+
+        let _ = agent.turn("hi").await.expect("turn should succeed");
+
+        assert!(
+            captured_format.lock().is_none(),
+            "set_response_format(None) must clear the field on the next turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_prompt_builder_without_datetime_strips_section_from_system_prompt() {
+        // Pin the cache-stability guarantee: the avatar handler relies
+        // on without_section("datetime") to keep the OpenAI prompt
+        // cache warm. Verify the section actually disappears from the
+        // system prompt that reaches the provider.
+        let captured_format = Arc::new(Mutex::new(None));
+        let captured_messages = Arc::new(Mutex::new(vec![]));
+        let mut agent =
+            build_capture_agent(captured_format, captured_messages.clone());
+
+        agent.set_prompt_builder(
+            crate::agent::prompt::SystemPromptBuilder::with_defaults()
+                .without_section("datetime"),
+        );
+
+        let _ = agent.turn("hi").await.expect("turn should succeed");
+
+        let messages = captured_messages.lock().clone();
+        let system = messages
+            .iter()
+            .find(|m| m.role == "system")
+            .expect("system message must be present");
+        assert!(
+            !system.content.contains("CRITICAL CONTEXT: CURRENT DATE & TIME"),
+            "DateTimeSection marker must be absent after without_section(\"datetime\"); \
+             got system prompt: {}",
+            system.content
+        );
+    }
+
+    #[tokio::test]
+    async fn set_prompt_builder_default_includes_datetime_section() {
+        // Negative control for the test above — the default builder
+        // (no without_section) DOES include the datetime section, so
+        // the absence in the previous test is meaningful.
+        let captured_format = Arc::new(Mutex::new(None));
+        let captured_messages = Arc::new(Mutex::new(vec![]));
+        let mut agent =
+            build_capture_agent(captured_format, captured_messages.clone());
+
+        agent.set_prompt_builder(crate::agent::prompt::SystemPromptBuilder::with_defaults());
+
+        let _ = agent.turn("hi").await.expect("turn should succeed");
+
+        let messages = captured_messages.lock().clone();
+        let system = messages
+            .iter()
+            .find(|m| m.role == "system")
+            .expect("system message must be present");
+        assert!(
+            system.content.contains("CRITICAL CONTEXT: CURRENT DATE & TIME"),
+            "default prompt builder MUST include datetime section"
+        );
+    }
+
     #[tokio::test]
     async fn turn_streamed_passes_tool_specs_to_provider() {
         let tools_received = Arc::new(Mutex::new(Vec::new()));

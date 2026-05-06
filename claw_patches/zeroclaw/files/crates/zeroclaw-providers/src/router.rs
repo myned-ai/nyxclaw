@@ -274,6 +274,17 @@ impl Provider for RouterProvider {
             .any(|(_, provider)| provider.supports_streaming_tool_events())
     }
 
+    fn supports_response_format(&self) -> bool {
+        // Conservative: all routed providers must honor it, otherwise a
+        // route to a non-supporting provider would silently drop the
+        // schema. See ReliableProvider for the same reasoning.
+        !self.providers.is_empty()
+            && self
+                .providers
+                .iter()
+                .all(|(_, p)| p.supports_response_format())
+    }
+
     fn stream_chat_with_history(
         &self,
         messages: &[ChatMessage],

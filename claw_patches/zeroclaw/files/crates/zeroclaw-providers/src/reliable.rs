@@ -1102,6 +1102,18 @@ impl Provider for ReliableProvider {
             .any(|(_, p)| p.supports_streaming_tool_events())
     }
 
+    fn supports_response_format(&self) -> bool {
+        // ReliableProvider falls back across providers; structured-output
+        // callers must assume the strictest policy — only true when ALL
+        // candidates support it. Otherwise a fallback path could silently
+        // strip the schema.
+        !self.providers.is_empty()
+            && self
+                .providers
+                .iter()
+                .all(|(_, p)| p.supports_response_format())
+    }
+
     fn stream_chat(
         &self,
         request: ChatRequest<'_>,

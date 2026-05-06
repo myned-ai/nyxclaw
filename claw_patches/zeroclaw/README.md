@@ -26,21 +26,48 @@ The patch ships as a single `git apply`-able file: [`zeroclaw-v0.7.4-nyxclaw.pat
 
 | Layer | Crate / file | Change |
 |-------|--------------|--------|
-| API | `zeroclaw-api/src/provider.rs` | Add `response_format: Option<&serde_json::Value>` to `ChatRequest` |
-| Runtime | `zeroclaw-runtime/src/agent/agent.rs` | Add `response_format` field + builder + `set_response_format`/`set_prompt_builder` setters; thread into `Agent::turn` and `Agent::turn_streamed` |
+| API | `zeroclaw-api/src/provider.rs` | Add `response_format: Option<&serde_json::Value>` to `ChatRequest`; new `Provider::supports_response_format()` capability method (default `false`) |
+| Runtime | `zeroclaw-runtime/src/agent/agent.rs` | Add `response_format` field + builder + `set_response_format`/`set_prompt_builder` setters; thread into `Agent::turn` and `Agent::turn_streamed`. **Tests**: 4 setter / prompt-builder tests with a `RequestCaptureProvider` mock |
 | Runtime | `zeroclaw-runtime/src/agent/loop_.rs` | `response_format: None` defaults in `run_tool_call_loop`'s `ChatRequest` sites (orchestrator/delegate paths) |
 | Runtime | `zeroclaw-runtime/src/agent/prompt.rs` | New `SystemPromptBuilder::without_section(name)` for stripping `DateTimeSection` (cache-stable system prompt) |
-| Providers | `zeroclaw-providers/src/openai.rs` | Native SSE streaming impl: `stream_chat()`, tool-call delta accumulation by `index`, `parse_openai_sse_lines` helper, full streaming-with-structured-output support |
-| Providers | `zeroclaw-providers/src/anthropic.rs` | `response_format: None` default (Anthropic uses forced tool-calls; not wired here) |
-| Providers | `zeroclaw-providers/src/reliable.rs` | Pass-through of `response_format` in 2 reconstruction sites; `None` defaults in 7 test sites |
-| Providers | `zeroclaw-providers/src/openrouter.rs`, `router.rs` | `None` defaults in 3 test sites |
+| Providers | `zeroclaw-providers/src/openai.rs` | Native SSE streaming impl: `stream_chat()`, tool-call delta accumulation by `index` (mandatory; missing-index deltas skipped, id rebinding is first-write-wins), `parse_openai_sse_lines` helper with **1 MiB per-line cap**, advertises `supports_response_format() = true` |
+| Providers | `zeroclaw-providers/src/anthropic.rs` | `response_format: None` default (Anthropic doesn't honor the field — the avatar handler now skips `set_response_format` here via the capability gate) |
+| Providers | `zeroclaw-providers/src/reliable.rs` | Pass-through of `response_format` + conservative AND-policy `supports_response_format()` (only true when every fallback candidate honors the field) |
+| Providers | `zeroclaw-providers/src/openrouter.rs`, `router.rs` | `None` defaults; `Router` uses the same conservative AND-policy as `Reliable` |
 | Gateway | `zeroclaw-gateway/src/lib.rs` | Register `/ws/avatar` route; add `pub mod nyxclaw` |
-| Gateway | `zeroclaw-gateway/src/nyxclaw.rs` | **NEW** — Avatar WebSocket channel: incremental JSON extractor, sentence-split speech_chunk emission, tool-call fillers, barge-in with `cancel_tokens` registry, `scope_session_key` task-local, partial-content persistence on streaming chunks |
+| Gateway | `zeroclaw-gateway/src/nyxclaw.rs` | **NEW** — Avatar WebSocket channel. **Hardened post-review**: `TurnOutcome` state machine (Completed / Cancelled / Disconnected / Failed) replaces error-string classification; `session_queue.acquire` serializes per-`session_id` to prevent cross-connection corruption; `session_id` charset validation (`[A-Za-z0-9_-]{1,128}`); WS frame caps (64 KiB / 256 KiB), per-message user-content cap (32 KiB), `accumulated_raw` cap (1 MiB) with cancel-on-overflow; `AvatarJsonExtractor` field caps (64 KiB); `Provider::supports_response_format()` capability gate (Anthropic etc. fall back to plain-prose narration without lying about the contract); barge-in race fix (drop `biased;` + post-loop `now_or_never` receiver poll); pure `classify_turn_event` helper for testable WS-frame contracts; `chunk_reset` + `consolidate_turn` for parity with `/ws/chat` |
 | Binary | `src/providers/traits.rs`, `tests/live/openai_codex_vision_e2e.rs` | `response_format: None` defaults in 8 test sites |
 
 Inspectable copies of every modified file live under [`files/`](./files/), mirroring the v0.7.4 crate layout.
 
-**Stats**: 13 files, +1671 / −1 lines, 1041 lines of which are the new `nyxclaw.rs` module.
+**Stats**: 13 files, +2871 / −1 lines, ~1900 lines of which are `nyxclaw.rs` (orchestration + 24 unit tests).
+
+## Hardening (post-review)
+
+After the initial port, a 5-agent code review surfaced 11 distinct
+correctness / security / reliability issues. All have been fixed
+on the same branch:
+
+| Category | Issue | Fix |
+|---|---|---|
+| Correctness | Sentence extractor split prematurely on chunk-end terminators ("I see 1." + "5 inches" emitted "I see 1." as a sentence) | Required lookahead whitespace; end-of-stream flushing handled by post-loop `sentence_buf.trim()` |
+| Correctness | Streaming-fallback path narrated raw JSON when parse failed (avatar would speak `{"speech":"hi","content":""}` literally) | Strict envelope check; if absent and `schema_enforced`, send `INVALID_RESPONSE_FORMAT` error frame instead |
+| Correctness | WS-closed-mid-turn classified as agent error; session ended in `"error"` state, sender wrote to closed socket | New `TurnOutcome::Disconnected` arm; same persistence as `Cancelled`, no `done` frame, session ends `idle` |
+| Correctness | `extractor.finalize()` skipped on cancel path (in-progress speech lost) | Finalize unconditionally before classification |
+| Correctness | `biased;` + barge-in arriving in same poll cycle as turn completion = queued message lost | Dropped `biased;`; added one-shot `now_or_never` receiver poll after loop |
+| Concurrency | Two clients reusing `?session_id=X` raced on `cancel_tokens` map and partial-persist `update_last` | `session_queue.acquire(&session_key)` per turn (matches `ws.rs`) |
+| Security | `session_id` flowed into format!() without validation (path traversal / log injection / oversize) | Charset+length gate at upgrade and connect-frame override |
+| Security | Anthropic + `response_format` was silent failure (LLM returned prose, every turn errored) | New `Provider::supports_response_format()` capability gate; non-supporting providers fall back to plain-prose narration |
+| Security | Unbounded WS frames, extractor buffers, `accumulated_raw`, SSE lines = OOM vectors | WS frame cap (`max_frame_size`/`max_message_size`), per-message user-content cap, extractor field cap (64 KiB), `accumulated_raw` cap (1 MiB) with cancel-on-overflow, SSE line cap (1 MiB) |
+| Security | Tool-call delta missing `index` defaulted to 0, splicing args into wrong slot; id rebinding silently overwrote | Missing index → skip with debug; id rebinding → first-write-wins with warn |
+| Security | Agent-init error sent raw to client (could leak provider URLs / key fragments) | Pipe through `sanitize_api_error` |
+| Parity | `/ws/avatar` skipped memory consolidation that `/ws/chat` runs after each turn | Same `consolidate_turn` fire-and-forget pattern in `handle_completed` |
+| Parity | Missing `chunk_reset` frame and error-code taxonomy (`AUTH_ERROR`/`PROVIDER_ERROR`/`AGENT_ERROR`) | Both added; matches `ws.rs:620` and `ws.rs:649` |
+| Test coverage | `Agent::set_response_format` / `set_prompt_builder` setters had no direct tests | 4 new tests with a `RequestCaptureProvider` mock pin the contract |
+| Test coverage | TurnEvent → WS-frame mapping (especially ToolCall's two-frame ordering) untested | Refactored `handle_turn_event` to delegate to a pure `classify_turn_event`; 6 new tests pin every variant's frame shape |
+
+See `git log 78fb0a6..HEAD` in the patched repo for per-fix commits
+with detailed root-cause notes.
 
 ## Apply
 
@@ -276,7 +303,7 @@ For OpenAI-compatible providers, add the `response_format` field to the request 
 
 ## Compatibility
 
-- **ZeroClaw v0.7.4** — tested and supported (workspace builds clean, 6300+ tests pass)
+- **ZeroClaw v0.7.4** — tested and supported (workspace builds clean, 6403 tests pass)
 - **Newer versions** — may require manual rebase. The patch is git-managed; resolve conflicts with the usual git tooling.
 - **Older versions (< v0.7.4)** — incompatible. v0.6.x and earlier use a different crate layout. For v0.5.0 see [`legacy_v0.5.0/`](./legacy_v0.5.0/).
 

@@ -524,6 +524,17 @@ pub trait Provider: Send + Sync {
         false
     }
 
+    /// Whether the provider honors the `response_format` field on
+    /// `ChatRequest` (i.e. forces a structured output schema). When
+    /// `false`, callers that need schema-guaranteed JSON output must
+    /// fall back to alternate strategies (forced tool calling, prompt
+    /// engineering) — the avatar channel uses this to skip
+    /// `set_response_format` when the active provider would silently
+    /// ignore it, avoiding mid-stream schema-violation errors.
+    fn supports_response_format(&self) -> bool {
+        false
+    }
+
     /// Streaming chat with optional system prompt. See `simple_chat` for
     /// the `temperature` contract.
     fn stream_chat_with_system(
@@ -669,6 +680,10 @@ impl<T: Provider + ?Sized> Provider for Arc<T> {
 
     fn supports_streaming_tool_events(&self) -> bool {
         self.as_ref().supports_streaming_tool_events()
+    }
+
+    fn supports_response_format(&self) -> bool {
+        self.as_ref().supports_response_format()
     }
 
     fn stream_chat_with_system(

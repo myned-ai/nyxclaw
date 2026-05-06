@@ -13,6 +13,13 @@ use zeroclaw_api::tool::ToolSpec;
 /// OpenAI's public API endpoint.
 const BASE_URL: &str = "https://api.openai.com/v1";
 
+/// Per-line cap for the SSE parser. OpenAI's chunks are typically a few
+/// hundred bytes; we cap at 1 MiB to absorb generously-sized tool-call
+/// argument fragments while preventing a hostile/proxied upstream from
+/// emitting an unbounded single line that grows the worker's read buffer
+/// until it OOMs.
+const MAX_SSE_LINE_BYTES: usize = 1024 * 1024;
+
 pub struct OpenAiProvider {
     base_url: String,
     credential: Option<String>,
@@ -387,17 +394,20 @@ impl OpenAiProvider {
     ///   typically omit it). Usage is logged but not surfaced — the
     ///   [`StreamEvent`] enum has no Usage variant.
     ///
+    /// Per-line size is bounded to [`MAX_SSE_LINE_BYTES`] — the gateway sits
+    /// on a worker thread, and an upstream proxy or hostile OpenAI-compatible
+    /// endpoint emitting a multi-GB single line with no `\n` would otherwise
+    /// grow `read_until`'s buffer until the worker OOMs.
+    ///
     /// Receiver-drop on the consumer side is treated as cancellation: any send
     /// failure returns early.
     async fn parse_openai_sse_lines<R>(
-        reader: R,
+        mut reader: R,
         tx: &tokio::sync::mpsc::Sender<StreamResult<StreamEvent>>,
     ) where
         R: tokio::io::AsyncBufRead + Unpin,
     {
         use tokio::io::AsyncBufReadExt;
-
-        let mut lines = reader.lines();
 
         // Tool calls are accumulated by their `index` field. Each index maps
         // to (id, name, arguments). The first delta with a given index carries
@@ -406,8 +416,38 @@ impl OpenAiProvider {
         // Preserve emission order: the order in which indices first appear.
         let mut tool_order: Vec<u64> = Vec::new();
 
-        while let Ok(Some(line)) = lines.next_line().await {
-            let line = line.trim();
+        let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024);
+        loop {
+            buf.clear();
+            let n = match reader.read_until(b'\n', &mut buf).await {
+                Ok(0) => break, // EOF
+                Ok(n) => n,
+                Err(e) => {
+                    let _ = tx.send(Err(StreamError::Http(e.to_string()))).await;
+                    return;
+                }
+            };
+
+            // Cap is checked AFTER read so we surface the overflow instead of
+            // silently truncating it. read_until reads up to and including the
+            // delimiter, so a too-long line still completes its read but bails
+            // here before more memory is committed by subsequent reads.
+            if n > MAX_SSE_LINE_BYTES {
+                let _ = tx
+                    .send(Err(StreamError::InvalidSse(format!(
+                        "SSE line exceeded {MAX_SSE_LINE_BYTES} bytes"
+                    ))))
+                    .await;
+                return;
+            }
+
+            // SSE is ASCII; non-UTF8 means a misbehaving upstream — drop the
+            // line rather than panic. Real OpenAI never produces this.
+            let line = match std::str::from_utf8(&buf) {
+                Ok(s) => s.trim_end_matches(['\r', '\n']).trim(),
+                Err(_) => continue,
+            };
+
             if line.is_empty() || !line.starts_with("data:") {
                 continue;
             }
@@ -447,10 +487,17 @@ impl OpenAiProvider {
                 // Tool-call deltas.
                 if let Some(tcs) = delta.get("tool_calls").and_then(|t| t.as_array()) {
                     for tc in tcs {
-                        let index = tc
-                            .get("index")
-                            .and_then(|i| i.as_u64())
-                            .unwrap_or_default();
+                        // `index` is mandatory in OpenAI's tool-call delta
+                        // spec. Treating a missing index as 0 (the previous
+                        // behavior) silently merges argument fragments from
+                        // a malformed delta into the first tool's slot,
+                        // corrupting both calls. Skip instead.
+                        let Some(index) = tc.get("index").and_then(|i| i.as_u64()) else {
+                            tracing::debug!(
+                                "OpenAI tool_call delta missing required `index` — skipping"
+                            );
+                            continue;
+                        };
                         let entry = tool_calls.entry(index).or_insert_with(|| {
                             tool_order.push(index);
                             (String::new(), String::new(), String::new())
@@ -458,7 +505,20 @@ impl OpenAiProvider {
                         if let Some(id) = tc.get("id").and_then(|v| v.as_str())
                             && !id.is_empty()
                         {
-                            entry.0 = id.to_string();
+                            // Tool-call ids are first-write-wins. Once
+                            // bound, a subsequent delta trying to rebind
+                            // the id at the same index is a malformed
+                            // stream — keep the original id and warn.
+                            if entry.0.is_empty() {
+                                entry.0 = id.to_string();
+                            } else if entry.0 != id {
+                                tracing::warn!(
+                                    existing = %entry.0,
+                                    attempted = %id,
+                                    index = index,
+                                    "OpenAI tool_call delta tried to rebind id at index — keeping first"
+                                );
+                            }
                         }
                         if let Some(func) = tc.get("function") {
                             if let Some(name) = func.get("name").and_then(|v| v.as_str())
@@ -723,6 +783,12 @@ impl Provider for OpenAiProvider {
         // OpenAI emits tool_calls progressively in `delta.tool_calls`; we
         // accumulate fragments by index and emit StreamEvent::ToolCall once
         // each call is fully assembled (after [DONE]).
+        true
+    }
+
+    fn supports_response_format(&self) -> bool {
+        // OpenAI honors `response_format: {type:"json_schema", ...}` natively
+        // — we forward it on every NativeChatRequest construction.
         true
     }
 
@@ -1453,6 +1519,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn parse_sse_lines_rejects_oversized_line() {
+        // A single line larger than MAX_SSE_LINE_BYTES must terminate the
+        // stream with an InvalidSse error rather than grow the buffer
+        // unboundedly. We drop one byte short of cap+1 onto a single
+        // data: line; even though the JSON would technically parse, the
+        // line cap fires first.
+        let mut huge_line = String::from("data: {\"choices\":[{\"delta\":{\"content\":\"");
+        huge_line.push_str(&"x".repeat(MAX_SSE_LINE_BYTES + 1));
+        huge_line.push_str("\"}}]}\n\n");
+
+        let cursor = std::io::Cursor::new(huge_line.into_bytes());
+        let (tx, mut rx) =
+            tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+        OpenAiProvider::parse_openai_sse_lines(cursor, &tx).await;
+        drop(tx);
+
+        let mut got_err = false;
+        while let Some(ev) = rx.recv().await {
+            if let Err(StreamError::InvalidSse(msg)) = &ev
+                && msg.contains("exceeded")
+            {
+                got_err = true;
+            }
+        }
+        assert!(
+            got_err,
+            "oversized SSE line should yield InvalidSse, got no matching error"
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_sse_lines_skips_tool_call_with_missing_index() {
+        // A delta missing the `index` field is malformed and must NOT
+        // silently merge into slot 0 (previous bug that corrupted the
+        // first tool's arguments). The valid call at index 1 must still
+        // assemble correctly.
+        let input = concat!(
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"id":"call_bad","type":"function","function":{"name":"bogus","arguments":"{}"}}]}}]}"#,
+            "\n\n",
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_good","type":"function","function":{"name":"real","arguments":"{}"}}]}}]}"#,
+            "\n\n",
+            "data: [DONE]\n\n",
+        );
+        let events = collect_stream_events(input).await;
+        let calls: Vec<(String, String)> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ToolCall(tc) => Some((tc.id.clone(), tc.name.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            calls,
+            vec![("call_good".into(), "real".into())],
+            "missing-index delta should be skipped, not merged into slot 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_sse_lines_keeps_first_tool_call_id_when_rebound() {
+        // Two deltas at the same index, both carrying different ids. The
+        // first wins; the second's attempt is logged but doesn't corrupt
+        // the call. Argument fragments still concatenate.
+        let input = concat!(
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_first","type":"function","function":{"name":"alpha","arguments":"{\"a\":"}}]}}]}"#,
+            "\n\n",
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_DIFFERENT","function":{"arguments":"1}"}}]}}]}"#,
+            "\n\n",
+            "data: [DONE]\n\n",
+        );
+        let events = collect_stream_events(input).await;
+        let calls: Vec<&ProviderToolCall> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ToolCall(tc) => Some(tc),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].id, "call_first",
+            "rebinding id at the same index must not overwrite the first"
+        );
+        assert_eq!(calls[0].arguments, r#"{"a":1}"#);
+    }
+
+    #[tokio::test]
     async fn parse_sse_lines_treats_done_as_terminal() {
         // Anything after [DONE] must not be emitted (server may send keepalive
         // comments after the sentinel; the parser should stop reading).
@@ -1479,6 +1632,10 @@ mod tests {
         let p = OpenAiProvider::new(Some("test"));
         assert!(p.supports_streaming());
         assert!(p.supports_streaming_tool_events());
+        assert!(
+            p.supports_response_format(),
+            "OpenAI honors response_format natively — capability gate must advertise true"
+        );
     }
 
     #[test]
