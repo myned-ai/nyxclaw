@@ -1,6 +1,8 @@
 # ZeroClaw Avatar Channel Patch
 
-Patches for ZeroClaw **v0.5.0** that add a dedicated avatar WebSocket channel (`/ws/avatar`) for nyxclaw voice+avatar integration.
+Patches for **ZeroClaw v0.7.4** that add a dedicated avatar WebSocket channel (`/ws/avatar`) for nyxclaw voice + avatar integration.
+
+> Looking for the v0.5.0 version? See [`legacy_v0.5.0/`](./legacy_v0.5.0/).
 
 ## What this patch does
 
@@ -10,58 +12,93 @@ When connected via `/ws/avatar`, ZeroClaw forces the LLM to respond with structu
 {"speech": "Here's what I found, take a look.", "content": "**Rome - Wikipedia**\nhttps://en.wikipedia.org/wiki/Rome"}
 ```
 
-- `speech` — sent to nyxclaw as `speech_chunk` events → avatar speaks it
-- `content` — sent to nyxclaw as `rich_content` event → app renders cards/links/tables
-- Tool calls/results stream in real-time during agent execution
-- Tool call fillers — avatar speaks contextual phrases (e.g. "Let me search for that") while tools execute
-- Cancel support for barge-in interruption
+- `speech` → streamed to nyxclaw as `speech_chunk` events (sentence-split mid-stream) → avatar speaks it
+- `content` → sent to nyxclaw as `rich_content` event → app renders cards/links/tables
+- Tool calls/results stream live during agent execution
+- Tool-call fillers — avatar speaks contextual phrases (e.g. "I'm searching the web") while tools execute
+- Cancel + barge-in support (mid-turn `{"type":"cancel"}` or new `{"type":"message"}` aborts in-flight response)
 
-The existing `/ws/chat` endpoint is unchanged — CLI and web dashboard clients work as before.
+The existing `/ws/chat` endpoint is unchanged — CLI and web dashboard clients work exactly as before.
 
-## Usage
+## What this patch contains
+
+The patch ships as a single `git apply`-able file: [`zeroclaw-v0.7.4-nyxclaw.patch`](./zeroclaw-v0.7.4-nyxclaw.patch).
+
+| Layer | Crate / file | Change |
+|-------|--------------|--------|
+| API | `zeroclaw-api/src/provider.rs` | Add `response_format: Option<&serde_json::Value>` to `ChatRequest` |
+| Runtime | `zeroclaw-runtime/src/agent/agent.rs` | Add `response_format` field + builder + `set_response_format`/`set_prompt_builder` setters; thread into `Agent::turn` and `Agent::turn_streamed` |
+| Runtime | `zeroclaw-runtime/src/agent/loop_.rs` | `response_format: None` defaults in `run_tool_call_loop`'s `ChatRequest` sites (orchestrator/delegate paths) |
+| Runtime | `zeroclaw-runtime/src/agent/prompt.rs` | New `SystemPromptBuilder::without_section(name)` for stripping `DateTimeSection` (cache-stable system prompt) |
+| Providers | `zeroclaw-providers/src/openai.rs` | Native SSE streaming impl: `stream_chat()`, tool-call delta accumulation by `index`, `parse_openai_sse_lines` helper, full streaming-with-structured-output support |
+| Providers | `zeroclaw-providers/src/anthropic.rs` | `response_format: None` default (Anthropic uses forced tool-calls; not wired here) |
+| Providers | `zeroclaw-providers/src/reliable.rs` | Pass-through of `response_format` in 2 reconstruction sites; `None` defaults in 7 test sites |
+| Providers | `zeroclaw-providers/src/openrouter.rs`, `router.rs` | `None` defaults in 3 test sites |
+| Gateway | `zeroclaw-gateway/src/lib.rs` | Register `/ws/avatar` route; add `pub mod nyxclaw` |
+| Gateway | `zeroclaw-gateway/src/nyxclaw.rs` | **NEW** — Avatar WebSocket channel: incremental JSON extractor, sentence-split speech_chunk emission, tool-call fillers, barge-in with `cancel_tokens` registry, `scope_session_key` task-local, partial-content persistence on streaming chunks |
+| Binary | `src/providers/traits.rs`, `tests/live/openai_codex_vision_e2e.rs` | `response_format: None` defaults in 8 test sites |
+
+Inspectable copies of every modified file live under [`files/`](./files/), mirroring the v0.7.4 crate layout.
+
+**Stats**: 13 files, +1671 / −1 lines, 1041 lines of which are the new `nyxclaw.rs` module.
+
+## Apply
+
+The patch uses `git apply`, so the target must be a git checkout of ZeroClaw at (or descended from) the v0.7.4 release tag.
 
 ### Bash (Linux/macOS)
+
 ```bash
-./patch.sh /path/to/zeroclaw-v0.5.0
+git clone https://github.com/zeroclaw-labs/zeroclaw -b v0.7.4 ~/zeroclaw-v0.7.4
+./patch.sh ~/zeroclaw-v0.7.4
 ```
 
 ### PowerShell (Windows)
+
 ```powershell
-.\patch.ps1 -ZeroClawDir C:\path\to\zeroclaw-v0.5.0
+git clone https://github.com/zeroclaw-labs/zeroclaw -b v0.7.4 C:\zeroclaw-v0.7.4
+.\patch.ps1 -ZeroClawDir C:\zeroclaw-v0.7.4
 ```
 
 Both scripts:
-- Back up original files to `.nyxclaw-patch-backup/`
-- Copy patched/new files into place
-- Verify all files were applied
 
-### After patching
+1. Verify the target is a v0.7.4 git checkout
+2. Dry-run the patch (`git apply --check`) — bail out before any tree mutation if it doesn't apply cleanly
+3. Apply the patch
+4. Print next-step build/test commands
+
+### Revert
+
 ```bash
-cd /path/to/zeroclaw-v0.5.0
-cargo build
-cargo test
-cargo run -- gateway
+git -C /path/to/zeroclaw-v0.7.4 apply -R zeroclaw-v0.7.4-nyxclaw.patch
 ```
 
-nyxclaw connects to `ws://<host>:<port>/ws/avatar` instead of `/ws/chat`.
+### After patching
+
+```bash
+cd /path/to/zeroclaw-v0.7.4
+cargo build --workspace
+cargo test -p zeroclaw-gateway --lib nyxclaw   # 10 unit tests for the avatar channel
+cargo run --bin zeroclawlabs -- gateway
+```
+
+nyxclaw then connects to `ws://<host>:<port>/ws/avatar` instead of `/ws/chat`.
 
 ## Authentication
 
-ZeroClaw uses bearer tokens for WebSocket auth. nyxclaw sends the token as a `?token=` query parameter on the WebSocket connection.
+ZeroClaw uses bearer tokens for WebSocket auth. Tokens are accepted via (precedence order):
 
-### Getting the token
+1. `Authorization: Bearer <token>` header
+2. `Sec-WebSocket-Protocol: bearer.<token>` subprotocol
+3. `?token=<token>` query parameter
 
 Generate a pairing token inside the ZeroClaw container:
 
 ```bash
-docker exec <zeroclaw-container> zeroclaw gateway get-paircode --new
+docker exec <zeroclaw-container> zeroclawlabs gateway get-paircode --new
 ```
 
-This prints a token like `zc_abc123def456...`. Copy it.
-
-### Configuring nyxclaw
-
-Add the token to nyxclaw's `.env`:
+Configure nyxclaw `.env`:
 
 ```env
 AGENT_TYPE=zeroclaw
@@ -70,51 +107,46 @@ AUTH_TOKEN=zc_YOUR_TOKEN_HERE
 USE_AVATAR_ENDPOINT=true
 ```
 
-nyxclaw will connect to `ws://<host>:<port>/ws/avatar?token=<AUTH_TOKEN>`.
+## Required AGENTS.md addition
 
-## AGENTS.md — Required prompt addition
+You **must** manually add the following **Response format** section to your `playground/AGENTS.md`:
 
-You must manually add the following **Response format** section to your `playground/AGENTS.md`:
-
-```markdown
+````markdown
 ## Response format
 
 Your responses are consumed by a voice + avatar system. Every response you generate is a JSON object with two fields:
 
-\`\`\`json
+```json
 {"speech": "...", "content": "..."}
-\`\`\`
+```
 
 ### `speech` — what the avatar says aloud
 - Keep it concise and conversational — this is spoken, not read.
 - Never include URLs, table data, code, or markdown syntax in speech.
 - When you have rich content to show, use a brief phrase: "Check this out", "Here's what I found", "Take a look."
-- For simple conversational responses (greetings, opinions, short answers), just put the full response in speech.
+- For simple conversational responses (greetings, opinions, short answers), put the full response in speech.
 
 ### `content` — what appears in the chat (rich content)
 - Put URLs, links, tables, code snippets, structured data, and detailed information here.
 - Use markdown formatting — the app renders it.
 - Set to empty string `""` when there's nothing visual to show — including error messages, apologies, explanations, and status updates. Only use `content` for URLs, tables, code, or structured data.
-- If you browsed a URL the user asked for, put the URL here.
-- If you compared items, put a markdown table here.
-- If you found search results, put the links here.
 
 ### Examples
 
 Simple greeting:
-\`\`\`json
+```json
 {"speech": "Hey, what's up?", "content": ""}
-\`\`\`
+```
 
 User asks for a link:
-\`\`\`json
+```json
 {"speech": "Here's the Wikipedia page for Rome, take a look.", "content": "**Rome - Wikipedia**\nhttps://en.wikipedia.org/wiki/Rome\n\nRome is the capital city of Italy."}
-\`\`\`
+```
 
 User asks to compare things:
-\`\`\`json
+```json
 {"speech": "Here's the comparison, check it out.", "content": "| Feature | iPhone 15 | Samsung S24 |\n|---------|-----------|-------------|\n| Screen | 6.1\" | 6.2\" |\n| Battery | 3349mAh | 4000mAh |"}
-\`\`\`
+```
 
 ### Never do this
 - Never put URLs in speech
@@ -122,11 +154,11 @@ User asks to compare things:
 - Never leave speech empty — always say something
 - Never put raw JSON or code in speech
 - Never put error messages or apologies in content — those belong in speech only
-```
+````
 
-## Performance Tuning
+## Performance tuning
 
-For real-time voice, latency matters. These ZeroClaw settings reduce time-to-first-token (TTFT) significantly. Edit your `config.toml` (located at `~/.zeroclaw/config.toml`, or `/zeroclaw-data/.zeroclaw/config.toml` inside Docker):
+For real-time voice, latency matters. These ZeroClaw settings reduce time-to-first-token (TTFT). Edit your `config.toml` (in `~/.zeroclaw/config.toml`, or `/zeroclaw-data/.zeroclaw/config.toml` inside Docker):
 
 ```toml
 default_temperature = 0.5
@@ -143,31 +175,28 @@ parallel_tools = true
 reasoning_enabled = false
 ```
 
-### What each setting does
-
 | Setting | Default | Recommended | Effect |
 |---------|---------|-------------|--------|
-| `default_temperature` | `0.7` | `0.5` | Less sampling overhead, slightly faster token selection |
-| `provider_timeout_secs` | `120` | `30` | Fail fast instead of hanging on slow requests |
-| `compact_context` | `false` | `true` | Reduces system prompt and context payload sent to the LLM |
-| `max_tool_iterations` | `10` | `4` | Limits tool-call round-trips per turn (each is a full LLM call) |
-| `max_history_messages` | `50` | `15` | Less conversation history = fewer input tokens = faster TTFT |
-| `max_context_tokens` | `32000` | `12000` | Triggers context compaction sooner, keeping payload lean |
-| `parallel_tools` | `false` | `true` | Runs multiple tool calls concurrently instead of sequentially |
-| `reasoning_enabled` | `false` | `false` | Keep disabled — reasoning adds seconds of thinking delay |
+| `default_temperature` | `0.7` | `0.5` | Less sampling overhead, faster token selection |
+| `provider_timeout_secs` | `120` | `30` | Fail fast instead of hanging |
+| `compact_context` | `false` | `true` | Reduces system prompt + context payload |
+| `max_tool_iterations` | `10` | `4` | Limits tool round-trips per turn |
+| `max_history_messages` | `50` | `15` | Less history → fewer input tokens → faster TTFT |
+| `max_context_tokens` | `32000` | `12000` | Triggers context compaction sooner |
+| `parallel_tools` | `false` | `true` | Concurrent tool execution |
+| `reasoning_enabled` | `false` | `false` | Keep disabled — adds seconds of thinking delay |
 
 ### Model selection
 
-Model choice is the single biggest latency factor. Fast options:
+Model choice is the biggest single latency factor:
 
 | Model | Provider | TTFT | Notes |
 |-------|----------|------|-------|
-| `gpt-4.1-mini` | `openai` | ~1s | Good balance of speed and quality |
-| `gpt-4.1-nano` | `openai` | ~0.5s | Fastest, lower quality |
+| `gpt-4.1-mini` | `openai` | ~1s | Good speed/quality balance |
+| `gpt-4.1-nano` | `openai` | ~0.5s | Fastest OpenAI option |
 | `claude-haiku-4-5` | `anthropic` | ~0.8s | Fast, good quality |
-| `llama-3.3-70b-versatile` | `groq` | ~0.3s | Groq LPU hardware, very fast |
+| `llama-3.3-70b-versatile` | `groq` | ~0.3s | Groq LPU hardware |
 
-Set in `config.toml`:
 ```toml
 default_provider = "openai"
 default_model = "gpt-4.1-mini"
@@ -175,84 +204,10 @@ default_model = "gpt-4.1-mini"
 
 ### Automatic optimizations (no config needed)
 
-- **Streaming** — the avatar channel uses `turn_with_streaming()` which streams tokens as they arrive. Speech starts as soon as the first sentence is complete.
-- **Prompt caching** — OpenAI automatically caches prompt prefixes (system prompt + tools). This patch removes the `DateTimeSection` (which changed every second and invalidated the cache). With a stable system prompt, cache hit rates of 95-99% are typical after the first call, reducing TTFT by up to 50%.
-- **HTTP warmup** — ZeroClaw pre-warms provider HTTP connection pools (TLS + HTTP/2) at startup, eliminating cold-start latency on the first request.
-- **Response caching** — set `response_cache_enabled = true` in `[memory]` and `temperature = 0.0` to cache responses for repeated queries. Useful for common greetings or FAQ-type questions.
-
-### Identity prompt size
-
-Your `playground/AGENTS.md`, `IDENTITY.md`, and `SOUL.md` files are injected into the system prompt. Larger files = more input tokens = higher TTFT. Keep them concise for voice use cases.
-
-These values are optimized for snappy voice responses. Depending on your use case you may want different tradeoffs — for example, raising `max_history_messages` for longer conversations, enabling `reasoning_enabled` for complex tasks, or increasing `max_tool_iterations` if your agent uses many tools. Experiment and find what works best for your setup.
-
-## Rich Content Thumbnails
-
-nyxclaw automatically enriches `rich_content` URLs with link card metadata (title, description, thumbnail) by scraping OpenGraph tags from each page. This works for most sites, but pages behind Cloudflare or bot protection will block the scrape and fall back to a low-quality favicon.
-
-To provide high-quality thumbnails for all sites, tools can include **thumbnail hints** in their output. nyxclaw picks these up from `tool_result` events and uses them as fallbacks when OGP scraping fails.
-
-### How it works
-
-1. Your tool appends a `---THUMBNAIL_HINTS---` footer to its text output
-2. ZeroClaw sends the output in the `tool_result` event (this already happens — no channel changes needed)
-3. nyxclaw parses the footer, stores URL-to-thumbnail mappings for the current turn
-4. When `rich_content` arrives with those URLs, nyxclaw uses the hints for any card where OGP scraping failed
-
-### Thumbnail hints format
-
-Append this to your tool's output text:
-
-```
----THUMBNAIL_HINTS---
-https://example.com/article	https://cdn.example.com/thumb1.jpg
-https://other.com/page	https://cdn.example.com/thumb2.jpg
-```
-
-- Sentinel line `---THUMBNAIL_HINTS---` marks the start
-- One mapping per line, tab-separated: `page_url<TAB>thumbnail_url`
-- Only include URLs that have thumbnails — missing URLs are fine
-- The LLM sees this footer but ignores it (no conversational value)
-
-### Per-provider examples
-
-Each search provider returns thumbnails differently. Here's how to extract them:
-
-**Brave Search API** (already implemented in our deployment):
-```rust
-// result.thumbnail.src contains the pre-crawled thumbnail
-if let Some(thumb) = result.get("thumbnail").and_then(|t| t.get("src")).and_then(|s| s.as_str()) {
-    thumbnail_hints.push((url.to_string(), thumb.to_string()));
-}
-```
-
-**Serper API** (Google Search):
-```python
-# result["imageUrl"] or result["thumbnailUrl"]
-thumb = result.get("imageUrl") or result.get("thumbnailUrl")
-```
-
-**Tavily API**:
-```python
-# result["image"] contains the thumbnail
-thumb = result.get("image")
-```
-
-**Custom tool / web_fetch**:
-```python
-# If your tool fetches a page and finds og:image, pass it through
-thumb = extract_og_image(html)  # your own extraction
-```
-
-### Thumbnail cascade
-
-nyxclaw applies thumbnails in this order (per URL):
-
-1. **OGP scrape** — fetches `og:image` from the actual page (~70% success rate)
-2. **Provider thumbnail hint** — used when OGP scraping failed or returned only a favicon
-3. **Favicon fallback** — Google favicons API (always works, low quality)
-
-If your tool doesn't provide hints, everything still works — nyxclaw falls back to OGP + favicon automatically.
+- **Native SSE streaming** — the patched `OpenAiProvider::stream_chat` emits `TurnEvent::Chunk` deltas as soon as bytes arrive. The avatar channel feeds those into a sentence splitter so speech starts on the first complete sentence (`~300–800 ms` after first byte).
+- **Prompt caching** — the avatar channel calls `set_prompt_builder(SystemPromptBuilder::with_defaults().without_section("datetime"))`, removing the per-second timestamp section that otherwise busts OpenAI's automatic prompt cache. Cache hit rates jump from ~0% to ~95% after the first call.
+- **HTTP warmup** — ZeroClaw pre-warms provider connection pools at startup.
+- **Partial-content persistence** — assistant responses are saved every 500 ms via `update_last`, so a process crash mid-turn doesn't lose the partial reply.
 
 ## WebSocket Protocol: `/ws/avatar`
 
@@ -264,140 +219,83 @@ If your tool doesn't provide hints, everything still works — nyxclaw falls bac
 {"type": "cancel"}
 ```
 
+A new `{"type":"message"}` arriving mid-turn cancels the in-flight turn AND queues itself as the next user message — so the user can interrupt and restart in one step.
+
 ### Server → Client
 
 ```json
 {"type": "session_start", "session_id": "abc123", "resumed": false, "message_count": 0}
-{"type": "connected", "message": "Connection established"}
-{"type": "tool_call", "name": "web_fetch", "args": {"url": "..."}}
-{"type": "tool_result", "name": "web_fetch", "output": "...", "success": true, "duration_ms": 1200}
-{"type": "speech_chunk", "content": "Here's the Wikipedia page for Rome, take a look."}
-{"type": "speech_chunk", "content": "Let me look that up for you.", "filler": true}
+{"type": "connected", "message": "Avatar connection established"}
+{"type": "speech_chunk", "content": "I'm searching the web.", "filler": true}
+{"type": "tool_call", "id": "...", "name": "web_search", "args": {"query": "..."}}
+{"type": "tool_result", "id": "...", "name": "web_search", "output": "..."}
+{"type": "speech_chunk", "content": "Here's what I found."}
 {"type": "rich_content", "content": "**Rome - Wikipedia**\nhttps://en.wikipedia.org/wiki/Rome\n\n..."}
-{"type": "done", "full_response": "Here's the Wikipedia page for Rome, take a look."}
+{"type": "done", "full_response": "Here's what I found."}
+{"type": "done", "full_response": "", "cancelled": true}
+{"type": "thinking", "content": "..."}
 {"type": "error", "message": "..."}
 ```
 
-**`speech_chunk` fields:**
+`speech_chunk` fields:
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `content` | `string` | Text for the avatar to speak |
-| `filler` | `bool` (optional) | If `true`, this is a contextual filler phrase generated during tool execution (e.g. "Let me search for that"). nyxclaw uses this to apply throttling (2s gap between fillers, 5s same-content cooldown). Omitted or `false` for normal speech. |
+| `filler` | `bool` (optional) | `true` if this is a contextual filler emitted during tool execution. nyxclaw uses this to apply throttling (2s gap between fillers, 5s same-content cooldown). |
 
-### Key differences from `/ws/chat`
+### Differences from `/ws/chat`
 
 | Feature | `/ws/chat` | `/ws/avatar` |
-|---------|-----------|-------------|
+|---------|-----------|--------------|
 | Response format | Raw text | Structured `{speech, content}` JSON |
-| Streaming events | `done` only | `tool_call`, `tool_result`, `speech_chunk`, `rich_content`, `done` |
-| Cancel support | No | Yes (`{"type": "cancel"}`) |
-| LLM constraint | `response_format` not set | `response_format: json_schema` enforced |
+| Streaming events | `chunk`, `tool_call`, `tool_result`, `done` | `speech_chunk` (sentence-split), `rich_content`, `tool_call`, `tool_result`, `done`, plus `filler:true` chunks |
+| Cancel handling | Via `/api/abort` HTTP | Via `{"type":"cancel"}` over WS, plus mid-turn message barge-in |
+| LLM constraint | None | `response_format: json_schema` enforced |
+| System prompt | Default (with datetime) | DateTimeSection stripped for cache stability |
+| Concurrency | Serialized via `session_queue` | Inline cancel/queue (UX-driven barge-in) |
 
-## How it works
+## Provider support
 
-### Files modified
+| Provider | Structured output | Streaming | Status |
+|----------|-------------------|-----------|--------|
+| `openai` | `response_format: json_schema` | Native SSE | **Patched** |
+| `azure_openai` | Same API as OpenAI | — | Not patched (manual edit needed; see [Patching additional providers](#patching-additional-providers)) |
+| `openrouter` | Passes through to model | — | Stub field only (no streaming impl) |
+| `compatible` | OpenAI-compatible | — | Not patched |
+| `anthropic` | Forced tool-calling (different mechanism) | — | Field stub only |
+| `gemini` | `response_mime_type` + `response_schema` | — | Not supported |
+| `ollama` | `format: "json"` | — | Not supported |
+| Others | — | — | Fallback: speech-only, no rich content |
 
-**Full file replacements (patched copies in `src/`):**
-
-| File | What changed |
-|------|-------------|
-| `src/providers/traits.rs` | Added `response_format` to `ChatRequest`, `StreamEvent` enum, `stream_chat()` trait method. |
-| `src/providers/openai.rs` | Added `response_format` + `stream` to `NativeChatRequest`, SSE streaming structs, `stream_chat()` impl. |
-| `src/agent/agent.rs` | Added `response_format` field + setter, `turn_with_events()`, `turn_with_streaming()` (streaming agent turn). |
-| `src/agent/prompt.rs` | Removed `DateTimeSection` from system prompt builder. The per-second timestamp was invalidating OpenAI's prompt cache on every request. User messages already carry timestamps, so the LLM still knows the current time. |
-| `src/channels/nyxclaw.rs` | **NEW** — Avatar WebSocket channel with incremental JSON extraction, cancel support, and tool call fillers. Streams `speech_chunk` events as the LLM generates, not after. Emits contextual filler phrases (`filler: true`) during tool execution. |
-
-**Line injections (original files preserved):**
-
-| File | What injected |
-|------|--------------|
-| `src/agent/loop_.rs` | `response_format: None,` in `ChatRequest` construction (1 location) |
-| `src/providers/anthropic.rs` | `response_format: None,` in `ProviderChatRequest` construction (1 location) |
-| `src/providers/reliable.rs` | `response_format: None,` in `ChatRequest` constructions (6 locations) + `stream_chat()` delegation |
-| `src/providers/mod.rs` | `StreamEvent` added to re-export list |
-| `Cargo.toml` | `async-stream = "0.3"` dependency added |
-| `src/channels/mod.rs` | `pub mod nyxclaw;` after `pub mod notion;` |
-| `src/gateway/mod.rs` | `use crate::channels::nyxclaw;` import + `/ws/avatar` route + print line |
-
-## Compatibility
-
-- **ZeroClaw v0.5.0** — tested and supported
-- **Other versions** — may require manual adjustments to `gateway/mod.rs` and `channels/mod.rs`
-
-### Provider support
-
-| Provider | Structured output | Status |
-|----------|------------------|--------|
-| `openai` | `response_format: json_schema` | **Patched** |
-| `azure_openai` | Same API as OpenAI | Not patched (see guide below) |
-| `openrouter` | Passes through to model | Not patched (see guide below) |
-| `compatible` | OpenAI-compatible API | Not patched (see guide below) |
-| `anthropic` | Requires forced tool calling (different mechanism) | Not supported yet |
-| `gemini` | `response_mime_type` + `response_schema` | Not supported yet |
-| `ollama` | `format: "json"` (partial) | Not supported yet |
-| Others | — | Fallback: speech-only, no rich content |
-
-When using an unpatched provider, the avatar channel falls back gracefully — the LLM response is sent as `speech_chunk` (the avatar speaks it) but no `rich_content` cards are generated.
+When using an unpatched provider, the avatar channel falls back gracefully — the response is sent as `speech_chunk` (avatar speaks it) but no `rich_content` cards are generated.
 
 ### Patching additional providers
 
-If your provider uses the OpenAI-compatible API (`azure_openai`, `openrouter`, `compatible`), you can patch it yourself. The pattern is the same for all OpenAI-compatible providers:
+For OpenAI-compatible providers, add the `response_format` field to the request struct and wire it through. The OpenAI implementation in `crates/zeroclaw-providers/src/openai.rs` is the reference template — search for `response_format` to find every site that needs touching (request struct, request builder, retry path, streaming path).
 
-**Step 1:** Find the `NativeChatRequest` struct in `src/providers/<your_provider>.rs`:
+## Compatibility
 
-```rust
-struct NativeChatRequest {
-    model: String,
-    messages: Vec<...>,
-    temperature: f64,
-    tools: Option<...>,
-    tool_choice: Option<String>,
-}
+- **ZeroClaw v0.7.4** — tested and supported (workspace builds clean, 6300+ tests pass)
+- **Newer versions** — may require manual rebase. The patch is git-managed; resolve conflicts with the usual git tooling.
+- **Older versions (< v0.7.4)** — incompatible. v0.6.x and earlier use a different crate layout. For v0.5.0 see [`legacy_v0.5.0/`](./legacy_v0.5.0/).
+
+## Files
+
 ```
-
-**Step 2:** Add the `response_format` field:
-
-```rust
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tool_choice: Option<String>,
-    // ── nyxclaw patch: structured output ──
-    #[serde(skip_serializing_if = "Option::is_none")]
-    response_format: Option<serde_json::Value>,
-}
-```
-
-**Step 3:** Find the `chat()` method where `NativeChatRequest` is constructed. Look for `tool_choice: tools.as_ref().map(|_| "auto"...` and add the `response_format` field after it:
-
-```rust
-    tool_choice: tools.as_ref().map(|_| "auto".to_string()),
-    // ── nyxclaw patch: pass through response_format ──
-    response_format: request.response_format.cloned(),
-    tools,
-```
-
-**Step 4:** Find `chat_with_tools()` (if it exists) and add `response_format: None,` to its `NativeChatRequest` construction.
-
-**Step 5:** Build and test:
-```bash
-cargo build
-cargo test -p zeroclaw --lib providers::<your_provider>
-```
-
-### Anthropic / Gemini — different approach needed
-
-Anthropic and Gemini use different APIs for structured output:
-
-- **Anthropic**: Requires `tool_choice: {"type": "tool", "name": "respond"}` with a forced tool whose schema includes `speech` and `content` fields. This is architecturally different from `response_format`.
-- **Gemini**: Uses `generationConfig.response_mime_type: "application/json"` + `generationConfig.response_schema: {...}`.
-
-These require provider-specific patches beyond the OpenAI pattern. Contributions welcome.
-
-## Reverting
-
-To revert all patches:
-```bash
-cp -r /path/to/zeroclaw/.nyxclaw-patch-backup/* /path/to/zeroclaw/
-rm -rf /path/to/zeroclaw/.nyxclaw-patch-backup
-rm /path/to/zeroclaw/src/channels/nyxclaw.rs
+claw_patches/zeroclaw/
+├── README.md                          # This file
+├── patch.sh                           # Apply on Linux/macOS
+├── patch.ps1                          # Apply on Windows
+├── zeroclaw-v0.7.4-nyxclaw.patch      # The patch (git apply -able)
+├── upgrade_to_zeroclaw_0.7.4.md       # Original migration plan
+├── files/                             # Inspectable copies of modified files
+│   ├── crates/
+│   │   ├── zeroclaw-api/src/provider.rs
+│   │   ├── zeroclaw-providers/src/{openai,anthropic,reliable,openrouter,router}.rs
+│   │   ├── zeroclaw-runtime/src/agent/{agent,loop_,prompt}.rs
+│   │   └── zeroclaw-gateway/src/{lib,nyxclaw}.rs
+│   ├── src/providers/traits.rs
+│   └── tests/live/openai_codex_vision_e2e.rs
+└── legacy_v0.5.0/                     # Archived v0.5.0 patch + README + scripts
 ```

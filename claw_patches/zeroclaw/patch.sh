@@ -1,331 +1,119 @@
 #!/bin/bash
 # ============================================================
-# ZeroClaw Avatar Channel Patch — v0.5.0
+# ZeroClaw Avatar Channel Patch — v0.7.4
 # ============================================================
-# Applies nyxclaw avatar channel patches to a ZeroClaw v0.5.0
-# installation. Creates backups of modified files.
+# Applies the nyxclaw avatar channel patch to a ZeroClaw v0.7.4
+# checkout via `git apply`.
 #
 # Usage:
-#   ./patch.sh /path/to/zeroclaw-v0.5.0
+#   ./patch.sh /path/to/zeroclaw-v0.7.4
 #
 # What it does:
-#   1. Replaces: traits.rs, openai.rs, agent.rs, prompt.rs (patched copies)
-#   2. Adds: nyxclaw.rs (new avatar channel)
-#   3. Injects: response_format: None into loop_.rs, anthropic.rs,
-#      reliable.rs (6 locations)
-#   4. Injects: pub mod nyxclaw into channels/mod.rs
-#   5. Injects: /ws/avatar route into gateway/mod.rs
+#   - Verifies the target is a clean v0.7.4 checkout (commit 78fb0a6)
+#   - Runs `git apply --check` to dry-run the patch
+#   - Applies the patch with `git apply`
+#   - Reports build/test commands to run next
 #
-# NOTE: You must manually update AGENTS.md (see README.md)
+# What the patch contains:
+#   1. response_format threading — ChatRequest gains an optional
+#      response_format field, plumbed through Agent::turn_streamed,
+#      OpenAI native, Anthropic, Reliable, Router, OpenRouter.
+#   2. OpenAI native SSE streaming — stream_chat() implementation
+#      with per-delta tool-call accumulation and structured-output
+#      compatibility.
+#   3. SystemPromptBuilder::without_section() — lets the avatar strip
+#      DateTimeSection so OpenAI's automatic prompt cache stays warm.
+#   4. nyxclaw avatar channel — new /ws/avatar WebSocket endpoint
+#      (zeroclaw-gateway::nyxclaw) emitting structured speech_chunk +
+#      rich_content + tool_call/tool_result + filler frames with
+#      barge-in support.
+#
+# NOTE: After patching you must update playground/AGENTS.md to instruct
+# the LLM about the {speech, content} response format. See README.md.
 # ============================================================
 
 set -euo pipefail
 
 if [ $# -lt 1 ]; then
-    echo "Usage: $0 <path-to-zeroclaw-v0.5.0>"
+    echo "Usage: $0 <path-to-zeroclaw-v0.7.4>"
     echo ""
-    echo "Example: $0 /home/user/zeroclaw"
+    echo "Example: $0 /home/user/zeroclaw-v0.7.4"
     exit 1
 fi
 
 ZEROCLAW_DIR="$1"
 PATCH_DIR="$(cd "$(dirname "$0")" && pwd)"
-BACKUP_DIR="${ZEROCLAW_DIR}/.nyxclaw-patch-backup"
+PATCH_FILE="${PATCH_DIR}/zeroclaw-v0.7.4-nyxclaw.patch"
+EXPECTED_BASE="78fb0a6"  # zeroclaw v0.7.4 release tag commit
 
-# Validate target
+if [ ! -f "${PATCH_FILE}" ]; then
+    echo "ERROR: patch file not found: ${PATCH_FILE}"
+    exit 1
+fi
+
 if [ ! -f "${ZEROCLAW_DIR}/Cargo.toml" ]; then
-    echo "ERROR: ${ZEROCLAW_DIR}/Cargo.toml not found. Is this a ZeroClaw directory?"
+    echo "ERROR: ${ZEROCLAW_DIR}/Cargo.toml not found. Is this a ZeroClaw checkout?"
+    exit 1
+fi
+
+if [ ! -e "${ZEROCLAW_DIR}/.git" ]; then
+    # `.git` is a directory in regular checkouts and a file in `git worktree`s.
+    echo "ERROR: ${ZEROCLAW_DIR} is not a git repository. The patch requires git apply."
+    echo "       Clone with: git clone https://github.com/zeroclaw-labs/zeroclaw -b v0.7.4 ${ZEROCLAW_DIR}"
     exit 1
 fi
 
 echo "============================================================"
-echo "ZeroClaw Avatar Channel Patch"
+echo "ZeroClaw Avatar Channel Patch — v0.7.4"
 echo "============================================================"
 echo "Target:  ${ZEROCLAW_DIR}"
-echo "Patches: ${PATCH_DIR}"
+echo "Patch:   ${PATCH_FILE}"
 echo ""
 
-# Create backup directory
-mkdir -p "${BACKUP_DIR}"
-echo "Backups: ${BACKUP_DIR}"
-echo ""
+# Confirm we're on (or at least contain) the v0.7.4 release commit
+HEAD_COMMIT="$(git -C "${ZEROCLAW_DIR}" rev-parse --short HEAD)"
+echo "HEAD:    ${HEAD_COMMIT}"
 
-# ── Helpers ─────────────────────────────────────────────────
-
-# Copy a patched file (full replacement)
-patch_file() {
-    local src="$1"
-    local dest="$2"
-    local full_dest="${ZEROCLAW_DIR}/${dest}"
-    local full_src="${PATCH_DIR}/${src}"
-
-    if [ ! -f "${full_src}" ]; then
-        echo "  SKIP  ${src} (not found in patch dir)"
-        return
-    fi
-
-    if [ -f "${full_dest}" ]; then
-        local backup_path="${BACKUP_DIR}/${dest}"
-        mkdir -p "$(dirname "${backup_path}")"
-        cp "${full_dest}" "${backup_path}"
-        echo "  REPLACE ${dest} (backup saved)"
-    else
-        mkdir -p "$(dirname "${full_dest}")"
-        echo "  NEW     ${dest}"
-    fi
-
-    cp "${full_src}" "${full_dest}"
-}
-
-# Backup a file before injecting
-backup_file() {
-    local file="$1"
-    local full_path="${ZEROCLAW_DIR}/${file}"
-    if [ -f "${full_path}" ]; then
-        local backup_path="${BACKUP_DIR}/${file}"
-        mkdir -p "$(dirname "${backup_path}")"
-        cp "${full_path}" "${backup_path}"
-    fi
-}
-
-# ── Step 1: File replacements ──────────────────────────────
-
-echo "Step 1: Replacing patched files..."
-echo ""
-
-patch_file "src/providers/traits.rs" "src/providers/traits.rs"
-patch_file "src/providers/openai.rs" "src/providers/openai.rs"
-patch_file "src/agent/agent.rs" "src/agent/agent.rs"
-patch_file "src/agent/prompt.rs" "src/agent/prompt.rs"
-patch_file "src/channels/nyxclaw.rs" "src/channels/nyxclaw.rs"
-
-echo ""
-
-# ── Step 2: Inject response_format: None ───────────────────
-# ChatRequest from traits.rs now requires response_format.
-# These files construct ChatRequest but weren't replaced.
-
-echo "Step 2: Injecting response_format: None into ChatRequest usages..."
-echo ""
-
-# loop_.rs — 1 location (line ~2458)
-FILE="${ZEROCLAW_DIR}/src/agent/loop_.rs"
-if [ -f "${FILE}" ] && ! grep -q "response_format" "${FILE}"; then
-    backup_file "src/agent/loop_.rs"
-    sed -i.bak '/^            ChatRequest {/{
-        N;N
-        s/\(tools: request_tools,\)/\1\n                response_format: None,/
-    }' "${FILE}"
-    rm -f "${FILE}.bak"
-    echo "  INJECT src/agent/loop_.rs (1 location)"
-fi
-
-# anthropic.rs — 1 location (line ~666)
-FILE="${ZEROCLAW_DIR}/src/providers/anthropic.rs"
-if [ -f "${FILE}" ] && ! grep -q "response_format" "${FILE}"; then
-    backup_file "src/providers/anthropic.rs"
-    sed -i.bak '/let request = ProviderChatRequest {/{
-        N;N;N;N;N;N
-        s/\(Some(&tool_specs)\n            },\)/\1\n            response_format: None,/
-    }' "${FILE}"
-    rm -f "${FILE}.bak"
-    echo "  INJECT src/providers/anthropic.rs (1 location)"
-fi
-
-# reliable.rs — 6 locations
-FILE="${ZEROCLAW_DIR}/src/providers/reliable.rs"
-if [ -f "${FILE}" ] && ! grep -q "response_format" "${FILE}"; then
-    backup_file "src/providers/reliable.rs"
-    # Add response_format: None after every `tools:` line inside ChatRequest blocks
-    # Match pattern: "tools: Some(" or "tools: None," followed by closing brace
-    sed -i.bak '/ChatRequest {/{
-        :loop
-        N
-        /}/!b loop
-        s/\(tools: [^}]*\),\(\n *}\)/\1,\n                response_format: None,\2/g
-    }' "${FILE}"
-    rm -f "${FILE}.bak"
-    echo "  INJECT src/providers/reliable.rs (6 locations)"
-fi
-
-# reliable.rs — add stream_chat delegation (so ReliableProvider delegates
-# stream_chat to the inner provider instead of returning empty default)
-FILE="${ZEROCLAW_DIR}/src/providers/reliable.rs"
-if [ -f "${FILE}" ] && ! grep -q "fn stream_chat(" "${FILE}"; then
-    # First ensure StreamEvent is imported
-    if ! grep -q "StreamEvent" "${FILE}"; then
-        sed -i.bak 's/ChatResponse, StreamChunk,/ChatResponse, StreamChunk, StreamEvent,/' "${FILE}"
-        rm -f "${FILE}.bak"
-    fi
-    python3 -c "
-import re, sys
-with open(sys.argv[1], 'r') as f:
-    content = f.read()
-
-injection = '''
-    fn stream_chat(
-        &self,
-        request: ChatRequest<'_>,
-        model: &str,
-        temperature: f64,
-    ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
-        // Delegate to the first provider that supports streaming
-        for (_name, provider) in &self.providers {
-            if provider.supports_streaming() {
-                let current_model = match self.model_chain(model).first() {
-                    Some(m) => m.to_string(),
-                    None => model.to_string(),
-                };
-                return provider.stream_chat(request, &current_model, temperature);
-            }
-        }
-        // Fallback: default empty Done
-        stream::once(async {
-            Ok(StreamEvent::Done(ChatResponse {
-                text: None,
-                tool_calls: Vec::new(),
-                usage: None,
-                reasoning_content: None,
-            }))
-        }).boxed()
-    }
-
-'''
-
-# Insert before fn stream_chat_with_system
-content = content.replace(
-    '    fn stream_chat_with_system(',
-    injection + '    fn stream_chat_with_system(',
-    1,
-)
-with open(sys.argv[1], 'w') as f:
-    f.write(content)
-" "${FILE}"
-    echo "  INJECT src/providers/reliable.rs (stream_chat delegation)"
-fi
-
-echo ""
-
-# ── Step 3: Inject StreamEvent re-export into providers/mod.rs ─
-echo "Step 3: Adding StreamEvent re-export to providers/mod.rs..."
-echo ""
-PROVIDERS_MOD="${ZEROCLAW_DIR}/src/providers/mod.rs"
-if [ -f "${PROVIDERS_MOD}" ] && ! grep -q "StreamEvent" "${PROVIDERS_MOD}"; then
-    backup_file "src/providers/mod.rs"
-    sed -i.bak 's/ToolCall, ToolResultMessage,/StreamEvent, ToolCall, ToolResultMessage,/' "${PROVIDERS_MOD}"
-    rm -f "${PROVIDERS_MOD}.bak"
-    echo "  INJECT src/providers/mod.rs (added StreamEvent)"
-else
-    echo "  SKIP  src/providers/mod.rs (StreamEvent already present)"
-fi
-echo ""
-
-# ── Step 4: Add async_stream dependency (for streaming SSE) ─
-echo "Step 4: Adding async_stream dependency..."
-echo ""
-CARGO_TOML="${ZEROCLAW_DIR}/Cargo.toml"
-if [ -f "${CARGO_TOML}" ] && ! grep -q "async-stream" "${CARGO_TOML}"; then
-    backup_file "Cargo.toml"
-    sed -i.bak '/^\[dependencies\]/a\
-async-stream = "0.3"' "${CARGO_TOML}"
-    rm -f "${CARGO_TOML}.bak"
-    echo "  INJECT Cargo.toml (added async-stream)"
-else
-    echo "  SKIP  Cargo.toml (async-stream already present)"
-fi
-echo ""
-
-# ── Step 5: Register channel module + route ────────────────
-
-echo "Step 5: Registering nyxclaw channel..."
-echo ""
-
-# channels/mod.rs — add module declaration
-CHANNELS_MOD="${ZEROCLAW_DIR}/src/channels/mod.rs"
-if [ -f "${CHANNELS_MOD}" ]; then
-    if ! grep -q "pub mod nyxclaw;" "${CHANNELS_MOD}"; then
-        backup_file "src/channels/mod.rs"
-        sed -i.bak '/^pub mod notion;/a\
-pub mod nyxclaw;' "${CHANNELS_MOD}"
-        rm -f "${CHANNELS_MOD}.bak"
-        echo "  INJECT src/channels/mod.rs (added pub mod nyxclaw)"
-    else
-        echo "  SKIP  src/channels/mod.rs (already present)"
-    fi
-fi
-
-# gateway/mod.rs — add import + route + print line
-GATEWAY_MOD="${ZEROCLAW_DIR}/src/gateway/mod.rs"
-if [ -f "${GATEWAY_MOD}" ]; then
-    if ! grep -q "nyxclaw" "${GATEWAY_MOD}"; then
-        backup_file "src/gateway/mod.rs"
-        # Import
-        sed -i.bak '/^pub mod ws;/a\
-use crate::channels::nyxclaw;' "${GATEWAY_MOD}"
-        rm -f "${GATEWAY_MOD}.bak"
-        # Route
-        sed -i.bak '/\.route("\/ws\/chat"/a\
-        // ── WebSocket avatar channel (nyxclaw) ──\
-        .route("/ws/avatar", get(nyxclaw::handle_ws_nyxclaw))' "${GATEWAY_MOD}"
-        rm -f "${GATEWAY_MOD}.bak"
-        # Print
-        sed -i.bak '/GET  \/ws\/chat/a\
-    println!("  GET  /ws/avatar — WebSocket avatar channel (nyxclaw)");' "${GATEWAY_MOD}"
-        rm -f "${GATEWAY_MOD}.bak"
-        echo "  INJECT src/gateway/mod.rs (import + route + print)"
-    else
-        echo "  SKIP  src/gateway/mod.rs (already present)"
-    fi
-fi
-
-echo ""
-echo "  NOTE: Update your playground/AGENTS.md manually (see README.md)"
-echo ""
-
-# ── Verify ──────────────────────────────────────────────────
-
-echo "Verifying..."
-ERRORS=0
-
-check_file() {
-    if [ ! -f "${ZEROCLAW_DIR}/$1" ]; then
-        echo "  MISSING: $1"
-        ERRORS=$((ERRORS + 1))
-    fi
-}
-
-check_contains() {
-    if [ -f "${ZEROCLAW_DIR}/$1" ] && ! grep -q "$2" "${ZEROCLAW_DIR}/$1"; then
-        echo "  NOT INJECTED: $1 (missing '$2')"
-        ERRORS=$((ERRORS + 1))
-    fi
-}
-
-check_file "src/channels/nyxclaw.rs"
-check_file "src/agent/agent.rs"
-check_contains "src/providers/traits.rs" "response_format"
-check_contains "src/providers/openai.rs" "response_format"
-check_contains "src/agent/loop_.rs" "response_format"
-check_contains "src/providers/anthropic.rs" "response_format"
-check_contains "src/providers/reliable.rs" "response_format"
-check_contains "src/channels/mod.rs" "pub mod nyxclaw"
-check_contains "src/gateway/mod.rs" "nyxclaw"
-
-if [ $ERRORS -eq 0 ]; then
-    echo "  All patches verified."
+if ! git -C "${ZEROCLAW_DIR}" merge-base --is-ancestor "${EXPECTED_BASE}" HEAD 2>/dev/null; then
     echo ""
-    echo "============================================================"
-    echo "Patch applied successfully!"
+    echo "WARNING: ${EXPECTED_BASE} (v0.7.4 release tag) is not an ancestor of HEAD."
+    echo "         The patch was generated against v0.7.4 and may not apply cleanly."
     echo ""
-    echo "Next steps:"
-    echo "  1. cd ${ZEROCLAW_DIR}"
-    echo "  2. cargo build"
-    echo "  3. cargo test"
-    echo "  4. cargo run -- gateway"
-    echo "  5. Connect nyxclaw to ws://<host>:<port>/ws/avatar"
-    echo "============================================================"
-else
+    read -r -p "Continue anyway? [y/N] " ans
+    if [[ "${ans}" != "y" && "${ans}" != "Y" ]]; then
+        exit 1
+    fi
+fi
+
+# Dry-run first so we fail loud before any tree mutation
+echo ""
+echo "Dry-running patch (git apply --check)..."
+if ! git -C "${ZEROCLAW_DIR}" apply --check "${PATCH_FILE}"; then
     echo ""
-    echo "ERROR: ${ERRORS} verification(s) failed!"
+    echo "ERROR: patch does not apply cleanly. Aborting before any changes."
+    echo "       Inspect ${PATCH_FILE} and resolve conflicts manually, or"
+    echo "       reset the target to a clean v0.7.4 checkout."
     exit 1
 fi
+echo "  OK — patch applies cleanly."
+
+echo ""
+echo "Applying patch..."
+git -C "${ZEROCLAW_DIR}" apply "${PATCH_FILE}"
+echo "  OK — patch applied."
+
+echo ""
+echo "============================================================"
+echo "Patch applied successfully."
+echo ""
+echo "Next steps:"
+echo "  1. cd ${ZEROCLAW_DIR}"
+echo "  2. cargo build --workspace"
+echo "  3. cargo test -p zeroclaw-gateway --lib nyxclaw"
+echo "  4. Update playground/AGENTS.md with the {speech, content}"
+echo "     response-format guidance (see ${PATCH_DIR}/README.md)."
+echo "  5. Start the gateway and connect nyxclaw to /ws/avatar."
+echo ""
+echo "To revert:"
+echo "  git -C ${ZEROCLAW_DIR} apply -R ${PATCH_FILE}"
+echo "============================================================"
