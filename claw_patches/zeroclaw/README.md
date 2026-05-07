@@ -2,8 +2,6 @@
 
 Patches for **ZeroClaw v0.7.4** that add a dedicated avatar WebSocket channel (`/ws/avatar`) for nyxclaw voice + avatar integration.
 
-> Looking for the v0.5.0 version? See [`legacy_v0.5.0/`](./legacy_v0.5.0/).
-
 ## What this patch does
 
 When connected via `/ws/avatar`, ZeroClaw forces the LLM to respond with structured JSON:
@@ -22,7 +20,7 @@ The existing `/ws/chat` endpoint is unchanged — CLI and web dashboard clients 
 
 ## What this patch contains
 
-The patch ships as a single `git apply`-able file: [`zeroclaw-v0.7.4-nyxclaw.patch`](./zeroclaw-v0.7.4-nyxclaw.patch).
+The patch ships as a directory of post-patch files under [`files/`](./files/) — `patch.sh` overlays them onto a v0.7.4 checkout via a plain copy.
 
 | Layer | Crate / file | Change |
 |-------|--------------|--------|
@@ -38,9 +36,9 @@ The patch ships as a single `git apply`-able file: [`zeroclaw-v0.7.4-nyxclaw.pat
 | Gateway | `zeroclaw-gateway/src/nyxclaw.rs` | **NEW** — Avatar WebSocket channel. **Hardened post-review**: `TurnOutcome` state machine (Completed / Cancelled / Disconnected / Failed) replaces error-string classification; `session_queue.acquire` serializes per-`session_id` to prevent cross-connection corruption; `session_id` charset validation (`[A-Za-z0-9_-]{1,128}`); WS frame caps (64 KiB / 256 KiB), per-message user-content cap (32 KiB), `accumulated_raw` cap (1 MiB) with cancel-on-overflow; `AvatarJsonExtractor` field caps (64 KiB); `Provider::supports_response_format()` capability gate (Anthropic etc. fall back to plain-prose narration without lying about the contract); barge-in race fix (drop `biased;` + post-loop `now_or_never` receiver poll); pure `classify_turn_event` helper for testable WS-frame contracts; `chunk_reset` + `consolidate_turn` for parity with `/ws/chat` |
 | Binary | `src/providers/traits.rs`, `tests/live/openai_codex_vision_e2e.rs` | `response_format: None` defaults in 8 test sites |
 
-Inspectable copies of every modified file live under [`files/`](./files/), mirroring the v0.7.4 crate layout.
+All 15 modified files live under [`files/`](./files/), mirroring the v0.7.4 source-tree layout.
 
-**Stats**: 13 files, +2871 / −1 lines, ~1900 lines of which are `nyxclaw.rs` (orchestration + 24 unit tests).
+**Stats**: 15 files (13 source + Dockerfile + docker-compose.yml), ~3000 lines added, ~1900 lines of which are `nyxclaw.rs` (orchestration + 24 unit tests).
 
 ## Hardening (post-review)
 
@@ -65,13 +63,20 @@ on the same branch:
 | Parity | Missing `chunk_reset` frame and error-code taxonomy (`AUTH_ERROR`/`PROVIDER_ERROR`/`AGENT_ERROR`) | Both added; matches `ws.rs:620` and `ws.rs:649` |
 | Test coverage | `Agent::set_response_format` / `set_prompt_builder` setters had no direct tests | 4 new tests with a `RequestCaptureProvider` mock pin the contract |
 | Test coverage | TurnEvent → WS-frame mapping (especially ToolCall's two-frame ordering) untested | Refactored `handle_turn_event` to delegate to a pure `classify_turn_event`; 6 new tests pin every variant's frame shape |
+| Docker | Upstream `Dockerfile` uses `COPY --parents` with the bare `1.7` syntax pragma — modern BuildKit refuses the flag | Bumped pragma to `1.7-labs` |
+| Docker | Workspace lists `tools/fill-translations` and `xtask` as members but the Dockerfile copies neither — `cargo build --locked` fails parsing the workspace | Added explicit `COPY` for both manifests + stub bin sources |
+| Docker | Second-pass source restore copies only `src/`, `benches/`, root `*.rs` — the `crates/*/src/lib.rs` empty stubs from pass 1 stay in place, producing 217 unresolved-import errors when the root crate links | Added `COPY crates/ crates/` after the cleanup |
+| Docker | Cache-invalidation `rm` covers only `zeroclawlabs-*` (the root crate); pass-1 stub artifacts for the 14 workspace members shadow the rebuild | Expanded glob to `zeroclaw* aardvark* robot-kit*` |
+| Docker | Upstream `docker-compose.yml` defaults to `image: ghcr.io/zeroclaw-labs/zeroclaw:latest` (the unpatched upstream build) | Replaced with `build: { context: ., target: dev }`, added env passthroughs and the `./playground:/zeroclaw-data/workspace` bind mount |
 
 See `git log 78fb0a6..HEAD` in the patched repo for per-fix commits
 with detailed root-cause notes.
 
 ## Apply
 
-The patch uses `git apply`, so the target must be a git checkout of ZeroClaw at (or descended from) the v0.7.4 release tag.
+The patch script overlays every file under [`files/`](./files/) onto a
+ZeroClaw v0.7.4 checkout. No git operations on the target — `cp` / `rsync`
+under the hood — so it works equally on a `git clone` or an extracted tarball.
 
 ### Bash (Linux/macOS)
 
@@ -89,49 +94,135 @@ git clone https://github.com/zeroclaw-labs/zeroclaw -b v0.7.4 C:\zeroclaw-v0.7.4
 
 Both scripts:
 
-1. Verify the target is a v0.7.4 git checkout
-2. Dry-run the patch (`git apply --check`) — bail out before any tree mutation if it doesn't apply cleanly
-3. Apply the patch
-4. Print next-step build/test commands
+1. Sanity-check the target is a ZeroClaw v0.7.4 source tree.
+2. If the target is a git checkout, refuse to overlay if it has uncommitted
+   changes (so a future revert via `git checkout -- .` is clean).
+3. List every file about to be overlaid.
+4. Copy `files/` over the target.
+5. Print next-step build/configure commands.
 
 ### Revert
 
+If the target is a git checkout — one command resets everything to upstream:
+
 ```bash
-git -C /path/to/zeroclaw-v0.7.4 apply -R zeroclaw-v0.7.4-nyxclaw.patch
+git -C /path/to/zeroclaw-v0.7.4 checkout -- .
 ```
 
-### After patching
+Otherwise, re-extract the upstream source.
+
+### After patching — local cargo workflow
 
 ```bash
 cd /path/to/zeroclaw-v0.7.4
 cargo build --workspace
-cargo test -p zeroclaw-gateway --lib nyxclaw   # 10 unit tests for the avatar channel
+cargo test -p zeroclaw-gateway --lib nyxclaw   # 24 unit tests for the avatar channel
 cargo run --bin zeroclawlabs -- gateway
 ```
 
-nyxclaw then connects to `ws://<host>:<port>/ws/avatar` instead of `/ws/chat`.
+### After patching — Docker workflow (recommended)
 
-## Authentication
-
-ZeroClaw uses bearer tokens for WebSocket auth. Tokens are accepted via (precedence order):
-
-1. `Authorization: Bearer <token>` header
-2. `Sec-WebSocket-Protocol: bearer.<token>` subprotocol
-3. `?token=<token>` query parameter
-
-Generate a pairing token inside the ZeroClaw container:
+The patch ships a working `docker-compose.yml` and Dockerfile (the upstream
+v0.7.4 versions are broken in four distinct places — the patch fixes all of
+them; see commit `c60968c` for the full root-cause writeup).
 
 ```bash
-docker exec <zeroclaw-container> zeroclawlabs gateway get-paircode --new
+cd /path/to/zeroclaw-v0.7.4
+
+# 1. Set provider creds (.env file at repo root)
+cat > .env <<EOF
+PROVIDER=openai
+ZEROCLAW_MODEL=gpt-4.1-mini
+API_KEY=sk-...your-key-here...
+OPENAI_API_KEY=sk-...your-key-here...
+EOF
+
+# 2. Make sure ./playground/ exists with your AGENTS.md, IDENTITY.md, etc.
+#    (the bind mount lands here at /zeroclaw-data/workspace inside the container)
+ls playground/AGENTS.md  # should exist
+
+# 3. Build + start
+docker compose up -d --build
 ```
 
-Configure nyxclaw `.env`:
+Build takes ~5–10 min cold (Rust workspace compile inside the container) and
+~10 s warm. The image is ~196 MB.
+
+### Configure providers + pairing inside the container
+
+The upstream v0.7.4 default `config.toml` ships with two settings that need
+to be flipped before the avatar will work end-to-end:
+
+```bash
+# 1. Enable bearer-token authentication (default ships disabled — would let
+#    any client hit the gateway with no auth at all).
+docker exec zeroclaw sed -i 's/require_pairing = false/require_pairing = true/' \
+    /zeroclaw-data/.zeroclaw/config.toml
+
+# 2. Point the agent at your real provider (default is `ollama`, which means
+#    the gateway tries to reach localhost:11434 inside the container and times
+#    out on every turn).
+docker exec zeroclaw zeroclaw config set providers.fallback openai
+
+# 3. Restart so the new config is loaded
+docker restart zeroclaw
+```
+
+### Get the bearer token
+
+In v0.7.4, `gateway get-paircode --new` returns a **one-time 6-digit pairing
+code**, not a long-lived bearer token. Exchange it via `POST /pair`:
+
+```bash
+# Generate a fresh pairing code (e.g. "325758")
+CODE=$(docker exec zeroclaw zeroclaw gateway get-paircode --new 2>&1 \
+       | grep -oE '[0-9]{6}' | head -1)
+echo "code: $CODE"
+
+# Exchange for a long-lived token
+TOKEN=$(curl -s -X POST \
+    -H "X-Pairing-Code: $CODE" \
+    -H "Content-Type: application/json" \
+    -d '{"device_name":"nyxclaw"}' \
+    http://localhost:42617/pair \
+    | python3 -c 'import sys,json; print(json.load(sys.stdin)["token"])')
+echo "token: $TOKEN"
+```
+
+Save the token in nyxclaw's `.env`:
 
 ```env
 AGENT_TYPE=zeroclaw
-BASE_URL=http://<zeroclaw-host>:<port>
-AUTH_TOKEN=zc_YOUR_TOKEN_HERE
+BASE_URL=http://host.docker.internal:42617
+AUTH_TOKEN=zc_...the-token-from-above...
 USE_AVATAR_ENDPOINT=true
+```
+
+> **Important**: `docker compose restart` does NOT re-read `.env`. After
+> changing `AUTH_TOKEN`, recreate the container:
+>
+> ```bash
+> docker compose up -d --force-recreate server
+> ```
+
+### Smoke test
+
+```bash
+# From the host
+curl -i \
+  -H "Connection: Upgrade" -H "Upgrade: websocket" \
+  -H "Sec-WebSocket-Version: 13" \
+  -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
+  "http://localhost:42617/ws/avatar?token=$TOKEN" \
+  --max-time 3 2>&1 | head -5
+# Expect: HTTP/1.1 101 Switching Protocols + a session_start frame
+
+# Without token, expect 401:
+curl -s -o /dev/null -w '%{http_code}\n' \
+  -H "Connection: Upgrade" -H "Upgrade: websocket" \
+  -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
+  http://localhost:42617/ws/avatar
+# Expect: 401
 ```
 
 ## Required AGENTS.md addition
@@ -312,17 +403,16 @@ For OpenAI-compatible providers, add the `response_format` field to the request 
 ```
 claw_patches/zeroclaw/
 ├── README.md                          # This file
-├── patch.sh                           # Apply on Linux/macOS
-├── patch.ps1                          # Apply on Windows
-├── zeroclaw-v0.7.4-nyxclaw.patch      # The patch (git apply -able)
-├── upgrade_to_zeroclaw_0.7.4.md       # Original migration plan
-├── files/                             # Inspectable copies of modified files
-│   ├── crates/
-│   │   ├── zeroclaw-api/src/provider.rs
-│   │   ├── zeroclaw-providers/src/{openai,anthropic,reliable,openrouter,router}.rs
-│   │   ├── zeroclaw-runtime/src/agent/{agent,loop_,prompt}.rs
-│   │   └── zeroclaw-gateway/src/{lib,nyxclaw}.rs
-│   ├── src/providers/traits.rs
-│   └── tests/live/openai_codex_vision_e2e.rs
-└── legacy_v0.5.0/                     # Archived v0.5.0 patch + README + scripts
+├── patch.sh                           # Overlay on Linux/macOS
+├── patch.ps1                          # Overlay on Windows
+└── files/                             # Post-patch copies of every modified file
+    ├── Dockerfile                     # Patched (1.7-labs syntax, full crate copy, etc.)
+    ├── docker-compose.yml             # Local-build target=dev, playground bind mount
+    ├── crates/
+    │   ├── zeroclaw-api/src/provider.rs
+    │   ├── zeroclaw-providers/src/{openai,anthropic,reliable,openrouter,router}.rs
+    │   ├── zeroclaw-runtime/src/agent/{agent,loop_,prompt}.rs
+    │   └── zeroclaw-gateway/src/{lib,nyxclaw}.rs
+    ├── src/providers/traits.rs
+    └── tests/live/openai_codex_vision_e2e.rs
 ```

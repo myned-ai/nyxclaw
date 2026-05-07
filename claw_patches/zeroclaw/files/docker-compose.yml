@@ -1,0 +1,70 @@
+# ZeroClaw v0.7.4 — Docker Compose for the patched (nyxclaw avatar) build.
+#
+# This compose file builds the local source tree (which has the
+# nyxclaw avatar channel + response_format threading + size-limit
+# hardening applied) rather than pulling the upstream
+# `ghcr.io/zeroclaw-labs/zeroclaw:latest` image.
+#
+# Quick start:
+#   1. Set API_KEY / OPENAI_API_KEY in .env
+#   2. docker compose up -d --build
+#   3. docker exec zeroclaw zeroclaw gateway get-paircode --new
+#      → copy the token into nyxclaw/.env as AUTH_TOKEN
+
+services:
+  zeroclaw:
+    build:
+      context: .
+      target: dev
+    container_name: zeroclaw
+    restart: unless-stopped
+
+    environment:
+      # Required: provider API key (the runtime accepts either form).
+      - API_KEY=${API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+
+      # Provider + model. openrouter | openai | anthropic | ollama
+      - PROVIDER=${PROVIDER:-openai}
+      - ZEROCLAW_MODEL=${ZEROCLAW_MODEL:-gpt-4.1-mini}
+
+      # Container networking — the gateway must bind 0.0.0.0 so the
+      # host port-forward and nyxclaw can reach it.
+      - ZEROCLAW_ALLOW_PUBLIC_BIND=true
+      - ZEROCLAW_GATEWAY_PORT=${ZEROCLAW_GATEWAY_PORT:-42617}
+
+      # Debug logging for the WS handler (mirrors v0.5.0 default).
+      - RUST_LOG=${RUST_LOG:-zeroclaw=debug,info}
+
+    volumes:
+      # Named volume holds /zeroclaw-data/.zeroclaw/config.toml and any
+      # other gateway-internal state. Separate from v0.5.0's volume so
+      # the upgrade can roll back without touching old data.
+      - zeroclaw-data:/zeroclaw-data
+      # Bind-mount the playground/ tree so AGENTS.md / IDENTITY.md /
+      # SOUL.md / MEMORY.md / USER.md (and runtime state — devices.db,
+      # cron/, memory/, sessions/, state/) live on the host. Matches
+      # the v0.5.0 layout for a drop-in replacement.
+      - ./playground:/zeroclaw-data/workspace
+
+    ports:
+      - "${HOST_PORT:-42617}:${ZEROCLAW_GATEWAY_PORT:-42617}"
+
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+    healthcheck:
+      test: ["CMD", "zeroclaw", "status", "--format=exit-code"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  zeroclaw-data:
