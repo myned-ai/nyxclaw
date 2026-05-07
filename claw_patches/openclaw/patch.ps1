@@ -1,161 +1,110 @@
-<#
-.SYNOPSIS
-    OpenClaw Avatar SSE Patch
-.DESCRIPTION
-    Adds /v1/chat/completions/avatar endpoint for nyxclaw integration.
-
-    Usage:
-      .\patch.ps1 -OpenClawDir C:\path\to\openclaw-v2026.3.13
-#>
+# ============================================================
+# OpenClaw Avatar SSE Patch - v2026.5.6 (PowerShell)
+# ============================================================
+# Overlays the patched files from .\files\ onto an OpenClaw v2026.5.6
+# checkout.
+#
+# Usage:
+#   .\patch.ps1 -OpenClawDir C:\path\to\openclaw-v2026.5.6
+#
+# See patch.sh for the full description.
+# ============================================================
 
 param(
-    [Parameter(Mandatory=$true, HelpMessage="Path to the OpenClaw directory")]
+    [Parameter(Mandatory = $true)]
     [string]$OpenClawDir
 )
 
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = 'Stop'
 
-$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$OpenClawDir = Resolve-Path $OpenClawDir -ErrorAction Stop | Select-Object -ExpandProperty Path
-$BackupDir = Join-Path $OpenClawDir ".nyxclaw-patch-backup"
+$PatchDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$FilesDir = Join-Path $PatchDir 'files'
 
-Write-Host "============================================================"
-Write-Host "OpenClaw Avatar SSE Patch"
-Write-Host "============================================================"
+if (-not (Test-Path $FilesDir)) {
+    Write-Error "$FilesDir does not exist - patch directory is incomplete."
+    exit 1
+}
+
+if (-not (Test-Path (Join-Path $OpenClawDir 'package.json'))) {
+    Write-Error "$OpenClawDir\package.json not found. Is this an OpenClaw checkout?"
+    exit 1
+}
+
+if (-not (Test-Path (Join-Path $OpenClawDir 'src/gateway/server-http.ts'))) {
+    Write-Error "$OpenClawDir\src\gateway\server-http.ts not found."
+    exit 1
+}
+
+# Light version sanity-check.
+$pkgJson = Get-Content (Join-Path $OpenClawDir 'package.json') -Raw
+if ($pkgJson -notmatch '"version":\s*"2026\.5\.') {
+    Write-Warning "$OpenClawDir\package.json does not mention version 2026.5.x."
+    Write-Warning "The files in this patch were generated against v2026.5.6 and may not fit other versions."
+    Write-Warning "Continuing anyway..."
+}
+
+# Git-clean check (only if target is a git tree).
+$IsGitTree = Test-Path (Join-Path $OpenClawDir '.git')
+if ($IsGitTree) {
+    $status = git -C $OpenClawDir status --porcelain 2>$null
+    if ($status) {
+        Write-Error "$OpenClawDir has uncommitted changes. Refusing to overlay - you'd lose the ability to revert. Commit or stash first."
+        exit 1
+    }
+}
+
+Write-Host '============================================================'
+Write-Host 'OpenClaw Avatar SSE Patch - v2026.5.6'
+Write-Host '============================================================'
 Write-Host "Target:  $OpenClawDir"
-Write-Host "Patches: $ScriptDir"
-Write-Host ""
+Write-Host "Source:  $FilesDir"
+Write-Host ''
 
-# -- Validate ---------------------------------------------------
-if (-not (Test-Path (Join-Path $OpenClawDir "src/gateway/openai-http.ts"))) {
-    Write-Error "src/gateway/openai-http.ts not found. Is this a valid OpenClaw source directory?"
-    exit 1
+if ($IsGitTree) {
+    $head = (git -C $OpenClawDir rev-parse --short HEAD).Trim()
+    $branch = (git -C $OpenClawDir branch --show-current 2>$null)
+    if (-not $branch) { $branch = '(detached)' }
+    Write-Host "HEAD:    $head"
+    Write-Host "Branch:  $branch"
+    Write-Host ''
 }
 
-if (-not (Test-Path (Join-Path $OpenClawDir "src/gateway/server-http.ts"))) {
-    Write-Error "src/gateway/server-http.ts not found."
-    exit 1
+Write-Host 'Files to overlay:'
+Get-ChildItem -Path $FilesDir -Recurse -File | ForEach-Object {
+    $rel = $_.FullName.Substring($FilesDir.Length + 1)
+    Write-Host "  $rel"
 }
+Write-Host ''
 
-Write-Host "Backups: $BackupDir"
-Write-Host ""
-
-# -- Step 1: Copy avatar-http.ts --------------------------------
-Write-Host "Step 1: Installing avatar-http.ts..."
-Write-Host ""
-
-$BackupGatewayDir = Join-Path $BackupDir "src/gateway"
-if (-not (Test-Path $BackupGatewayDir)) {
-    New-Item -ItemType Directory -Path $BackupGatewayDir | Out-Null
-}
-
-$ServerHttpPath = Join-Path $OpenClawDir "src/gateway/server-http.ts"
-$BackupServerHttpPath = Join-Path $BackupGatewayDir "server-http.ts"
-
-# Backup server-http.ts
-if (-not (Test-Path $BackupServerHttpPath)) {
-    Copy-Item -Path $ServerHttpPath -Destination $BackupServerHttpPath -Force
-    Write-Host "  BACKUP src/gateway/server-http.ts"
-}
-
-# Copy new avatar handler
-$SrcAvatarHttp = Join-Path $ScriptDir "src/gateway/avatar-http.ts"
-$DestAvatarHttp = Join-Path $OpenClawDir "src/gateway/avatar-http.ts"
-Copy-Item -Path $SrcAvatarHttp -Destination $DestAvatarHttp -Force
-Write-Host "  NEW    src/gateway/avatar-http.ts"
-
-Write-Host ""
-
-# -- Step 2: Inject import + route into server-http.ts ----------
-Write-Host "Step 2: Registering avatar route in server-http.ts..."
-Write-Host ""
-
-$Content = Get-Content -Path $ServerHttpPath -Raw
-
-# 2a: Add import (after the openai-http import)
-if ($Content -notmatch "handleAvatarHttpRequest") {
-    $ImportTarget = 'import \{ handleOpenAiHttpRequest \} from "\./openai-http\.js";?'
-    $ImportReplacement = "import { handleOpenAiHttpRequest } from `"./openai-http.js`";`nimport { handleAvatarHttpRequest } from `"./avatar-http.js`";"
-    $Content = $Content -replace $ImportTarget, $ImportReplacement
-    Write-Host "  INJECT import { handleAvatarHttpRequest } from `"./avatar-http.js`""
+# Robocopy preserves attributes and supports recursive overlay; fall
+# back to Copy-Item if Robocopy isn't available (rare on Windows).
+if (Get-Command robocopy -ErrorAction SilentlyContinue) {
+    # /E = subdirs incl. empty, /NJH /NJS = no header/summary noise,
+    # /NFL /NDL = no per-file/dir log, /NP = no progress.
+    robocopy $FilesDir $OpenClawDir /E /NJH /NJS /NFL /NDL /NP | Out-Null
+    # Robocopy returns 0-7 for success states; treat as success.
+    if ($LASTEXITCODE -gt 7) {
+        Write-Error "robocopy failed with exit $LASTEXITCODE"
+        exit 1
+    }
 } else {
-    Write-Host "  SKIP  import (already present)"
+    Copy-Item -Path "$FilesDir\*" -Destination $OpenClawDir -Recurse -Force
 }
 
-# 2b: Add route stage (before the openai stage)
-if ($Content -notmatch '"avatar"') {
-    $AvatarStage = @"
-      if (openAiChatCompletionsEnabled) {
-        requestStages.push({
-          name: "avatar",
-          run: () =>
-            handleAvatarHttpRequest(req, res, {
-              auth: resolvedAuth,
-              config: openAiChatCompletionsConfig,
-              trustedProxies,
-              allowRealIpFallback,
-              rateLimiter,
-            }),
-        });
-      }
-"@
-    
-    # We replace the first occurrence of `if (openAiChatCompletionsEnabled) {` with our stage + the original `if`
-    $Target = "(\s*if\s*\(\s*openAiChatCompletionsEnabled\s*\)\s*\{)"
-    # Replace only first occurrence 
-    $Content = [regex]::new($Target).Replace($Content, "`n$AvatarStage`n`$1", 1)
-    
-    Write-Host "  INJECT route stage 'avatar' (before 'openai' stage)"
-} else {
-    Write-Host "  SKIP  route stage (already present)"
-}
-
-Set-Content -Path $ServerHttpPath -Value $Content -NoNewline
-
-Write-Host ""
-
-# -- Verify -----------------------------------------------------
-Write-Host "Verifying..."
-
-$Errors = 0
-
-if (-not (Test-Path $DestAvatarHttp)) {
-    Write-Host "  FAIL  avatar-http.ts not found"
-    $Errors++
-} else {
-    Write-Host "  OK    avatar-http.ts"
-}
-
-$Content = Get-Content -Path $ServerHttpPath -Raw
-
-if ($Content -notmatch "handleAvatarHttpRequest") {
-    Write-Host "  FAIL  avatar import not in server-http.ts"
-    $Errors++
-} else {
-    Write-Host "  OK    avatar import in server-http.ts"
-}
-
-if ($Content -notmatch '"avatar"') {
-    Write-Host "  FAIL  avatar route stage not in server-http.ts"
-    $Errors++
-} else {
-    Write-Host "  OK    avatar route stage in server-http.ts"
-}
-
-if ($Errors -gt 0) {
-    Write-Host ""
-    Write-Error "$Errors verification(s) failed."
-    exit 1
-}
-
-Write-Host "  All patches verified."
-Write-Host ""
-Write-Host "============================================================"
-Write-Host "Patch applied successfully!"
-Write-Host ""
-Write-Host "Next steps:"
+Write-Host '============================================================'
+Write-Host 'Patch applied successfully.'
+Write-Host ''
+Write-Host 'Next steps:'
 Write-Host "  1. cd $OpenClawDir"
-Write-Host "  2. npm run build   (or: pnpm build)"
-Write-Host "  3. npm start -- gateway --bind lan"
-Write-Host "  4. Connect nyxclaw to http://<host>:<port>/v1/chat/completions/avatar"
-Write-Host "============================================================"
+Write-Host '  2. npm install'
+Write-Host '  3. npm run build'
+Write-Host '  4. npm start -- gateway --bind lan --port 18789'
+Write-Host '  5. Set OPENCLAW_GATEWAY_TOKEN in your env (or docker-compose.yml)'
+Write-Host '  6. Add {speech, content} response-format guidance to your'
+Write-Host '     workspace AGENTS.md (see README.md)'
+Write-Host ''
+if ($IsGitTree) {
+    Write-Host 'To revert:'
+    Write-Host "  git -C $OpenClawDir checkout -- ."
+}
+Write-Host '============================================================'

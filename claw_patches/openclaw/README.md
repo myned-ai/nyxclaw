@@ -1,6 +1,6 @@
 # OpenClaw Avatar SSE Patch
 
-Patches for OpenClaw **v2026.3.13** that add a dedicated avatar SSE endpoint (`/v1/chat/completions/avatar`) for nyxclaw voice+avatar integration.
+Patches for **OpenClaw v2026.5.6** that add a dedicated avatar SSE endpoint (`/v1/chat/completions/avatar`) for nyxclaw voice + avatar integration.
 
 ## What this patch does
 
@@ -15,29 +15,63 @@ Adds a new HTTP SSE endpoint that forces the LLM to respond with structured JSON
 - Tool calls/results stream as `event: tool_call` / `event: tool_result` during agent execution
 - The existing `/v1/chat/completions` endpoint is unchanged
 
-## Usage
+## What this patch contains
+
+The patch ships as a directory of post-patch files under [`files/`](./files/) — `patch.sh` overlays them onto a v2026.5.6 checkout via a plain copy.
+
+| File | Change |
+|------|--------|
+| `src/gateway/avatar-http.ts` | **NEW** — Avatar SSE handler. Subscribes to agent events, accumulates the streamed `{speech, content}` JSON, sentence-splits the `speech` field for low-latency `event: speech_chunk` emission, and emits `event: rich_content` / `event: tool_call` / `event: tool_result` / `event: done`. Injects an `extraSystemPrompt` to force the JSON envelope. |
+| `src/gateway/server-http.ts` | Adds 4 small blocks to the upstream v2026.5.6 file: a `getAvatarHttpModule()` lazy-load factory + module promise (matches the upstream pattern for every other gateway sub-handler), an `isAvatarHttpPath()` strict-equality guard for `/v1/chat/completions/avatar`, and a `requestStages.push` block that wires the avatar handler into the request pipeline before the openai handler. Avatar reuses the same auth, config, and rate limiter as `/v1/chat/completions`. |
+
+**Stats**: 2 files (1 new + 1 modified), ~660 lines added (avatar-http.ts) + ~25 lines added to server-http.ts.
+
+## Apply
+
+The patch script overlays every file under [`files/`](./files/) onto an
+OpenClaw v2026.5.6 checkout. No git operations on the target — `cp` / `rsync`
+under the hood — so it works equally on a `git clone` or an extracted tarball.
 
 ### Bash (Linux/macOS)
+
 ```bash
-./patch.sh /path/to/openclaw-v2026.3.13
+git clone https://github.com/openclaw/openclaw -b v2026.5.6 ~/openclaw-v2026.5.6
+./patch.sh ~/openclaw-v2026.5.6
 ```
 
 ### PowerShell (Windows)
+
 ```powershell
-.\patch.ps1 -OpenClawDir C:\path\to\openclaw-v2026.3.13
+git clone https://github.com/openclaw/openclaw -b v2026.5.6 C:\openclaw-v2026.5.6
+.\patch.ps1 -OpenClawDir C:\openclaw-v2026.5.6
 ```
 
 Both scripts:
-- Back up original files to `.nyxclaw-patch-backup/`
-- Copy patched/new files into place
-- Inject route registration into `server-http.ts`
-- Verify all files were applied
+
+1. Sanity-check the target is an OpenClaw v2026.5.6 source tree.
+2. If the target is a git checkout, refuse to overlay if it has uncommitted
+   changes (so a future revert via `git checkout -- .` is clean).
+3. List every file about to be overlaid.
+4. Copy `files/` over the target.
+5. Print next-step build/run commands.
+
+### Revert
+
+If the target is a git checkout — one command resets everything to upstream:
+
+```bash
+git -C /path/to/openclaw-v2026.5.6 checkout -- .
+```
+
+Otherwise, re-extract the upstream source.
 
 ### After patching
+
 ```bash
-cd /path/to/openclaw-v2026.3.13
-npm run build      # or: pnpm build / bun build
-node dist/index.js gateway --bind lan --port 18789
+cd /path/to/openclaw-v2026.5.6
+npm install
+npm run build
+npm start -- gateway --bind lan --port 18789
 ```
 
 nyxclaw connects to `http://<host>:<port>/v1/chat/completions/avatar` instead of `/v1/chat/completions`.
@@ -271,41 +305,32 @@ OpenClaw uses an external PI agent runtime (`@mariozechner/pi-coding-agent`) tha
 
 1. **`extraSystemPrompt`** — injects the JSON response format instructions into the agent's system prompt
 2. **`avatar-http.ts`** — new SSE handler that subscribes to agent events, accumulates the JSON response, incrementally extracts the `speech` field, and emits custom SSE event types
-3. **`server-http.ts`** — one injection to register the `/v1/chat/completions/avatar` route
+3. **`server-http.ts`** — adds a `getAvatarHttpModule()` lazy-load factory and a `requestStages.push` block that registers `/v1/chat/completions/avatar` ahead of `/v1/chat/completions` in the gateway pipeline
 
 The `extraSystemPrompt` approach works because:
 - OpenClaw's agent pipeline already supports `extraSystemPrompt` all the way through
 - Claude and GPT-4 reliably produce JSON when instructed in the system prompt (especially with structured examples)
 - No modifications needed to the agent runner, LLM provider, or session manager
 
-### Files modified
-
-**New files:**
-
-| File | What it does |
-|------|-------------|
-| `src/gateway/avatar-http.ts` | Avatar SSE endpoint handler. Adds `extraSystemPrompt` for JSON format, incrementally extracts `speech` → `speech_chunk` events, emits `rich_content` on completion. |
-
-**Line injections (original files preserved):**
-
-| File | What injected |
-|------|--------------|
-| `server-http.ts` | Import + route registration for `/v1/chat/completions/avatar` in the request pipeline |
-
 ## Compatibility
 
-- **OpenClaw v2026.3.13** — tested and supported
-- **Other versions** — `server-http.ts` request pipeline structure may differ; manual adjustment may be needed
+- **OpenClaw v2026.5.6** — tested and supported. The overlay matches v2026.5.6's lazy-load module pattern (every gateway sub-handler — `openai-http`, `models-http`, `embeddings-http`, etc. — is lazy-loaded via a `get*Module()` factory; the avatar overlay follows the same convention).
+- **v2026.3.13–v2026.4.x** — incompatible. v2026.3.x used static imports for gateway sub-handlers; the new lazy-load factory pattern was introduced between v2026.3.13 and v2026.5.6. If you need a v2026.3.13 patch, check git history for the previous overlay version.
+- **Newer versions** — may require manual rebase. The patch is git-managed; resolve conflicts with the usual git tooling.
 
 ### Provider support
 
 Since we use `extraSystemPrompt` (not `response_format`), this works with **any LLM provider** that OpenClaw supports — Claude, GPT-4, Gemini, etc. The LLM just needs to follow JSON instructions in the system prompt.
 
-## Reverting
+## Files
 
-To revert all patches:
-```bash
-cp -r /path/to/openclaw/.nyxclaw-patch-backup/* /path/to/openclaw/
-rm -rf /path/to/openclaw/.nyxclaw-patch-backup
-rm /path/to/openclaw/src/gateway/avatar-http.ts
+```
+claw_patches/openclaw/
+├── README.md                          # This file
+├── patch.sh                           # Overlay on Linux/macOS
+├── patch.ps1                          # Overlay on Windows
+└── files/                             # Post-patch copies of every modified file
+    └── src/gateway/
+        ├── avatar-http.ts             # NEW — avatar SSE handler
+        └── server-http.ts             # Patched — adds 4 wiring blocks for the avatar route
 ```

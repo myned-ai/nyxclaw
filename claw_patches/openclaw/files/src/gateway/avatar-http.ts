@@ -13,7 +13,7 @@ import { randomUUID } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { createDefaultDeps } from "../cli/deps.js";
 import { agentCommandFromIngress } from "../commands/agent.js";
-import type { ImageContent } from "../commands/agent/types.js";
+import type { ImageContent } from "../agents/command/types.js";
 import type { GatewayHttpChatCompletionsConfig } from "../config/types.gateway.js";
 import { emitAgentEvent, onAgentEvent } from "../infra/agent-events.js";
 import { logWarn } from "../logger.js";
@@ -276,41 +276,60 @@ function buildAgentPrompt(
   };
 }
 
+function parseImageUrlToSource(url: string): InputImageSource {
+  const dataUriMatch = /^data:([^,]*?),(.*)$/is.exec(url);
+  if (dataUriMatch) {
+    const metadata = (dataUriMatch[1] ?? "").trim();
+    const data = dataUriMatch[2] ?? "";
+    const metadataParts = metadata
+      .split(";")
+      .map((part) => part.trim())
+      .filter(Boolean);
+    const isBase64 = metadataParts.some((part) => part.toLowerCase() === "base64");
+    if (!isBase64) {
+      throw new Error("image_url data URI must be base64 encoded");
+    }
+    if (!data) {
+      throw new Error("image_url data URI is missing payload data");
+    }
+    const mediaTypeRaw = metadataParts.find((part) => part.includes("/"));
+    return {
+      type: "base64",
+      mediaType: mediaTypeRaw,
+      data,
+    };
+  }
+  return { type: "url", url };
+}
+
 async function resolveImagesForRequest(
   activeTurn: ActiveTurnContext,
   limits: ResolvedLimits,
 ): Promise<ImageContent[]> {
   const msg = activeTurn.activeUserMessage;
   if (!msg) return [];
-  const content = msg.content;
-  if (!Array.isArray(content)) return [];
-
-  const imageSources: InputImageSource[] = [];
-  for (const part of content as Array<{ type?: string; image_url?: { url?: string } }>) {
-    if (part?.type === "image_url" && part.image_url?.url) {
-      imageSources.push({ url: part.image_url.url });
-    }
-  }
-
-  if (imageSources.length === 0) return [];
-  if (imageSources.length > limits.maxImageParts) {
-    throw new Error(`Too many image parts (${imageSources.length} > ${limits.maxImageParts}).`);
+  const urls = extractImageUrls(msg.content);
+  if (urls.length === 0) return [];
+  if (urls.length > limits.maxImageParts) {
+    throw new Error(`Too many image parts (${urls.length} > ${limits.maxImageParts}).`);
   }
 
   const images: ImageContent[] = [];
   let totalBytes = 0;
-  for (const source of imageSources) {
-    if (source.url.startsWith("data:")) {
-      const estBytes = estimateBase64DecodedBytes(source.url);
-      totalBytes += estBytes;
+  for (const url of urls) {
+    const source = parseImageUrlToSource(url);
+    if (source.type === "base64") {
+      const sourceBytes = estimateBase64DecodedBytes(source.data);
+      if (totalBytes + sourceBytes > limits.maxTotalImageBytes) {
+        throw new Error("Total image data exceeds size limit.");
+      }
     }
+    const image = await extractImageContentFromSource(source, limits.images);
+    totalBytes += estimateBase64DecodedBytes(image.data);
     if (totalBytes > limits.maxTotalImageBytes) {
       throw new Error("Total image data exceeds size limit.");
     }
-    const result = await extractImageContentFromSource(source, limits.images);
-    if (result) {
-      images.push(result);
-    }
+    images.push(image);
   }
   return images;
 }
@@ -517,6 +536,7 @@ export async function handleAvatarHttpRequest(
     messageChannel,
     bestEffortDeliver: false as const,
     senderIsOwner: true as const,
+    allowModelOverride: true as const,
   };
 
   // Always stream for avatar endpoint
