@@ -22,55 +22,16 @@ The existing `/ws/chat` endpoint is unchanged — CLI and web dashboard clients 
 
 The patch ships as a directory of post-patch files under [`files/`](./files/) — `patch.sh` overlays them onto a v0.7.4 checkout via a plain copy.
 
-| Layer | Crate / file | Change |
-|-------|--------------|--------|
-| API | `zeroclaw-api/src/provider.rs` | Add `response_format: Option<&serde_json::Value>` to `ChatRequest`; new `Provider::supports_response_format()` capability method (default `false`) |
-| Runtime | `zeroclaw-runtime/src/agent/agent.rs` | Add `response_format` field + builder + `set_response_format`/`set_prompt_builder` setters; thread into `Agent::turn` and `Agent::turn_streamed`. **Tests**: 4 setter / prompt-builder tests with a `RequestCaptureProvider` mock |
-| Runtime | `zeroclaw-runtime/src/agent/loop_.rs` | `response_format: None` defaults in `run_tool_call_loop`'s `ChatRequest` sites (orchestrator/delegate paths) |
-| Runtime | `zeroclaw-runtime/src/agent/prompt.rs` | New `SystemPromptBuilder::without_section(name)` for stripping `DateTimeSection` (cache-stable system prompt) |
-| Providers | `zeroclaw-providers/src/openai.rs` | Native SSE streaming impl: `stream_chat()`, tool-call delta accumulation by `index` (mandatory; missing-index deltas skipped, id rebinding is first-write-wins), `parse_openai_sse_lines` helper with **1 MiB per-line cap**, advertises `supports_response_format() = true` |
-| Providers | `zeroclaw-providers/src/anthropic.rs` | `response_format: None` default (Anthropic doesn't honor the field — the avatar handler now skips `set_response_format` here via the capability gate) |
-| Providers | `zeroclaw-providers/src/reliable.rs` | Pass-through of `response_format` + conservative AND-policy `supports_response_format()` (only true when every fallback candidate honors the field) |
-| Providers | `zeroclaw-providers/src/openrouter.rs`, `router.rs` | `None` defaults; `Router` uses the same conservative AND-policy as `Reliable` |
-| Gateway | `zeroclaw-gateway/src/lib.rs` | Register `/ws/avatar` route; add `pub mod nyxclaw` |
-| Gateway | `zeroclaw-gateway/src/nyxclaw.rs` | **NEW** — Avatar WebSocket channel. **Hardened post-review**: `TurnOutcome` state machine (Completed / Cancelled / Disconnected / Failed) replaces error-string classification; `session_queue.acquire` serializes per-`session_id` to prevent cross-connection corruption; `session_id` charset validation (`[A-Za-z0-9_-]{1,128}`); WS frame caps (64 KiB / 256 KiB), per-message user-content cap (32 KiB), `accumulated_raw` cap (1 MiB) with cancel-on-overflow; `AvatarJsonExtractor` field caps (64 KiB); `Provider::supports_response_format()` capability gate (Anthropic etc. fall back to plain-prose narration without lying about the contract); barge-in race fix (drop `biased;` + post-loop `now_or_never` receiver poll); pure `classify_turn_event` helper for testable WS-frame contracts; `chunk_reset` + `consolidate_turn` for parity with `/ws/chat` |
-| Binary | `src/providers/traits.rs`, `tests/live/openai_codex_vision_e2e.rs` | `response_format: None` defaults in 8 test sites |
-
-All 15 modified files live under [`files/`](./files/), mirroring the v0.7.4 source-tree layout.
-
-**Stats**: 15 files (13 source + Dockerfile + docker-compose.yml), ~3000 lines added, ~1900 lines of which are `nyxclaw.rs` (orchestration + 24 unit tests).
-
-## Hardening (post-review)
-
-After the initial port, a 5-agent code review surfaced 11 distinct
-correctness / security / reliability issues. All have been fixed
-on the same branch:
-
-| Category | Issue | Fix |
+| Layer | File | Change |
 |---|---|---|
-| Correctness | Sentence extractor split prematurely on chunk-end terminators ("I see 1." + "5 inches" emitted "I see 1." as a sentence) | Required lookahead whitespace; end-of-stream flushing handled by post-loop `sentence_buf.trim()` |
-| Correctness | Streaming-fallback path narrated raw JSON when parse failed (avatar would speak `{"speech":"hi","content":""}` literally) | Strict envelope check; if absent and `schema_enforced`, send `INVALID_RESPONSE_FORMAT` error frame instead |
-| Correctness | WS-closed-mid-turn classified as agent error; session ended in `"error"` state, sender wrote to closed socket | New `TurnOutcome::Disconnected` arm; same persistence as `Cancelled`, no `done` frame, session ends `idle` |
-| Correctness | `extractor.finalize()` skipped on cancel path (in-progress speech lost) | Finalize unconditionally before classification |
-| Correctness | `biased;` + barge-in arriving in same poll cycle as turn completion = queued message lost | Dropped `biased;`; added one-shot `now_or_never` receiver poll after loop |
-| Concurrency | Two clients reusing `?session_id=X` raced on `cancel_tokens` map and partial-persist `update_last` | `session_queue.acquire(&session_key)` per turn (matches `ws.rs`) |
-| Security | `session_id` flowed into format!() without validation (path traversal / log injection / oversize) | Charset+length gate at upgrade and connect-frame override |
-| Security | Anthropic + `response_format` was silent failure (LLM returned prose, every turn errored) | New `Provider::supports_response_format()` capability gate; non-supporting providers fall back to plain-prose narration |
-| Security | Unbounded WS frames, extractor buffers, `accumulated_raw`, SSE lines = OOM vectors | WS frame cap (`max_frame_size`/`max_message_size`), per-message user-content cap, extractor field cap (64 KiB), `accumulated_raw` cap (1 MiB) with cancel-on-overflow, SSE line cap (1 MiB) |
-| Security | Tool-call delta missing `index` defaulted to 0, splicing args into wrong slot; id rebinding silently overwrote | Missing index → skip with debug; id rebinding → first-write-wins with warn |
-| Security | Agent-init error sent raw to client (could leak provider URLs / key fragments) | Pipe through `sanitize_api_error` |
-| Parity | `/ws/avatar` skipped memory consolidation that `/ws/chat` runs after each turn | Same `consolidate_turn` fire-and-forget pattern in `handle_completed` |
-| Parity | Missing `chunk_reset` frame and error-code taxonomy (`AUTH_ERROR`/`PROVIDER_ERROR`/`AGENT_ERROR`) | Both added; matches `ws.rs:620` and `ws.rs:649` |
-| Test coverage | `Agent::set_response_format` / `set_prompt_builder` setters had no direct tests | 4 new tests with a `RequestCaptureProvider` mock pin the contract |
-| Test coverage | TurnEvent → WS-frame mapping (especially ToolCall's two-frame ordering) untested | Refactored `handle_turn_event` to delegate to a pure `classify_turn_event`; 6 new tests pin every variant's frame shape |
-| Docker | Upstream `Dockerfile` uses `COPY --parents` with the bare `1.7` syntax pragma — modern BuildKit refuses the flag | Bumped pragma to `1.7-labs` |
-| Docker | Workspace lists `tools/fill-translations` and `xtask` as members but the Dockerfile copies neither — `cargo build --locked` fails parsing the workspace | Added explicit `COPY` for both manifests + stub bin sources |
-| Docker | Second-pass source restore copies only `src/`, `benches/`, root `*.rs` — the `crates/*/src/lib.rs` empty stubs from pass 1 stay in place, producing 217 unresolved-import errors when the root crate links | Added `COPY crates/ crates/` after the cleanup |
-| Docker | Cache-invalidation `rm` covers only `zeroclawlabs-*` (the root crate); pass-1 stub artifacts for the 14 workspace members shadow the rebuild | Expanded glob to `zeroclaw* aardvark* robot-kit*` |
-| Docker | Upstream `docker-compose.yml` defaults to `image: ghcr.io/zeroclaw-labs/zeroclaw:latest` (the unpatched upstream build) | Replaced with `build: { context: ., target: dev }`, added env passthroughs and the `./playground:/zeroclaw-data/workspace` bind mount |
+| API | `zeroclaw-api/src/provider.rs` | Add `response_format` field to `ChatRequest`; new `Provider::supports_response_format()` capability method |
+| Runtime | `zeroclaw-runtime/src/agent/{agent,loop_,prompt}.rs` | Thread `response_format` through `Agent::turn`/`turn_streamed`; add `SystemPromptBuilder::without_section("datetime")` for cache-stable prompts (+ 4 unit tests) |
+| Providers | `zeroclaw-providers/src/{openai,anthropic,reliable,openrouter,router}.rs` | Native SSE streaming in `openai.rs` (1 MiB per-line cap, tool-call delta accumulation by `index`); capability-gated fallbacks elsewhere (Anthropic etc. narrate plain prose instead of failing) |
+| Gateway | `zeroclaw-gateway/src/{lib,nyxclaw}.rs` | **NEW** `/ws/avatar` channel — `TurnOutcome` state machine, per-`session_id` serialization, WS frame + buffer caps, barge-in via cancel-or-new-message, `classify_turn_event` helper (+ 24 unit tests) |
+| Binary | `src/providers/traits.rs`, `tests/live/...` | `response_format: None` defaults in 8 test sites |
+| Build | `Dockerfile`, `docker-compose.yml` | Fix upstream `COPY --parents` pragma + crate-stub cache invalidation; switch compose from prebuilt image to local `target: dev` build with `./playground` bind mount |
 
-See `git log 78fb0a6..HEAD` in the patched repo for per-fix commits
-with detailed root-cause notes.
+**Stats**: 15 files, ~3000 lines added (~1900 of which is `nyxclaw.rs` + tests). See `git log` for per-fix commit notes.
 
 ## Apply
 
@@ -122,88 +83,51 @@ cargo run --bin zeroclawlabs -- gateway
 
 ### After patching — Docker workflow (recommended)
 
-The patch ships a working `docker-compose.yml` and Dockerfile (the upstream
-v0.7.4 versions are broken in four distinct places — the patch fixes all of
-them; see commit `c60968c` for the full root-cause writeup).
+The patch ships a working `docker-compose.yml` and Dockerfile (the upstream v0.7.4 versions don't build).
 
 ```bash
 cd /path/to/zeroclaw-v0.7.4
 
-# 1. Set provider creds (.env file at repo root)
+# 1. Provider creds (.env)
 cat > .env <<EOF
 PROVIDER=openai
 ZEROCLAW_MODEL=gpt-4.1-mini
-API_KEY=sk-...your-key-here...
-OPENAI_API_KEY=sk-...your-key-here...
+API_KEY=sk-...
+OPENAI_API_KEY=sk-...
 EOF
 
-# 2. Make sure ./playground/ exists with your AGENTS.md, IDENTITY.md, etc.
-#    (the bind mount lands here at /zeroclaw-data/workspace inside the container)
-ls playground/AGENTS.md  # should exist
+# 2. Ensure ./playground/AGENTS.md exists (bind-mounted to /zeroclaw-data/workspace)
 
-# 3. Build + start
+# 3. Build + start (cold ~5–10 min, warm ~10 s; image ~196 MB)
 docker compose up -d --build
-```
 
-Build takes ~5–10 min cold (Rust workspace compile inside the container) and
-~10 s warm. The image is ~196 MB.
-
-### Configure providers + pairing inside the container
-
-The upstream v0.7.4 default `config.toml` ships with two settings that need
-to be flipped before the avatar will work end-to-end:
-
-```bash
-# 1. Enable bearer-token authentication (default ships disabled — would let
-#    any client hit the gateway with no auth at all).
-docker exec zeroclaw sed -i 's/require_pairing = false/require_pairing = true/' \
-    /zeroclaw-data/.zeroclaw/config.toml
-
-# 2. Point the agent at your real provider (default is `ollama`, which means
-#    the gateway tries to reach localhost:11434 inside the container and times
-#    out on every turn).
+# 4. Flip two defaults: enable auth, point at your provider
+docker exec zeroclaw sed -i 's/require_pairing = false/require_pairing = true/' /zeroclaw-data/.zeroclaw/config.toml
 docker exec zeroclaw zeroclaw config set providers.fallback openai
-
-# 3. Restart so the new config is loaded
 docker restart zeroclaw
 ```
 
 ### Get the bearer token
 
-In v0.7.4, `gateway get-paircode --new` returns a **one-time 6-digit pairing
-code**, not a long-lived bearer token. Exchange it via `POST /pair`:
+`gateway get-paircode --new` returns a 6-digit pairing code — exchange it via `POST /pair` for a long-lived token:
 
 ```bash
-# Generate a fresh pairing code (e.g. "325758")
-CODE=$(docker exec zeroclaw zeroclaw gateway get-paircode --new 2>&1 \
-       | grep -oE '[0-9]{6}' | head -1)
-echo "code: $CODE"
-
-# Exchange for a long-lived token
-TOKEN=$(curl -s -X POST \
-    -H "X-Pairing-Code: $CODE" \
-    -H "Content-Type: application/json" \
-    -d '{"device_name":"nyxclaw"}' \
-    http://localhost:42617/pair \
+CODE=$(docker exec zeroclaw zeroclaw gateway get-paircode --new 2>&1 | grep -oE '[0-9]{6}' | head -1)
+TOKEN=$(curl -s -X POST -H "X-Pairing-Code: $CODE" -H "Content-Type: application/json" \
+    -d '{"device_name":"nyxclaw"}' http://localhost:42617/pair \
     | python3 -c 'import sys,json; print(json.load(sys.stdin)["token"])')
-echo "token: $TOKEN"
 ```
 
-Save the token in nyxclaw's `.env`:
+Then in nyxclaw's `.env`:
 
 ```env
 AGENT_TYPE=zeroclaw
 BASE_URL=http://host.docker.internal:42617
-AUTH_TOKEN=zc_...the-token-from-above...
+AUTH_TOKEN=zc_...
 USE_AVATAR_ENDPOINT=true
 ```
 
-> **Important**: `docker compose restart` does NOT re-read `.env`. After
-> changing `AUTH_TOKEN`, recreate the container:
->
-> ```bash
-> docker compose up -d --force-recreate server
-> ```
+> `docker compose restart` does NOT re-read `.env`. After changing `AUTH_TOKEN`: `docker compose up -d --force-recreate server`.
 
 ### Smoke test
 
@@ -225,7 +149,7 @@ curl -s -o /dev/null -w '%{http_code}\n' \
 # Expect: 401
 ```
 
-## Required AGENTS.md addition
+## AGENTS.md — Required prompt addition
 
 You **must** manually add the following **Response format** section to your `playground/AGENTS.md`:
 
@@ -274,7 +198,7 @@ User asks to compare things:
 - Never put error messages or apologies in content — those belong in speech only
 ````
 
-## Performance tuning
+## Performance Tuning
 
 For real-time voice, latency matters. These ZeroClaw settings reduce time-to-first-token (TTFT). Edit your `config.toml` (in `~/.zeroclaw/config.toml`, or `/zeroclaw-data/.zeroclaw/config.toml` inside Docker):
 
@@ -396,7 +320,7 @@ For OpenAI-compatible providers, add the `response_format` field to the request 
 
 - **ZeroClaw v0.7.4** — tested and supported (workspace builds clean, 6403 tests pass)
 - **Newer versions** — may require manual rebase. The patch is git-managed; resolve conflicts with the usual git tooling.
-- **Older versions (< v0.7.4)** — incompatible. v0.6.x and earlier use a different crate layout. For v0.5.0 see [`legacy_v0.5.0/`](./legacy_v0.5.0/).
+- **Older versions (< v0.7.4)** — incompatible. v0.6.x and earlier use a different crate layout.
 
 ## Files
 
